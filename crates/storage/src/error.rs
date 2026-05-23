@@ -31,6 +31,11 @@ pub enum StorageError {
         /// The page size this build expects.
         page_size: usize,
     },
+
+    /// The page header's `page_type` discriminant doesn't match any known
+    /// [`crate::header::PageType`] variant. Likely on-disk corruption.
+    #[error("invalid page type discriminant: {0}")]
+    InvalidPageType(u16),
 }
 
 /// Convenience alias for results returned by the storage layer.

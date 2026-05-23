@@ -11,6 +11,18 @@
 /// buffer-pool memory ratio stays reasonable on a laptop demo.
 pub const PAGE_SIZE: usize = 8192;
 
+/// [`PAGE_SIZE`] re-typed as a `u16`.
+///
+/// Lets `const` expressions use the page size where the in-page slot
+/// directory and free-space pointer (both `u16`) need it. A compile-time
+/// assertion below guarantees the two stay in sync.
+pub const PAGE_SIZE_U16: u16 = 8192;
+
+const _: () = assert!(
+    PAGE_SIZE == PAGE_SIZE_U16 as usize,
+    "PAGE_SIZE and PAGE_SIZE_U16 must agree",
+);
+
 /// A fixed-size buffer holding exactly one page.
 pub type Page = [u8; PAGE_SIZE];
 

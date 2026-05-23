@@ -56,6 +56,7 @@ All crates live in a single Cargo workspace.
 
 > **Update this section as a running heartbeat.** Top entry = most recent. Keep terse — one line per shipped task.
 
+- _(Sprint 1, 2026-05-22)_ Storage I — page header + CRC32 landed (issue #3): 24-byte header (`lsn`, `checksum`, `page_type`, `slot_count`, `free_space_ptr`, `flags`, `reserved`), hand-written CRC32 (IEEE polynomial, const-table-generated, matches the standard 0xCBF43926 test vector), checksum scope = `[12..PAGE_SIZE]` so LSN updates don't invalidate it. 22/22 storage tests green.
 - _(Sprint 1, 2026-05-22)_ Storage I — file manager landed (issue #2): `PageId`, `PAGE_SIZE = 8192`, `FileManager` with `open` / `allocate_page` / `read_page` / `write_page` / `fsync`. 8/8 unit tests green. CI gates clean.
 - _(pre-Sprint-1, 2026-05-22)_ Bootstrap (PR #1, merged): Rust 1.95.0 installed, `.claude/skills/db-debug.md` added, `.mcp.json` registers GitHub MCP server, CLAUDE.md + design.md + sprints.md drafted, 8-crate workspace, Sprint 1 milestone + 5 issues filed (#2–#6).
 

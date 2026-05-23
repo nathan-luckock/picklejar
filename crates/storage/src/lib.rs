@@ -27,10 +27,16 @@
 
 #![forbid(unsafe_code)]
 
+pub mod crc32;
 pub mod error;
 pub mod file;
+pub mod header;
 pub mod page;
 
 pub use error::{Result, StorageError};
 pub use file::FileManager;
+pub use header::{
+    compute_checksum, recompute_checksum, verify_checksum, PageHeader, PageType, FLAG_DIRTY,
+    FLAG_NEEDS_VACUUM, HEADER_SIZE,
+};
 pub use page::{Page, PageId, PAGE_SIZE};
