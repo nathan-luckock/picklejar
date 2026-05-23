@@ -56,16 +56,18 @@ All crates live in a single Cargo workspace.
 
 > **Update this section as a running heartbeat.** Top entry = most recent. Keep terse — one line per shipped task.
 
-- _(pre-Sprint-1, 2026-05-22)_ Bootstrap: Rust 1.95.0 installed, `.claude/skills/db-debug.md` added, `.mcp.json` registers GitHub MCP server, CLAUDE.md drafted, repo cloned.
+- _(Sprint 1, 2026-05-22)_ Storage I — file manager landed (issue #2): `PageId`, `PAGE_SIZE = 8192`, `FileManager` with `open` / `allocate_page` / `read_page` / `write_page` / `fsync`. 8/8 unit tests green. CI gates clean.
+- _(pre-Sprint-1, 2026-05-22)_ Bootstrap (PR #1, merged): Rust 1.95.0 installed, `.claude/skills/db-debug.md` added, `.mcp.json` registers GitHub MCP server, CLAUDE.md + design.md + sprints.md drafted, 8-crate workspace, Sprint 1 milestone + 5 issues filed (#2–#6).
 
 ---
 
 ## Page format (canonical, update as it changes)
 
-> Fill in as we build. Single source of truth for the on-disk layout.
+> Single source of truth for the on-disk layout.
 
-- Page size: **TBD (likely 8KB)**
-- Page header layout: **TBD — see [docs/design.md](docs/design.md) once written**
+- Page size: **8192 bytes (8 KiB).** Defined as `rustdb_storage::PAGE_SIZE`.
+- Page ID: **`u64`, 0-indexed**, byte offset = `page_id * PAGE_SIZE`. See `rustdb_storage::PageId`.
+- Page header layout: **24 bytes** — see [docs/design.md](docs/design.md#slotted-page-format-heap-tables). Implementation lands in Sprint 1 issue #3.
 
 ---
 

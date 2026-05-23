@@ -1,0 +1,18 @@
+# Normalize line endings for source files: LF in the repo, native in working tree
+# via Git's autocrlf. rustfmt's `newline_style = "Auto"` respects the working
+# tree's choice, so this keeps Windows and Linux both happy without churn.
+
+* text=auto
+
+*.rs       text eol=lf
+*.toml     text eol=lf
+*.md       text eol=lf
+*.yml      text eol=lf
+*.yaml     text eol=lf
+*.json     text eol=lf
+
+*.exe      binary
+*.db       binary
+*.wal      binary
+*.png      binary
+*.jpg      binary

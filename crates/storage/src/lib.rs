@@ -1,20 +1,36 @@
 //! Storage layer for the rustdb engine.
 //!
-//! Provides page-based on-disk storage, a buffer pool with pin/unpin semantics,
-//! and a B+ tree index. Everything above this crate (WAL, MVCC, SQL) treats
-//! storage as the canonical source of truth for committed data — but mutations
-//! flow through the WAL first (see `rustdb-wal`).
+//! Provides page-based on-disk storage, a buffer pool with pin/unpin
+//! semantics (Sprint 2), and a B+ tree index (Sprint 2). Everything above
+//! this crate (WAL, MVCC, SQL) treats storage as the canonical source of
+//! truth for committed data — but mutations flow through the WAL first
+//! (see `rustdb-wal`).
 //!
-//! # Layout (TBD — finalize in docs/design.md)
+//! # Layout
 //!
-//! - Page size: likely 8 KiB
-//! - Slotted-page format for heap tables
-//! - B+ tree pages: separate header layout, see `btree` module
+//! - Page size: 8 KiB (see [`page::PAGE_SIZE`]).
+//! - Slotted-page format for heap tables (Sprint 1, follow-up issue #4).
+//! - B+ tree pages: separate header layout (Sprint 2).
 //!
 //! # Invariants
 //!
-//! - A pinned page is never evicted.
-//! - All page handles are RAII; dropping a `PageGuard` unpins exactly once.
-//! - Writes go through the buffer pool, never directly to disk.
+//! - A pinned page is never evicted (Sprint 2).
+//! - All page handles are RAII; dropping a `PageGuard` unpins exactly once
+//!   (Sprint 2).
+//! - Writes go through the buffer pool, never directly to disk (Sprint 2).
+//!
+//! # Sprint 1 surface
+//!
+//! - [`page::PageId`], [`page::PAGE_SIZE`], [`page::Page`]
+//! - [`file::FileManager`] — raw page-granular I/O
+//! - [`error::StorageError`]
 
 #![forbid(unsafe_code)]
+
+pub mod error;
+pub mod file;
+pub mod page;
+
+pub use error::{Result, StorageError};
+pub use file::FileManager;
+pub use page::{Page, PageId, PAGE_SIZE};

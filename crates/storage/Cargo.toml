@@ -12,5 +12,8 @@ description = "Page manager, buffer pool, and B+ tree for the rustdb engine."
 thiserror.workspace = true
 tracing.workspace = true
 
+[dev-dependencies]
+tempfile = "3"
+
 [lints]
 workspace = true
