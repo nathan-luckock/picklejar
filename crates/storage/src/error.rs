@@ -36,6 +36,55 @@ pub enum StorageError {
     /// [`crate::header::PageType`] variant. Likely on-disk corruption.
     #[error("invalid page type discriminant: {0}")]
     InvalidPageType(u16),
+
+    /// A [`HeapPage`] was opened over a page whose header reports a
+    /// different `page_type`.
+    ///
+    /// [`HeapPage`]: crate::heap::HeapPage
+    #[error("wrong page type: expected {expected:?}, got {actual:?}")]
+    WrongPageType {
+        /// The type the caller expected.
+        expected: crate::header::PageType,
+        /// The type actually stored in the page header.
+        actual: crate::header::PageType,
+    },
+
+    /// Tuple is larger than what a heap page can ever hold.
+    /// Hard cap is `PAGE_SIZE - HEADER_SIZE - SLOT_SIZE`.
+    #[error("tuple size {size} bytes is too large for a single page")]
+    TupleTooLarge {
+        /// The attempted tuple size in bytes.
+        size: usize,
+    },
+
+    /// Empty tuples are rejected — a zero-length payload would collide with
+    /// the tombstone encoding (slot length = 0 ⇒ deleted).
+    #[error("empty tuples are not supported on heap pages")]
+    EmptyTuple,
+
+    /// The page does not have enough free space (slot directory + tuple
+    /// payload) to satisfy this insert.
+    #[error("heap page full: needed {needed} bytes, only {available} free")]
+    PageFull {
+        /// Bytes required by this insert (tuple length + slot entry size).
+        needed: u16,
+        /// Bytes currently free between the slot directory and the tuple
+        /// region.
+        available: u16,
+    },
+
+    /// `SlotId` is not present in the heap page's slot directory.
+    #[error("invalid slot id {slot}: heap page has {slot_count} slot(s)")]
+    InvalidSlot {
+        /// The caller's slot id.
+        slot: u16,
+        /// Slots currently in the directory (live + tombstoned).
+        slot_count: u16,
+    },
+
+    /// Caller tried to delete a slot that was already tombstoned.
+    #[error("slot {0} is already tombstoned")]
+    SlotAlreadyDeleted(u16),
 }
 
 /// Convenience alias for results returned by the storage layer.

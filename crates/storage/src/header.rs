@@ -29,6 +29,16 @@ use crate::page::{Page, PAGE_SIZE, PAGE_SIZE_U16};
 /// Size of the page header in bytes.
 pub const HEADER_SIZE: usize = 24;
 
+/// [`HEADER_SIZE`] re-typed as a `u16`. Same trick as
+/// [`crate::page::PAGE_SIZE_U16`] — lets `u16` arithmetic stay clean in
+/// the slotted-page layout without per-call `try_from` ceremony.
+pub const HEADER_SIZE_U16: u16 = 24;
+
+const _: () = assert!(
+    HEADER_SIZE == HEADER_SIZE_U16 as usize,
+    "HEADER_SIZE and HEADER_SIZE_U16 must agree",
+);
+
 /// Byte range covered by the checksum: everything after the LSN and the
 /// checksum field itself.
 pub const CHECKSUM_RANGE: std::ops::Range<usize> = 12..PAGE_SIZE;

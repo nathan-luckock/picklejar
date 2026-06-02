@@ -31,12 +31,14 @@ pub mod crc32;
 pub mod error;
 pub mod file;
 pub mod header;
+pub mod heap;
 pub mod page;
 
 pub use error::{Result, StorageError};
 pub use file::FileManager;
 pub use header::{
     compute_checksum, recompute_checksum, verify_checksum, PageHeader, PageType, FLAG_DIRTY,
-    FLAG_NEEDS_VACUUM, HEADER_SIZE,
+    FLAG_NEEDS_VACUUM, HEADER_SIZE, HEADER_SIZE_U16,
 };
-pub use page::{Page, PageId, PAGE_SIZE};
+pub use heap::{HeapPage, SlotId, MAX_TUPLE_SIZE, SLOT_SIZE, SLOT_SIZE_U16};
+pub use page::{Page, PageId, PAGE_SIZE, PAGE_SIZE_U16};
