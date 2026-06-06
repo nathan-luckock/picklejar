@@ -27,6 +27,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod btree;
 pub mod buffer;
 pub mod crc32;
 pub mod error;
@@ -35,6 +36,7 @@ pub mod header;
 pub mod heap;
 pub mod page;
 
+pub use btree::{InternalPage, INTERNAL_ENTRY_SIZE, MAX_INTERNAL_KEYS, MAX_INTERNAL_KEYS_U16};
 pub use buffer::{BufferPool, PageReadGuard, PageWriteGuard, K};
 pub use error::{Result, StorageError};
 pub use file::FileManager;

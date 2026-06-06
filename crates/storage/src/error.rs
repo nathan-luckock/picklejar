@@ -87,10 +87,24 @@ pub enum StorageError {
     SlotAlreadyDeleted(u16),
 
     /// All buffer pool frames are pinned; no victim available for eviction.
-    /// The caller is holding too many guards simultaneously — typically a
+    /// The caller is holding too many guards simultaneously, typically a
     /// query plan bug that pins more pages than the pool can hold.
     #[error("buffer pool full: all frames are pinned")]
     BufferPoolFull,
+
+    /// A B+ tree node has reached its capacity. Caller should split.
+    #[error("B+ tree node full: {key_count} entries, capacity {capacity}")]
+    BTreeNodeFull {
+        /// Current number of keys in the node.
+        key_count: u16,
+        /// Maximum keys the node can hold.
+        capacity: u16,
+    },
+
+    /// Caller tried to insert a duplicate key into a B+ tree node.
+    /// Sprint 2 uses unique-key B+ trees; composite keys come later.
+    #[error("duplicate B+ tree key: {0}")]
+    DuplicateBTreeKey(u64),
 }
 
 /// Convenience alias for results returned by the storage layer.
