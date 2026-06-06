@@ -36,6 +36,10 @@
 //!
 //! [`PageHeader`]: crate::header::PageHeader
 
+use std::cell::Cell;
+use std::ops::Bound;
+
+use crate::buffer::BufferPool;
 use crate::error::{Result, StorageError};
 use crate::header::{PageHeader, PageType, HEADER_SIZE};
 use crate::heap::SlotId;
@@ -509,6 +513,565 @@ impl<'a> LeafPage<'a> {
     }
 }
 
+// ============================================================================
+// Read-only views (operate on `&Page`)
+// ============================================================================
+
+/// Read-only view over an internal node. Used by traversal paths that hold
+/// a buffer pool read guard and only need to inspect the page.
+#[derive(Debug)]
+struct InternalView<'a> {
+    buf: &'a Page,
+}
+
+impl<'a> InternalView<'a> {
+    fn new(buf: &'a Page) -> Result<Self> {
+        let header = PageHeader::read(buf)?;
+        if header.page_type != PageType::BTreeInternal {
+            return Err(StorageError::WrongPageType {
+                expected: PageType::BTreeInternal,
+                actual: header.page_type,
+            });
+        }
+        Ok(Self { buf })
+    }
+
+    fn key_count(&self) -> u16 {
+        u16::from_le_bytes(
+            self.buf[KEY_COUNT_OFFSET..KEY_COUNT_OFFSET + 2]
+                .try_into()
+                .expect("2 bytes"),
+        )
+    }
+
+    fn first_child(&self) -> PageId {
+        let raw = u64::from_le_bytes(
+            self.buf[FIRST_CHILD_OFFSET..FIRST_CHILD_OFFSET + 8]
+                .try_into()
+                .expect("8 bytes"),
+        );
+        PageId::new(raw)
+    }
+
+    fn entry_at(&self, index: u16) -> (u64, PageId) {
+        let off = ENTRIES_OFFSET + (index as usize) * INTERNAL_ENTRY_SIZE;
+        let key = u64::from_le_bytes(self.buf[off..off + 8].try_into().expect("8 bytes"));
+        let child = u64::from_le_bytes(self.buf[off + 8..off + 16].try_into().expect("8 bytes"));
+        (key, PageId::new(child))
+    }
+
+    fn find_child(&self, query_key: u64) -> PageId {
+        let count = self.key_count();
+        if count == 0 {
+            return self.first_child();
+        }
+        let mut lo: u16 = 0;
+        let mut hi: u16 = count;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let (k, _) = self.entry_at(mid);
+            if k <= query_key {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        if lo == 0 {
+            self.first_child()
+        } else {
+            self.entry_at(lo - 1).1
+        }
+    }
+}
+
+/// Read-only view over a leaf node.
+#[derive(Debug)]
+struct LeafView<'a> {
+    buf: &'a Page,
+}
+
+impl<'a> LeafView<'a> {
+    fn new(buf: &'a Page) -> Result<Self> {
+        let header = PageHeader::read(buf)?;
+        if header.page_type != PageType::BTreeLeaf {
+            return Err(StorageError::WrongPageType {
+                expected: PageType::BTreeLeaf,
+                actual: header.page_type,
+            });
+        }
+        Ok(Self { buf })
+    }
+
+    fn key_count(&self) -> u16 {
+        u16::from_le_bytes(
+            self.buf[LEAF_KEY_COUNT_OFFSET..LEAF_KEY_COUNT_OFFSET + 2]
+                .try_into()
+                .expect("2 bytes"),
+        )
+    }
+
+    fn next_leaf(&self) -> PageId {
+        let raw = u64::from_le_bytes(
+            self.buf[LEAF_NEXT_LEAF_OFFSET..LEAF_NEXT_LEAF_OFFSET + 8]
+                .try_into()
+                .expect("8 bytes"),
+        );
+        PageId::new(raw)
+    }
+
+    fn entry_at(&self, index: u16) -> (u64, TupleRef) {
+        let off = LEAF_ENTRIES_OFFSET + (index as usize) * LEAF_ENTRY_SIZE;
+        let key = u64::from_le_bytes(self.buf[off..off + 8].try_into().expect("8 bytes"));
+        let page = u64::from_le_bytes(self.buf[off + 8..off + 16].try_into().expect("8 bytes"));
+        let slot = u16::from_le_bytes(self.buf[off + 16..off + 18].try_into().expect("2 bytes"));
+        (key, TupleRef::new(PageId::new(page), SlotId::new(slot)))
+    }
+
+    fn find_key(&self, key: u64) -> Option<TupleRef> {
+        let count = self.key_count();
+        let mut lo: u16 = 0;
+        let mut hi: u16 = count;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let (k, t) = self.entry_at(mid);
+            match k.cmp(&key) {
+                std::cmp::Ordering::Equal => return Some(t),
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+            }
+        }
+        None
+    }
+
+    /// Position of the first entry whose key is >= `lo_key`. Returns
+    /// `key_count` when every key is strictly less than `lo_key`.
+    fn lower_bound(&self, lo_key: u64) -> u16 {
+        let count = self.key_count();
+        let mut lo: u16 = 0;
+        let mut hi: u16 = count;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let (k, _) = self.entry_at(mid);
+            if k < lo_key {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    }
+}
+
+// ============================================================================
+// BTree: insert / search / range_scan
+// ============================================================================
+
+/// A B+ tree index over a [`BufferPool`].
+///
+/// The tree's root page may change across `insert` calls when the current
+/// root splits, so the root id lives in a `Cell` and `BTree` borrows the
+/// pool immutably.
+pub struct BTree<'pool> {
+    pool: &'pool BufferPool,
+    root: Cell<PageId>,
+}
+
+impl<'pool> BTree<'pool> {
+    /// Create a new empty B+ tree. Allocates one leaf page as the initial
+    /// root and returns a handle.
+    pub fn create(pool: &'pool BufferPool) -> Result<Self> {
+        let (root_id, mut guard) = pool.new_page()?;
+        LeafPage::init(guard.page_mut(), PageId::INVALID);
+        Ok(Self {
+            pool,
+            root: Cell::new(root_id),
+        })
+    }
+
+    /// Open an existing tree whose root is `root`.
+    #[must_use]
+    pub const fn open(pool: &'pool BufferPool, root: PageId) -> Self {
+        Self {
+            pool,
+            root: Cell::new(root),
+        }
+    }
+
+    /// Current root page id. Changes when the root splits.
+    #[must_use]
+    pub fn root_page(&self) -> PageId {
+        self.root.get()
+    }
+
+    /// Look up `key`. Returns `None` if the key is not in the tree.
+    pub fn search(&self, key: u64) -> Result<Option<TupleRef>> {
+        let mut current = self.root.get();
+        loop {
+            let guard = self.pool.fetch_page(current)?;
+            let header = PageHeader::read(guard.page())?;
+            match header.page_type {
+                PageType::BTreeLeaf => {
+                    let leaf = LeafView::new(guard.page())?;
+                    return Ok(leaf.find_key(key));
+                }
+                PageType::BTreeInternal => {
+                    let internal = InternalView::new(guard.page())?;
+                    current = internal.find_child(key);
+                }
+                other => {
+                    return Err(StorageError::WrongPageType {
+                        expected: PageType::BTreeLeaf,
+                        actual: other,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Insert `(key, tuple)`. Splits and propagates as needed; allocates a
+    /// new root when the existing root splits.
+    pub fn insert(&self, key: u64, tuple: TupleRef) -> Result<()> {
+        let root = self.root.get();
+        let split = self.insert_recursive(root, key, tuple)?;
+        if let Some((promoted_key, new_right_child)) = split {
+            // The root split. Allocate a new root that points at the old
+            // root (now the left child) and the new sibling (right child),
+            // with the promoted key as the only separator.
+            let (new_root_id, mut guard) = self.pool.new_page()?;
+            let mut new_root = InternalPage::init(guard.page_mut(), root);
+            new_root.insert(promoted_key, new_right_child)?;
+            drop(guard);
+            self.root.set(new_root_id);
+        }
+        Ok(())
+    }
+
+    /// Walk to the right child for `key`, recurse, and insert any promoted
+    /// separator into this node on the way back up. Returns `Some((key,
+    /// new_right_child))` when this node split.
+    fn insert_recursive(
+        &self,
+        page_id: PageId,
+        key: u64,
+        tuple: TupleRef,
+    ) -> Result<Option<(u64, PageId)>> {
+        // Peek at the page type with a read guard first.
+        let page_type = {
+            let guard = self.pool.fetch_page(page_id)?;
+            PageHeader::read(guard.page())?.page_type
+        };
+
+        match page_type {
+            PageType::BTreeLeaf => self.insert_into_leaf(page_id, key, tuple),
+            PageType::BTreeInternal => {
+                // Find the child to descend into using a read view.
+                let child_id = {
+                    let guard = self.pool.fetch_page(page_id)?;
+                    let internal = InternalView::new(guard.page())?;
+                    internal.find_child(key)
+                };
+                let result = self.insert_recursive(child_id, key, tuple)?;
+                if let Some((promoted_key, new_right_child)) = result {
+                    self.insert_into_internal(page_id, promoted_key, new_right_child)
+                } else {
+                    Ok(None)
+                }
+            }
+            other => Err(StorageError::WrongPageType {
+                expected: PageType::BTreeLeaf,
+                actual: other,
+            }),
+        }
+    }
+
+    /// Insert into a leaf. Splits when full.
+    fn insert_into_leaf(
+        &self,
+        page_id: PageId,
+        key: u64,
+        tuple: TupleRef,
+    ) -> Result<Option<(u64, PageId)>> {
+        // First try the easy path: room in the leaf.
+        {
+            let mut guard = self.pool.fetch_page_mut(page_id)?;
+            let mut leaf = LeafPage::from_bytes(guard.page_mut())?;
+            match leaf.insert(key, tuple) {
+                Ok(()) => return Ok(None),
+                Err(StorageError::BTreeNodeFull { .. }) => {
+                    // Fall through to split below.
+                }
+                Err(e) => return Err(e),
+            }
+        } // drop guard before allocating
+
+        self.split_leaf_and_insert(page_id, key, tuple).map(Some)
+    }
+
+    fn split_leaf_and_insert(
+        &self,
+        old_id: PageId,
+        insert_key: u64,
+        insert_tuple: TupleRef,
+    ) -> Result<(u64, PageId)> {
+        // Allocate the new (right) sibling first. new_page returns a write
+        // guard, but we drop it immediately so we can re-fetch in a more
+        // controlled order below.
+        let (new_id, new_guard) = self.pool.new_page()?;
+        drop(new_guard);
+
+        // Snapshot the old leaf's data with a read guard.
+        let (mut entries, old_next) = {
+            let guard = self.pool.fetch_page(old_id)?;
+            let view = LeafView::new(guard.page())?;
+            let entries: Vec<(u64, TupleRef)> =
+                (0..view.key_count()).map(|i| view.entry_at(i)).collect();
+            (entries, view.next_leaf())
+        };
+
+        // Splice the new entry in, rejecting duplicates.
+        let pos = entries.partition_point(|(k, _)| *k < insert_key);
+        if pos < entries.len() && entries[pos].0 == insert_key {
+            return Err(StorageError::DuplicateBTreeKey(insert_key));
+        }
+        entries.insert(pos, (insert_key, insert_tuple));
+
+        let mid = entries.len() / 2;
+        let split_key = entries[mid].0;
+
+        // Initialize the new leaf with the right half, pointing at the
+        // old leaf's former next_leaf.
+        {
+            let mut new_guard = self.pool.fetch_page_mut(new_id)?;
+            LeafPage::init(new_guard.page_mut(), old_next);
+            let mut new_leaf = LeafPage::from_bytes(new_guard.page_mut())?;
+            for &(k, t) in &entries[mid..] {
+                new_leaf.insert(k, t)?;
+            }
+        }
+
+        // Rewrite the old leaf with the left half. Reset key_count first
+        // so insert can rebuild from scratch; set next_leaf to new_id.
+        {
+            let mut old_guard = self.pool.fetch_page_mut(old_id)?;
+            let mut old_leaf = LeafPage::from_bytes(old_guard.page_mut())?;
+            old_leaf.set_key_count(0);
+            old_leaf.set_next_leaf(new_id);
+            for &(k, t) in &entries[..mid] {
+                old_leaf.insert(k, t)?;
+            }
+        }
+
+        Ok((split_key, new_id))
+    }
+
+    /// Insert into an internal node. Splits when full.
+    fn insert_into_internal(
+        &self,
+        page_id: PageId,
+        key: u64,
+        right_child: PageId,
+    ) -> Result<Option<(u64, PageId)>> {
+        // Easy path first.
+        {
+            let mut guard = self.pool.fetch_page_mut(page_id)?;
+            let mut internal = InternalPage::from_bytes(guard.page_mut())?;
+            match internal.insert(key, right_child) {
+                Ok(()) => return Ok(None),
+                Err(StorageError::BTreeNodeFull { .. }) => {}
+                Err(e) => return Err(e),
+            }
+        }
+
+        self.split_internal_and_insert(page_id, key, right_child)
+            .map(Some)
+    }
+
+    fn split_internal_and_insert(
+        &self,
+        old_id: PageId,
+        insert_key: u64,
+        insert_right_child: PageId,
+    ) -> Result<(u64, PageId)> {
+        let (new_id, new_guard) = self.pool.new_page()?;
+        drop(new_guard);
+
+        // Snapshot the old internal node.
+        let (mut entries, old_first_child) = {
+            let guard = self.pool.fetch_page(old_id)?;
+            let view = InternalView::new(guard.page())?;
+            let entries: Vec<(u64, PageId)> =
+                (0..view.key_count()).map(|i| view.entry_at(i)).collect();
+            (entries, view.first_child())
+        };
+
+        // Splice in the new separator.
+        let pos = entries.partition_point(|(k, _)| *k < insert_key);
+        if pos < entries.len() && entries[pos].0 == insert_key {
+            return Err(StorageError::DuplicateBTreeKey(insert_key));
+        }
+        entries.insert(pos, (insert_key, insert_right_child));
+
+        // Promote the middle key. Left keeps entries[..mid], right gets
+        // first_child = entries[mid].right_child and entries[mid+1..].
+        let mid = entries.len() / 2;
+        let promoted_key = entries[mid].0;
+        let new_first_child = entries[mid].1;
+        let left_entries = entries[..mid].to_vec();
+        let right_entries = entries[mid + 1..].to_vec();
+
+        // Initialize new internal node.
+        {
+            let mut new_guard = self.pool.fetch_page_mut(new_id)?;
+            InternalPage::init(new_guard.page_mut(), new_first_child);
+            let mut new_internal = InternalPage::from_bytes(new_guard.page_mut())?;
+            for &(k, c) in &right_entries {
+                new_internal.insert(k, c)?;
+            }
+        }
+
+        // Rewrite old internal node with the left half.
+        {
+            let mut old_guard = self.pool.fetch_page_mut(old_id)?;
+            // Re-init preserves the first_child slot; we use the old one.
+            InternalPage::init(old_guard.page_mut(), old_first_child);
+            let mut old_internal = InternalPage::from_bytes(old_guard.page_mut())?;
+            for &(k, c) in &left_entries {
+                old_internal.insert(k, c)?;
+            }
+        }
+
+        Ok((promoted_key, new_id))
+    }
+
+    /// Iterate over entries with keys in `[lo, hi)` (or whatever the
+    /// `Bound`s specify). The iterator is lazy: each `next()` may fetch
+    /// the next sibling leaf via the buffer pool.
+    pub fn range_scan(&self, lo: Bound<u64>, hi: Bound<u64>) -> Result<RangeScan<'pool>> {
+        // Walk to the leaf that *might* contain the lower bound.
+        let start_key = match lo {
+            Bound::Included(k) | Bound::Excluded(k) => k,
+            Bound::Unbounded => 0,
+        };
+        let mut current = self.root.get();
+        loop {
+            let guard = self.pool.fetch_page(current)?;
+            let header = PageHeader::read(guard.page())?;
+            match header.page_type {
+                PageType::BTreeLeaf => break,
+                PageType::BTreeInternal => {
+                    let internal = InternalView::new(guard.page())?;
+                    current = internal.find_child(start_key);
+                }
+                other => {
+                    return Err(StorageError::WrongPageType {
+                        expected: PageType::BTreeLeaf,
+                        actual: other,
+                    });
+                }
+            }
+        }
+
+        // Position within the start leaf.
+        let start_index = {
+            let guard = self.pool.fetch_page(current)?;
+            let view = LeafView::new(guard.page())?;
+            let mut idx = view.lower_bound(start_key);
+            if let Bound::Excluded(k) = lo {
+                if idx < view.key_count() {
+                    let (existing, _) = view.entry_at(idx);
+                    if existing == k {
+                        idx += 1;
+                    }
+                }
+            }
+            idx
+        };
+
+        Ok(RangeScan {
+            pool: self.pool,
+            current_leaf: current,
+            current_index: start_index,
+            hi,
+            done: false,
+        })
+    }
+}
+
+impl std::fmt::Debug for BTree<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BTree")
+            .field("root", &self.root.get())
+            .finish()
+    }
+}
+
+/// Lending-style iterator over a B+ tree range scan. Each `next` may fault
+/// a leaf page through the buffer pool, so items are `Result`s.
+pub struct RangeScan<'pool> {
+    pool: &'pool BufferPool,
+    current_leaf: PageId,
+    current_index: u16,
+    hi: Bound<u64>,
+    done: bool,
+}
+
+impl Iterator for RangeScan<'_> {
+    type Item = Result<(u64, TupleRef)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        loop {
+            if self.current_leaf.is_invalid() {
+                self.done = true;
+                return None;
+            }
+            let guard = match self.pool.fetch_page(self.current_leaf) {
+                Ok(g) => g,
+                Err(e) => {
+                    self.done = true;
+                    return Some(Err(e));
+                }
+            };
+            let view = match LeafView::new(guard.page()) {
+                Ok(v) => v,
+                Err(e) => {
+                    self.done = true;
+                    return Some(Err(e));
+                }
+            };
+            if self.current_index >= view.key_count() {
+                self.current_leaf = view.next_leaf();
+                self.current_index = 0;
+                continue;
+            }
+            let (k, t) = view.entry_at(self.current_index);
+            let in_upper = match self.hi {
+                Bound::Included(hi) => k <= hi,
+                Bound::Excluded(hi) => k < hi,
+                Bound::Unbounded => true,
+            };
+            if !in_upper {
+                self.done = true;
+                return None;
+            }
+            self.current_index += 1;
+            return Some(Ok((k, t)));
+        }
+    }
+}
+
+impl std::fmt::Debug for RangeScan<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RangeScan")
+            .field("current_leaf", &self.current_leaf)
+            .field("current_index", &self.current_index)
+            .field("done", &self.done)
+            .finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -815,5 +1378,219 @@ mod tests {
         assert!(PageId::INVALID.is_invalid());
         assert!(!PageId::new(0).is_invalid());
         assert!(!PageId::new(42).is_invalid());
+    }
+
+    // ------------------------------------------------------------------------
+    // BTree ops tests (insert / search / range_scan with split propagation)
+    // ------------------------------------------------------------------------
+
+    use crate::buffer::BufferPool;
+    use crate::file::FileManager;
+    use tempfile::TempDir;
+
+    fn fresh_tree(pool_size: usize) -> (TempDir, BufferPool) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = FileManager::open(dir.path().join("tree.db")).expect("open");
+        let pool = BufferPool::new(file, pool_size);
+        (dir, pool)
+    }
+
+    fn tr(slot: u16) -> TupleRef {
+        TupleRef::new(PageId::new(1), SlotId::new(slot))
+    }
+
+    #[test]
+    fn btree_create_makes_single_leaf_root() {
+        let (_dir, pool) = fresh_tree(8);
+        let tree = BTree::create(&pool).expect("create");
+        // Root is a leaf with no entries.
+        let g = pool.fetch_page(tree.root_page()).expect("read root");
+        let header = PageHeader::read(g.page()).expect("hdr");
+        assert_eq!(header.page_type, PageType::BTreeLeaf);
+        let view = LeafView::new(g.page()).expect("leaf view");
+        assert_eq!(view.key_count(), 0);
+    }
+
+    #[test]
+    fn btree_search_on_empty_returns_none() {
+        let (_dir, pool) = fresh_tree(8);
+        let tree = BTree::create(&pool).expect("create");
+        assert_eq!(tree.search(42).expect("search"), None);
+    }
+
+    #[test]
+    fn btree_insert_then_search_small() {
+        let (_dir, pool) = fresh_tree(8);
+        let tree = BTree::create(&pool).expect("create");
+        for (i, k) in [10u64, 20, 30, 5, 15].iter().enumerate() {
+            tree.insert(*k, tr(u16::try_from(i).unwrap()))
+                .expect("insert");
+        }
+        for (i, k) in [10u64, 20, 30, 5, 15].iter().enumerate() {
+            assert_eq!(
+                tree.search(*k).expect("search"),
+                Some(tr(u16::try_from(i).unwrap())),
+            );
+        }
+        assert_eq!(tree.search(99).expect("search"), None);
+    }
+
+    #[test]
+    fn btree_insert_rejects_duplicate() {
+        let (_dir, pool) = fresh_tree(8);
+        let tree = BTree::create(&pool).expect("create");
+        tree.insert(42, tr(0)).expect("first");
+        let err = tree.insert(42, tr(1)).expect_err("dup");
+        assert!(matches!(err, StorageError::DuplicateBTreeKey(42)));
+        assert_eq!(tree.search(42).expect("search"), Some(tr(0)));
+    }
+
+    #[test]
+    fn btree_leaf_split_propagates_to_new_root() {
+        // Insert enough keys to force at least one leaf split. After the
+        // first split, root becomes an internal node.
+        let (_dir, pool) = fresh_tree(16);
+        let tree = BTree::create(&pool).expect("create");
+        let n = u64::from(MAX_LEAF_KEYS_U16) + 1;
+        for i in 0..n {
+            tree.insert(i, tr(0)).expect("insert");
+        }
+        // Now root should be internal.
+        let g = pool.fetch_page(tree.root_page()).expect("read root");
+        let header = PageHeader::read(g.page()).expect("hdr");
+        assert_eq!(header.page_type, PageType::BTreeInternal);
+        drop(g);
+        // All keys still findable.
+        for i in 0..n {
+            assert_eq!(tree.search(i).expect("search"), Some(tr(0)));
+        }
+        // Keys above the inserted range still miss.
+        assert_eq!(tree.search(n + 100).expect("search"), None);
+    }
+
+    #[test]
+    fn btree_handles_bulk_insert_then_search() {
+        // Cross the threshold for an internal split too. Two full leaves
+        // plus the root keep things shallow; once we cross ~MAX_INTERNAL
+        // separator keys we'd split the internal too. Use a moderate
+        // workload to exercise the split path without blowing test time.
+        let (_dir, pool) = fresh_tree(64);
+        let tree = BTree::create(&pool).expect("create");
+        // Use a deterministic but scrambled order.
+        let keys: Vec<u64> = (0..2000u64).map(|i| (i * 1009 + 7) % 2003).collect();
+        // Dedupe (modulo can collide for prime mismatches, but 1009 vs 2003 are coprime).
+        let mut seen = std::collections::HashSet::new();
+        for k in &keys {
+            if seen.insert(*k) {
+                tree.insert(*k, tr((*k % 65535) as u16)).expect("insert");
+            }
+        }
+        // Every inserted key must be findable.
+        for k in &keys {
+            if seen.contains(k) {
+                let want = Some(tr((*k % 65535) as u16));
+                assert_eq!(tree.search(*k).expect("search"), want, "key {k}");
+            }
+        }
+    }
+
+    #[test]
+    fn btree_range_scan_inclusive_within_single_leaf() {
+        let (_dir, pool) = fresh_tree(8);
+        let tree = BTree::create(&pool).expect("create");
+        for i in 0u64..10 {
+            tree.insert(i, tr(u16::try_from(i).unwrap()))
+                .expect("insert");
+        }
+        let scan = tree
+            .range_scan(Bound::Included(3), Bound::Included(7))
+            .expect("scan");
+        let got: Vec<u64> = scan.map(|r| r.unwrap().0).collect();
+        assert_eq!(got, vec![3, 4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn btree_range_scan_excluded_bounds() {
+        let (_dir, pool) = fresh_tree(8);
+        let tree = BTree::create(&pool).expect("create");
+        for i in 0u64..10 {
+            tree.insert(i, tr(0)).expect("insert");
+        }
+        let got: Vec<u64> = tree
+            .range_scan(Bound::Excluded(3), Bound::Excluded(7))
+            .expect("scan")
+            .map(|r| r.unwrap().0)
+            .collect();
+        assert_eq!(got, vec![4, 5, 6]);
+    }
+
+    #[test]
+    fn btree_range_scan_unbounded_returns_everything() {
+        let (_dir, pool) = fresh_tree(8);
+        let tree = BTree::create(&pool).expect("create");
+        for i in 0u64..20 {
+            tree.insert(i, tr(0)).expect("insert");
+        }
+        let got: Vec<u64> = tree
+            .range_scan(Bound::Unbounded, Bound::Unbounded)
+            .expect("scan")
+            .map(|r| r.unwrap().0)
+            .collect();
+        let expected: Vec<u64> = (0u64..20).collect();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn btree_range_scan_crosses_leaf_boundary() {
+        // Insert enough keys to force a leaf split, then range-scan across
+        // the boundary.
+        let (_dir, pool) = fresh_tree(16);
+        let tree = BTree::create(&pool).expect("create");
+        let n = u64::from(MAX_LEAF_KEYS_U16) + 1;
+        for i in 0..n {
+            tree.insert(i, tr(0)).expect("insert");
+        }
+        // Scan a window that straddles the split point.
+        let mid = n / 2;
+        let got: Vec<u64> = tree
+            .range_scan(Bound::Included(mid - 5), Bound::Included(mid + 5))
+            .expect("scan")
+            .map(|r| r.unwrap().0)
+            .collect();
+        let expected: Vec<u64> = (mid - 5..=mid + 5).collect();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn btree_range_scan_empty_result() {
+        let (_dir, pool) = fresh_tree(8);
+        let tree = BTree::create(&pool).expect("create");
+        tree.insert(10, tr(0)).expect("insert");
+        tree.insert(20, tr(0)).expect("insert");
+        let got: Vec<u64> = tree
+            .range_scan(Bound::Included(30), Bound::Included(40))
+            .expect("scan")
+            .map(|r| r.unwrap().0)
+            .collect();
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn btree_open_existing_root() {
+        // Build a tree, close, re-open with the saved root.
+        let (_dir, pool) = fresh_tree(16);
+        let root_id;
+        {
+            let tree = BTree::create(&pool).expect("create");
+            for i in 0u64..50 {
+                tree.insert(i, tr(u16::try_from(i).unwrap()))
+                    .expect("insert");
+            }
+            root_id = tree.root_page();
+        }
+        pool.flush_all().expect("flush");
+        let tree = BTree::open(&pool, root_id);
+        assert_eq!(tree.search(7).expect("search"), Some(tr(7)));
+        assert_eq!(tree.search(42).expect("search"), Some(tr(42)));
     }
 }
