@@ -21,7 +21,9 @@
 pub mod error;
 pub mod lsn;
 pub mod record;
+pub mod writer;
 
 pub use error::{Result, WalError};
 pub use lsn::{Lsn, TxnId};
 pub use record::{LogRecord, RecordHeader, RecordKind, HEADER_BYTES, MIN_RECORD_BYTES};
+pub use writer::WalWriter;
