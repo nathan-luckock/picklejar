@@ -38,6 +38,7 @@
 
 use crate::error::{Result, StorageError};
 use crate::header::{PageHeader, PageType, HEADER_SIZE};
+use crate::heap::SlotId;
 use crate::page::{Page, PageId, PAGE_SIZE};
 
 /// Bytes per entry in an internal node (`key u64` + `right_child PageId u64`).
@@ -200,6 +201,11 @@ impl<'a> InternalPage<'a> {
         }
     }
 
+    /// Set the `key_count` field. Internal helper used during splits.
+    fn set_key_count(&mut self, count: u16) {
+        self.buf[KEY_COUNT_OFFSET..KEY_COUNT_OFFSET + 2].copy_from_slice(&count.to_le_bytes());
+    }
+
     /// Insert a new `(key, right_child)` entry. Keeps entries sorted
     /// ascending by key.
     ///
@@ -245,9 +251,261 @@ impl<'a> InternalPage<'a> {
         self.buf[insert_off..insert_off + 8].copy_from_slice(&key.to_le_bytes());
         self.buf[insert_off + 8..insert_off + 16].copy_from_slice(&right_child.get().to_le_bytes());
         // Bump key_count.
-        let new_count = count + 1;
-        self.buf[KEY_COUNT_OFFSET..KEY_COUNT_OFFSET + 2].copy_from_slice(&new_count.to_le_bytes());
+        self.set_key_count(count + 1);
         Ok(())
+    }
+}
+
+// ============================================================================
+// Leaf node
+// ============================================================================
+
+/// Reference to a tuple stored on a heap page. B+ tree leaves carry these
+/// instead of the tuple bytes; the actual data lives in the heap.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, PartialOrd, Ord)]
+pub struct TupleRef {
+    /// Heap page that holds the tuple.
+    pub page_id: PageId,
+    /// Slot within that page.
+    pub slot_id: SlotId,
+}
+
+impl TupleRef {
+    /// Construct a `TupleRef` from raw parts.
+    #[must_use]
+    pub const fn new(page_id: PageId, slot_id: SlotId) -> Self {
+        Self { page_id, slot_id }
+    }
+}
+
+/// Bytes per entry in a leaf node.
+///
+/// Layout: 8 (key) + 8 (`page_id`) + 2 (`slot_id`). Packed, not padded.
+/// Reads go through `from_le_bytes` and there is no alignment requirement
+/// on byte slices, so the padding would just waste fanout.
+pub const LEAF_ENTRY_SIZE: usize = 18;
+
+/// Bytes between the page header and the entry array on a leaf node:
+/// `key_count u16` + `next_leaf PageId u64`.
+const LEAF_FIXED_FIELDS: usize = 2 + 8;
+
+/// Maximum number of `(key, tuple_ref)` pairs a leaf can hold.
+pub const MAX_LEAF_KEYS: usize = (PAGE_SIZE - HEADER_SIZE - LEAF_FIXED_FIELDS) / LEAF_ENTRY_SIZE;
+
+/// `MAX_LEAF_KEYS` typed as `u16`. The compile-time assertion below
+/// guarantees the cast can never truncate.
+#[allow(clippy::cast_possible_truncation)]
+pub const MAX_LEAF_KEYS_U16: u16 = MAX_LEAF_KEYS as u16;
+
+const _: () = assert!(
+    MAX_LEAF_KEYS <= u16::MAX as usize,
+    "MAX_LEAF_KEYS must fit in u16",
+);
+
+// Leaf field offsets.
+const LEAF_KEY_COUNT_OFFSET: usize = HEADER_SIZE; // 24
+const LEAF_NEXT_LEAF_OFFSET: usize = LEAF_KEY_COUNT_OFFSET + 2; // 26
+const LEAF_ENTRIES_OFFSET: usize = LEAF_NEXT_LEAF_OFFSET + 8; // 34
+
+/// View over a B+ tree leaf node page.
+#[derive(Debug)]
+pub struct LeafPage<'a> {
+    buf: &'a mut Page,
+}
+
+impl<'a> LeafPage<'a> {
+    /// Initialize `buf` as a fresh leaf with the given `next_leaf` sibling
+    /// pointer. Use [`PageId::INVALID`] for the right-most leaf.
+    pub fn init(buf: &'a mut Page, next_leaf: PageId) -> Self {
+        buf.fill(0);
+        let mut header = PageHeader::new_heap();
+        header.page_type = PageType::BTreeLeaf;
+        header.write(buf);
+        buf[LEAF_KEY_COUNT_OFFSET..LEAF_KEY_COUNT_OFFSET + 2].copy_from_slice(&0u16.to_le_bytes());
+        buf[LEAF_NEXT_LEAF_OFFSET..LEAF_NEXT_LEAF_OFFSET + 8]
+            .copy_from_slice(&next_leaf.get().to_le_bytes());
+        Self { buf }
+    }
+
+    /// Open an existing leaf. Validates `page_type`.
+    pub fn from_bytes(buf: &'a mut Page) -> Result<Self> {
+        let header = PageHeader::read(buf)?;
+        if header.page_type != PageType::BTreeLeaf {
+            return Err(StorageError::WrongPageType {
+                expected: PageType::BTreeLeaf,
+                actual: header.page_type,
+            });
+        }
+        Ok(Self { buf })
+    }
+
+    /// Borrow the underlying page buffer.
+    #[must_use]
+    pub fn as_bytes(&self) -> &Page {
+        self.buf
+    }
+
+    /// Current number of live keys in this leaf.
+    #[must_use]
+    pub fn key_count(&self) -> u16 {
+        u16::from_le_bytes(
+            self.buf[LEAF_KEY_COUNT_OFFSET..LEAF_KEY_COUNT_OFFSET + 2]
+                .try_into()
+                .expect("2 bytes"),
+        )
+    }
+
+    /// The next leaf in the sibling chain, or [`PageId::INVALID`] if this
+    /// is the right-most leaf.
+    #[must_use]
+    pub fn next_leaf(&self) -> PageId {
+        let raw = u64::from_le_bytes(
+            self.buf[LEAF_NEXT_LEAF_OFFSET..LEAF_NEXT_LEAF_OFFSET + 8]
+                .try_into()
+                .expect("8 bytes"),
+        );
+        PageId::new(raw)
+    }
+
+    /// Update the sibling pointer. Pass [`PageId::INVALID`] when this leaf
+    /// becomes the right-most.
+    pub fn set_next_leaf(&mut self, next: PageId) {
+        self.buf[LEAF_NEXT_LEAF_OFFSET..LEAF_NEXT_LEAF_OFFSET + 8]
+            .copy_from_slice(&next.get().to_le_bytes());
+    }
+
+    /// True when the leaf has reached [`MAX_LEAF_KEYS`]. Caller should split.
+    #[must_use]
+    pub fn is_full(&self) -> bool {
+        self.key_count() >= MAX_LEAF_KEYS_U16
+    }
+
+    /// The `(key, tuple_ref)` pair at the given index. Panics if `index`
+    /// is out of range; callers should bounds-check via [`key_count`].
+    ///
+    /// [`key_count`]: Self::key_count
+    #[must_use]
+    pub fn entry_at(&self, index: u16) -> (u64, TupleRef) {
+        debug_assert!(
+            index < self.key_count(),
+            "entry_at({}) out of bounds (key_count={})",
+            index,
+            self.key_count(),
+        );
+        let off = LEAF_ENTRIES_OFFSET + (index as usize) * LEAF_ENTRY_SIZE;
+        let key = u64::from_le_bytes(self.buf[off..off + 8].try_into().expect("8 bytes"));
+        let page = u64::from_le_bytes(self.buf[off + 8..off + 16].try_into().expect("8 bytes"));
+        let slot = u16::from_le_bytes(self.buf[off + 16..off + 18].try_into().expect("2 bytes"));
+        (key, TupleRef::new(PageId::new(page), SlotId::new(slot)))
+    }
+
+    /// Iterator over the keys in ascending order.
+    pub fn iter_keys(&self) -> impl Iterator<Item = u64> + '_ {
+        (0..self.key_count()).map(|i| self.entry_at(i).0)
+    }
+
+    /// Iterator over all `(key, tuple_ref)` entries in ascending key order.
+    pub fn iter_entries(&self) -> impl Iterator<Item = (u64, TupleRef)> + '_ {
+        (0..self.key_count()).map(|i| self.entry_at(i))
+    }
+
+    /// Binary search for `key`. Returns the tuple reference if present.
+    #[must_use]
+    pub fn find_key(&self, key: u64) -> Option<TupleRef> {
+        let count = self.key_count();
+        let mut lo: u16 = 0;
+        let mut hi: u16 = count;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let (k, t) = self.entry_at(mid);
+            match k.cmp(&key) {
+                std::cmp::Ordering::Equal => return Some(t),
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+            }
+        }
+        None
+    }
+
+    /// Set `key_count`. Internal helper for split / merge paths.
+    fn set_key_count(&mut self, count: u16) {
+        self.buf[LEAF_KEY_COUNT_OFFSET..LEAF_KEY_COUNT_OFFSET + 2]
+            .copy_from_slice(&count.to_le_bytes());
+    }
+
+    /// Insert a new `(key, tuple_ref)` entry. Keeps entries sorted by key.
+    /// Rejects duplicates with [`StorageError::DuplicateBTreeKey`].
+    pub fn insert(&mut self, key: u64, tuple_ref: TupleRef) -> Result<()> {
+        if self.is_full() {
+            return Err(StorageError::BTreeNodeFull {
+                key_count: self.key_count(),
+                capacity: MAX_LEAF_KEYS_U16,
+            });
+        }
+        let count = self.key_count();
+        let mut lo: u16 = 0;
+        let mut hi: u16 = count;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let (k, _) = self.entry_at(mid);
+            if k < key {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        if lo < count {
+            let (existing, _) = self.entry_at(lo);
+            if existing == key {
+                return Err(StorageError::DuplicateBTreeKey(key));
+            }
+        }
+        let insert_off = LEAF_ENTRIES_OFFSET + (lo as usize) * LEAF_ENTRY_SIZE;
+        let last_used_off = LEAF_ENTRIES_OFFSET + (count as usize) * LEAF_ENTRY_SIZE;
+        if lo < count {
+            self.buf
+                .copy_within(insert_off..last_used_off, insert_off + LEAF_ENTRY_SIZE);
+        }
+        self.buf[insert_off..insert_off + 8].copy_from_slice(&key.to_le_bytes());
+        self.buf[insert_off + 8..insert_off + 16]
+            .copy_from_slice(&tuple_ref.page_id.get().to_le_bytes());
+        self.buf[insert_off + 16..insert_off + 18]
+            .copy_from_slice(&tuple_ref.slot_id.get().to_le_bytes());
+        self.set_key_count(count + 1);
+        Ok(())
+    }
+
+    /// Delete the entry for `key`. Shifts later entries left by one slot.
+    /// Returns the removed `TupleRef`.
+    pub fn delete(&mut self, key: u64) -> Result<TupleRef> {
+        let count = self.key_count();
+        let mut lo: u16 = 0;
+        let mut hi: u16 = count;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let (k, _) = self.entry_at(mid);
+            match k.cmp(&key) {
+                std::cmp::Ordering::Equal => {
+                    let (_, removed) = self.entry_at(mid);
+                    let entry_off = LEAF_ENTRIES_OFFSET + (mid as usize) * LEAF_ENTRY_SIZE;
+                    let last_off = LEAF_ENTRIES_OFFSET + (count as usize) * LEAF_ENTRY_SIZE;
+                    if mid + 1 < count {
+                        self.buf
+                            .copy_within(entry_off + LEAF_ENTRY_SIZE..last_off, entry_off);
+                    }
+                    // Zero the now-unused tail so debug dumps stay clean.
+                    let new_last_off = last_off - LEAF_ENTRY_SIZE;
+                    for b in &mut self.buf[new_last_off..last_off] {
+                        *b = 0;
+                    }
+                    self.set_key_count(count - 1);
+                    return Ok(removed);
+                }
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+            }
+        }
+        Err(StorageError::BTreeKeyNotFound(key))
     }
 }
 
@@ -399,5 +657,163 @@ mod tests {
             pairs.iter().map(|&(k, c)| (k, PageId::new(c))).collect();
         want.sort_by_key(|&(k, _)| k);
         assert_eq!(got, want);
+    }
+
+    // ------------------------------------------------------------------------
+    // Leaf node tests
+    // ------------------------------------------------------------------------
+
+    fn tref(page: u64, slot: u16) -> TupleRef {
+        TupleRef::new(PageId::new(page), SlotId::new(slot))
+    }
+
+    #[test]
+    fn leaf_fanout_matches_documented_capacity() {
+        assert_eq!(MAX_LEAF_KEYS, 453);
+    }
+
+    #[test]
+    fn leaf_init_produces_empty() {
+        let mut buf = fresh_page();
+        let leaf = LeafPage::init(&mut buf, PageId::INVALID);
+        assert_eq!(leaf.key_count(), 0);
+        assert!(leaf.next_leaf().is_invalid());
+        assert!(!leaf.is_full());
+    }
+
+    #[test]
+    fn leaf_from_bytes_accepts_btree_leaf() {
+        let mut buf = fresh_page();
+        LeafPage::init(&mut buf, PageId::INVALID);
+        assert!(LeafPage::from_bytes(&mut buf).is_ok());
+    }
+
+    #[test]
+    fn leaf_from_bytes_rejects_non_leaf_page() {
+        let mut buf = fresh_page();
+        PageHeader::new_heap().write(&mut buf);
+        let err = LeafPage::from_bytes(&mut buf).expect_err("must reject");
+        assert!(matches!(
+            err,
+            StorageError::WrongPageType {
+                expected: PageType::BTreeLeaf,
+                actual: PageType::Heap,
+            }
+        ));
+    }
+
+    #[test]
+    fn leaf_insert_then_find_round_trips() {
+        let mut buf = fresh_page();
+        let mut leaf = LeafPage::init(&mut buf, PageId::INVALID);
+        leaf.insert(10, tref(100, 0)).expect("insert 10");
+        leaf.insert(20, tref(100, 1)).expect("insert 20");
+        leaf.insert(30, tref(100, 2)).expect("insert 30");
+        assert_eq!(leaf.find_key(10), Some(tref(100, 0)));
+        assert_eq!(leaf.find_key(20), Some(tref(100, 1)));
+        assert_eq!(leaf.find_key(30), Some(tref(100, 2)));
+        assert_eq!(leaf.find_key(15), None);
+        assert_eq!(leaf.find_key(0), None);
+        assert_eq!(leaf.find_key(999), None);
+    }
+
+    #[test]
+    fn leaf_insert_maintains_sorted_order() {
+        let mut buf = fresh_page();
+        let mut leaf = LeafPage::init(&mut buf, PageId::INVALID);
+        let order = [50u64, 10, 30, 20, 40, 5, 60];
+        for (i, &k) in order.iter().enumerate() {
+            leaf.insert(k, tref(100, u16::try_from(i).unwrap()))
+                .expect("insert");
+        }
+        let keys: Vec<u64> = leaf.iter_keys().collect();
+        let mut expected = order.to_vec();
+        expected.sort_unstable();
+        assert_eq!(keys, expected);
+    }
+
+    #[test]
+    fn leaf_rejects_duplicate_key() {
+        let mut buf = fresh_page();
+        let mut leaf = LeafPage::init(&mut buf, PageId::INVALID);
+        leaf.insert(42, tref(100, 0)).expect("first");
+        let err = leaf.insert(42, tref(200, 5)).expect_err("duplicate");
+        assert!(matches!(err, StorageError::DuplicateBTreeKey(42)));
+        assert_eq!(leaf.find_key(42), Some(tref(100, 0)));
+    }
+
+    #[test]
+    fn leaf_is_full_at_max_keys() {
+        let mut buf = fresh_page();
+        let mut leaf = LeafPage::init(&mut buf, PageId::INVALID);
+        for i in 0..u64::from(MAX_LEAF_KEYS_U16) {
+            leaf.insert(i, tref(100, 0)).expect("insert");
+        }
+        assert!(leaf.is_full());
+        let err = leaf.insert(9999, tref(100, 0)).expect_err("must reject");
+        assert!(matches!(err, StorageError::BTreeNodeFull { .. }));
+    }
+
+    #[test]
+    fn leaf_delete_removes_and_returns_tuple_ref() {
+        let mut buf = fresh_page();
+        let mut leaf = LeafPage::init(&mut buf, PageId::INVALID);
+        leaf.insert(10, tref(100, 0)).expect("insert");
+        leaf.insert(20, tref(100, 1)).expect("insert");
+        leaf.insert(30, tref(100, 2)).expect("insert");
+        let removed = leaf.delete(20).expect("delete");
+        assert_eq!(removed, tref(100, 1));
+        assert_eq!(leaf.key_count(), 2);
+        assert_eq!(leaf.find_key(20), None);
+        assert_eq!(leaf.find_key(10), Some(tref(100, 0)));
+        assert_eq!(leaf.find_key(30), Some(tref(100, 2)));
+        let keys: Vec<u64> = leaf.iter_keys().collect();
+        assert_eq!(keys, vec![10, 30]);
+    }
+
+    #[test]
+    fn leaf_delete_missing_key_errors() {
+        let mut buf = fresh_page();
+        let mut leaf = LeafPage::init(&mut buf, PageId::INVALID);
+        leaf.insert(10, tref(100, 0)).expect("insert");
+        let err = leaf.delete(99).expect_err("missing");
+        assert!(matches!(err, StorageError::BTreeKeyNotFound(99)));
+    }
+
+    #[test]
+    fn leaf_sibling_pointer_round_trips() {
+        let mut buf = fresh_page();
+        let mut leaf = LeafPage::init(&mut buf, PageId::INVALID);
+        assert!(leaf.next_leaf().is_invalid());
+        leaf.set_next_leaf(PageId::new(77));
+        assert_eq!(leaf.next_leaf(), PageId::new(77));
+        leaf.set_next_leaf(PageId::INVALID);
+        assert!(leaf.next_leaf().is_invalid());
+    }
+
+    #[test]
+    fn leaf_entry_at_round_trips() {
+        let mut buf = fresh_page();
+        let mut leaf = LeafPage::init(&mut buf, PageId::INVALID);
+        leaf.insert(100, tref(11, 1)).expect("insert");
+        leaf.insert(200, tref(22, 2)).expect("insert");
+        leaf.insert(300, tref(33, 3)).expect("insert");
+        assert_eq!(leaf.entry_at(0), (100, tref(11, 1)));
+        assert_eq!(leaf.entry_at(1), (200, tref(22, 2)));
+        assert_eq!(leaf.entry_at(2), (300, tref(33, 3)));
+    }
+
+    #[test]
+    fn leaf_init_with_explicit_next() {
+        let mut buf = fresh_page();
+        let leaf = LeafPage::init(&mut buf, PageId::new(99));
+        assert_eq!(leaf.next_leaf(), PageId::new(99));
+    }
+
+    #[test]
+    fn page_id_invalid_helpers() {
+        assert!(PageId::INVALID.is_invalid());
+        assert!(!PageId::new(0).is_invalid());
+        assert!(!PageId::new(42).is_invalid());
     }
 }

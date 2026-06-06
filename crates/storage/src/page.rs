@@ -35,6 +35,10 @@ pub type Page = [u8; PAGE_SIZE];
 pub struct PageId(pub u64);
 
 impl PageId {
+    /// Sentinel for "no page". Used by the B+ tree leaf's `next_leaf`
+    /// pointer to mark the right-most leaf in a sibling chain.
+    pub const INVALID: Self = Self(u64::MAX);
+
     /// Construct a `PageId` from a raw u64.
     #[must_use]
     pub const fn new(id: u64) -> Self {
@@ -47,7 +51,14 @@ impl PageId {
         self.0
     }
 
-    /// The byte offset in the file where this page begins.
+    /// True for the [`PageId::INVALID`] sentinel.
+    #[must_use]
+    pub const fn is_invalid(self) -> bool {
+        self.0 == u64::MAX
+    }
+
+    /// The byte offset in the file where this page begins. Undefined for
+    /// the `INVALID` sentinel.
     #[must_use]
     pub const fn byte_offset(self) -> u64 {
         self.0 * PAGE_SIZE as u64

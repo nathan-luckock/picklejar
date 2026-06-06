@@ -105,6 +105,10 @@ pub enum StorageError {
     /// Sprint 2 uses unique-key B+ trees; composite keys come later.
     #[error("duplicate B+ tree key: {0}")]
     DuplicateBTreeKey(u64),
+
+    /// Caller asked to delete a key that is not present in the B+ tree.
+    #[error("B+ tree key not found: {0}")]
+    BTreeKeyNotFound(u64),
 }
 
 /// Convenience alias for results returned by the storage layer.

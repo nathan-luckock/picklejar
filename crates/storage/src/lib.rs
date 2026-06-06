@@ -36,7 +36,10 @@ pub mod header;
 pub mod heap;
 pub mod page;
 
-pub use btree::{InternalPage, INTERNAL_ENTRY_SIZE, MAX_INTERNAL_KEYS, MAX_INTERNAL_KEYS_U16};
+pub use btree::{
+    InternalPage, LeafPage, TupleRef, INTERNAL_ENTRY_SIZE, LEAF_ENTRY_SIZE, MAX_INTERNAL_KEYS,
+    MAX_INTERNAL_KEYS_U16, MAX_LEAF_KEYS, MAX_LEAF_KEYS_U16,
+};
 pub use buffer::{BufferPool, PageReadGuard, PageWriteGuard, K};
 pub use error::{Result, StorageError};
 pub use file::FileManager;
