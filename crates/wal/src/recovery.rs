@@ -208,6 +208,43 @@ pub(crate) fn apply_image(
     Ok(true)
 }
 
+/// Summary of a recovery run, returned by [`recover`].
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct RecoveryStats {
+    /// Committed transactions found during analysis.
+    pub winners: usize,
+    /// Uncommitted transactions rolled back.
+    pub losers: usize,
+    /// Records re-applied during redo.
+    pub redone: usize,
+    /// Updates reverted during undo (CLRs written).
+    pub undone: usize,
+}
+
+/// Run all three recovery phases against `pool` and `wal_path`, then flush
+/// the recovered pages so the result is durable. Returns a summary.
+///
+/// `pool` may be a plain pool with no WAL hook: everything the recovered
+/// pages reference is already fsync'd (winner records were durable before
+/// the crash; undo fsyncs its CLRs), so the final `flush_all` is safe.
+///
+/// Recovery is idempotent: running it twice over the same WAL converges to
+/// the same state and the second run redoes/undoes nothing new.
+pub fn recover(pool: &BufferPool, wal_path: impl AsRef<Path>) -> Result<RecoveryStats> {
+    let wal_path = wal_path.as_ref();
+    let analysis = analyze(wal_path)?;
+    let redone = redo(pool, wal_path)?;
+    let mut writer = WalWriter::open(wal_path)?;
+    let undone = undo(pool, &mut writer, &analysis, wal_path)?;
+    pool.flush_all().map_err(to_io)?;
+    Ok(RecoveryStats {
+        winners: analysis.winners().len(),
+        losers: analysis.losers().len(),
+        redone,
+        undone,
+    })
+}
+
 /// Roll back every loser transaction, writing CLRs as it goes.
 ///
 /// For each loser, walk its log records backward from `last_lsn` via the
