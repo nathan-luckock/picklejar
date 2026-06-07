@@ -1,4 +1,4 @@
-//! ARIES-style crash recovery: analysis and redo (undo lands in #34).
+//! ARIES-style crash recovery: analysis, redo, and undo.
 //!
 //! Recovery runs in three phases after a crash:
 //!
@@ -9,8 +9,9 @@
 //! 2. **Redo** ([`redo`]) replays *history*: every `Update` and `Clr` is
 //!    re-applied to the page it touched, gated on the page's stored LSN so
 //!    the replay is idempotent. Redo runs for winners and losers alike, so
-//!    that undo (phase 3) starts from a known state.
-//! 3. **Undo** rolls back losers. Implemented in a follow-up (issue #34).
+//!    that undo starts from a known state.
+//! 3. **Undo** ([`undo`]) rolls back losers, walking each one's `prev_lsn`
+//!    chain backward and writing a CLR per reverted update.
 //!
 //! # Why redo replays losers too
 //!
@@ -34,9 +35,10 @@ use std::path::Path;
 use rustdb_storage::{BufferPool, HeapPage, PageHeader, PageId, PageType, SlotId};
 
 use crate::error::Result;
-use crate::lsn::Lsn;
+use crate::lsn::{Lsn, TxnId};
 use crate::reader::WalReader;
-use crate::record::LogRecord;
+use crate::record::{LogRecord, RecordHeader, RecordKind};
+use crate::writer::WalWriter;
 
 /// Per-transaction state rebuilt during analysis.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -206,6 +208,103 @@ pub(crate) fn apply_image(
     Ok(true)
 }
 
+/// Roll back every loser transaction, writing CLRs as it goes.
+///
+/// For each loser, walk its log records backward from `last_lsn` via the
+/// `prev_lsn` chain. Each `Update` is reverted by applying its before-image
+/// and appending a CLR whose `undo_next` points at the next record to undo.
+/// `Clr` records encountered (left by a previous crashed undo) are skipped
+/// straight to their `undo_next`, so undo never re-does work already
+/// compensated. A loser whose last record is already an `Abort` is fully
+/// rolled back and is skipped entirely.
+///
+/// Returns the number of CLRs written (i.e. the number of updates undone).
+///
+/// CLRs and the terminating `Abort` are fsync'd, so a crash mid-undo is
+/// recoverable: re-running redo replays the CLRs already on disk, and undo
+/// resumes from the last CLR's `undo_next`.
+pub fn undo(
+    pool: &BufferPool,
+    writer: &mut WalWriter,
+    analysis: &Analysis,
+    wal_path: impl AsRef<Path>,
+) -> Result<usize> {
+    let records = read_all(wal_path)?;
+    let mut clrs_written = 0usize;
+
+    for txn_id in analysis.losers() {
+        let status = analysis.txns[&txn_id];
+
+        // Already fully rolled back? (last record is an Abort.)
+        if let Some((hdr, _)) = records.get(&status.last_lsn.get()) {
+            if hdr.kind == RecordKind::Abort {
+                continue;
+            }
+        }
+
+        let txn = TxnId::new(txn_id);
+        // The undo chain's log tail: each CLR we append links to the prior
+        // record so the transaction's on-disk chain stays connected.
+        let mut chain_tail = status.last_lsn;
+        let mut next = status.last_lsn;
+
+        while !next.is_invalid() {
+            let Some((hdr, rec)) = records.get(&next.get()) else {
+                break; // chain points outside the log; stop defensively
+            };
+            match rec {
+                LogRecord::Update {
+                    page_id,
+                    slot_id,
+                    before,
+                    ..
+                } => {
+                    let clr = LogRecord::Clr {
+                        page_id: *page_id,
+                        slot_id: *slot_id,
+                        undo_image: before.clone(),
+                        undo_next: hdr.prev_lsn.get(),
+                    };
+                    let clr_lsn = writer.append(&clr, txn, chain_tail)?;
+                    writer.fsync_through(clr_lsn)?;
+                    // Apply the before-image, stamping the page with the
+                    // CLR's LSN so redo of this CLR is idempotent.
+                    apply_image(pool, *page_id, *slot_id, before, clr_lsn)?;
+                    clrs_written += 1;
+                    chain_tail = clr_lsn;
+                    next = hdr.prev_lsn;
+                }
+                LogRecord::Clr { undo_next, .. } => {
+                    // Region already compensated by a prior undo; skip it.
+                    next = Lsn::new(*undo_next);
+                }
+                LogRecord::Begin => break,
+                // Commit/Abort/Checkpoint should not appear mid-chain for a
+                // loser, but follow the link defensively.
+                _ => next = hdr.prev_lsn,
+            }
+        }
+
+        // Mark the transaction fully rolled back.
+        let abort_lsn = writer.append(&LogRecord::Abort, txn, chain_tail)?;
+        writer.fsync_through(abort_lsn)?;
+    }
+
+    Ok(clrs_written)
+}
+
+/// Read every complete record in the WAL into a map keyed by LSN. Used by
+/// undo for random access while walking `prev_lsn` chains backward.
+fn read_all(wal_path: impl AsRef<Path>) -> Result<HashMap<u64, (RecordHeader, LogRecord)>> {
+    let reader = WalReader::open(wal_path)?;
+    let mut map = HashMap::new();
+    for item in reader {
+        let (hdr, rec) = item?;
+        map.insert(hdr.lsn.get(), (hdr, rec));
+    }
+    Ok(map)
+}
+
 /// Map a storage error into a WAL error. Recovery surfaces storage failures
 /// as I/O errors since they all mean "the page layer could not complete a
 /// recovery operation".
@@ -338,6 +437,101 @@ mod tests {
         buf.copy_from_slice(guard.page());
         let heap = HeapPage::from_bytes(&mut buf).expect("heap");
         assert_eq!(heap.get(SlotId::new(0)), None, "no tuple should be present");
+    }
+
+    /// Read a slot's bytes off a page through the pool (test helper).
+    fn read_slot(pool: &BufferPool, page_id: u64, slot: u16) -> Option<Vec<u8>> {
+        let guard = pool.fetch_page(PageId::new(page_id)).expect("fetch");
+        let mut buf = Box::new([0u8; PAGE_SIZE]);
+        buf.copy_from_slice(guard.page());
+        let heap = HeapPage::from_bytes(&mut buf).expect("heap");
+        heap.get(SlotId::new(slot)).map(<[u8]>::to_vec)
+    }
+
+    #[test]
+    fn undo_rolls_back_uncommitted_insert() {
+        // txn 1 inserts but never commits. After redo+undo the row is gone.
+        let (dir, wal) = build_wal(&[
+            (LogRecord::Begin, 1, u64::MAX),
+            (upd(0, 0, b"", b"ghost"), 1, 1),
+        ]);
+        let pool = fresh_pool(&dir, "data.db", 16);
+        redo(&pool, &wal).expect("redo");
+        // After redo, the (uncommitted) insert is present (repeat history).
+        assert_eq!(read_slot(&pool, 0, 0).as_deref(), Some(&b"ghost"[..]));
+
+        let analysis = analyze(&wal).expect("analyze");
+        assert_eq!(analysis.losers(), vec![1]);
+        let mut writer = WalWriter::open(&wal).expect("writer");
+        let undone = undo(&pool, &mut writer, &analysis, &wal).expect("undo");
+        assert_eq!(undone, 1);
+        // The insert has been rolled back to a tombstone.
+        assert_eq!(read_slot(&pool, 0, 0), None);
+    }
+
+    #[test]
+    fn undo_reverts_uncommitted_update_to_before_image() {
+        // txn 1 commits an insert; txn 2 updates it but does not commit.
+        let (dir, wal) = build_wal(&[
+            (LogRecord::Begin, 1, u64::MAX),
+            (upd(0, 0, b"", b"committed-value"), 1, 1),
+            (LogRecord::Commit, 1, 2),
+            (LogRecord::Begin, 2, u64::MAX),
+            (upd(0, 0, b"committed-value", b"dirty-value"), 2, 4),
+        ]);
+        let pool = fresh_pool(&dir, "data.db", 16);
+        redo(&pool, &wal).expect("redo");
+        assert_eq!(read_slot(&pool, 0, 0).as_deref(), Some(&b"dirty-value"[..]));
+
+        let analysis = analyze(&wal).expect("analyze");
+        assert_eq!(analysis.winners(), vec![1]);
+        assert_eq!(analysis.losers(), vec![2]);
+        let mut writer = WalWriter::open(&wal).expect("writer");
+        undo(&pool, &mut writer, &analysis, &wal).expect("undo");
+        // Loser's update reverted; winner's value restored.
+        assert_eq!(
+            read_slot(&pool, 0, 0).as_deref(),
+            Some(&b"committed-value"[..])
+        );
+    }
+
+    #[test]
+    fn full_recovery_is_idempotent_across_repeated_runs() {
+        // Simulate a crash during undo by running the whole recovery twice
+        // against fresh buffer pools over the SAME wal. The second run sees
+        // the CLRs + Abort the first run wrote and must converge to the
+        // same state without re-undoing.
+        let (dir, wal) = build_wal(&[
+            (LogRecord::Begin, 1, u64::MAX),
+            (upd(0, 0, b"", b"keep"), 1, 1),
+            (LogRecord::Commit, 1, 2),
+            (LogRecord::Begin, 2, u64::MAX),
+            (upd(0, 1, b"", b"rollme"), 2, 4),
+        ]);
+
+        // First recovery.
+        {
+            let pool = fresh_pool(&dir, "data.db", 16);
+            redo(&pool, &wal).expect("redo 1");
+            let a = analyze(&wal).expect("analyze 1");
+            let mut w = WalWriter::open(&wal).expect("writer 1");
+            undo(&pool, &mut w, &a, &wal).expect("undo 1");
+            assert_eq!(read_slot(&pool, 0, 0).as_deref(), Some(&b"keep"[..]));
+            assert_eq!(read_slot(&pool, 0, 1), None, "loser rolled back");
+        }
+
+        // Second recovery against a fresh data file but the grown WAL.
+        {
+            let pool = fresh_pool(&dir, "data2.db", 16);
+            redo(&pool, &wal).expect("redo 2");
+            let a = analyze(&wal).expect("analyze 2");
+            // Loser 2 is already aborted; undo should write no new CLRs.
+            let mut w = WalWriter::open(&wal).expect("writer 2");
+            let undone = undo(&pool, &mut w, &a, &wal).expect("undo 2");
+            assert_eq!(undone, 0, "already-aborted loser is not undone again");
+            assert_eq!(read_slot(&pool, 0, 0).as_deref(), Some(&b"keep"[..]));
+            assert_eq!(read_slot(&pool, 0, 1), None, "still rolled back");
+        }
     }
 
     #[test]

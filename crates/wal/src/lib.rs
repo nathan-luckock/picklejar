@@ -31,5 +31,5 @@ pub use hook::WalSyncHandle;
 pub use lsn::{Lsn, TxnId};
 pub use reader::WalReader;
 pub use record::{LogRecord, RecordHeader, RecordKind, HEADER_BYTES, MIN_RECORD_BYTES};
-pub use recovery::{analyze, redo, Analysis, TxnStatus};
+pub use recovery::{analyze, redo, undo, Analysis, TxnStatus};
 pub use writer::WalWriter;
