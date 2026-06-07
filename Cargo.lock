@@ -540,7 +540,9 @@ dependencies = [
 name = "rustdb-wal"
 version = "0.0.1"
 dependencies = [
+ "proptest",
  "rustdb-storage",
+ "tempfile",
  "thiserror",
  "tracing",
 ]
