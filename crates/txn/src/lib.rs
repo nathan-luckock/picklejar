@@ -15,5 +15,6 @@
 #![forbid(unsafe_code)]
 
 pub mod manager;
+pub mod visibility;
 
 pub use manager::{IsolationLevel, Snapshot, Transaction, TransactionManager, TxnState, Xid};
