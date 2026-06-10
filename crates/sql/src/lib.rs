@@ -22,5 +22,7 @@ pub use ast::{BinOp, Expr, UnOp, Value};
 pub use error::{Result, SqlError};
 pub use lexer::Lexer;
 pub use parser::Parser;
-pub use statement::{ColumnDef, DataType, Statement};
+pub use statement::{
+    ColumnDef, DataType, Join, JoinKind, OrderItem, Select, SelectItem, Statement, TableRef,
+};
 pub use token::{Keyword, Span, Token, TokenKind};
