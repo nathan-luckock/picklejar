@@ -23,7 +23,8 @@ Non-goals: distributed replication, network protocol compatibility with Postgres
 | 2 | Storage II: buffer pool + B+ tree + proptests | ✅ shipped (PRs #17–#21) |
 | 3 | WAL: record format, writer, reader, buffer pool integration, proptests | ✅ shipped (PRs #27–#31) |
 | 4 | ARIES recovery (analysis + redo + undo + forced-kill torture test) | ✅ shipped (PRs #37–#42) |
-| 5–6 | Transactions + MVCC | ⏳ next |
+| 5 | Transactions + MVCC (manager, visibility, versions, MvccTable, isolation levels) | ✅ shipped (PRs #49–#54) |
+| 6 | MVCC polish: write-write conflict detection, version GC | ⏳ next |
 | 7–9 | SQL parser → planner → executor | ⏳ |
 | 10 | Torture test + polish | ⏳ |
 | 11 | Demo + write-up + SPED talk | ⏳ |
@@ -257,13 +258,56 @@ A dirty page cannot be flushed before its corresponding log records are fsync'd.
 
 ---
 
-## Transactions + MVCC (Sprints 5–6 — planned)
+## Transactions + MVCC (Sprint 5 — shipped)
 
-Snapshot isolation as the default. Each tuple carries `xmin` (creating txn) and `xmax` (deleting txn). A reader at snapshot S sees tuple T iff `xmin(T) ≤ S` and (`xmax(T)` is null or `xmax(T) > S`).
+Implemented in the `rustdb-txn` crate. Snapshot isolation is the default; Read Committed is also available.
 
-The page header's `reserved: u32` field is the version-chain pointer for older tuple versions; the current row lives at the regular slot.
+### Transaction manager (`manager.rs`)
 
-Lock manager exists primarily for DDL and unique-index enforcement; reads under SI don't take row locks.
+Assigns monotonic xids (from 1; `0` is the "no transaction" sentinel), tracks each xid's state (Active / Committed / Aborted), and captures a **txid-based snapshot** at begin (Postgres model):
+
+- `xmax`: first xid not yet started at snapshot time (xids `>= xmax` are invisible).
+- `active`: xids in progress at snapshot time (their writes are invisible).
+- `xmin`: lowest active xid (a fast-path floor).
+
+A creator xid `v` is "committed in the past" for a snapshot iff `v < xmax`, `v` not in `active`, and `state(v) == Committed`.
+
+### Visibility (`visibility.rs`)
+
+A version carries `xmin` (creator) and `xmax` (deleter; `0` = live). `Snapshot::is_visible(xmin, xmax, mgr, reader)` returns true iff **both**:
+1. the creator is visible (`xmin == reader`, i.e. own write, or `xmin` committed in the past), and
+2. the deletion is not visible (`xmax == 0`, or the deleter aborted, or the deleter is still in progress / committed after the snapshot).
+
+Snapshot stability falls out for free: `is_visible` reads only state frozen at begin time, so a later commit can never flip a version's visibility for an existing reader.
+
+### Versioned values (`version.rs`)
+
+Each row is a chain of versions, each stored in a heap slot as:
+`[ xmin u64 | xmax u64 | prev_page u64 | prev_slot u16 | payload ]` (26-byte header). `prev` (a `TupleRef`, `INVALID` = oldest) links a version to the previous one. Deleting or updating stamps the old version's `xmax` in place — a fixed 8-byte write, never a payload rewrite.
+
+### MVCC table (`mvcc.rs`)
+
+A B+ tree index maps `key -> newest version ref`; versions live in heap pages.
+- **insert**: new version at the head, chaining onto any existing head.
+- **update**: stamp the version *visible to the writer* with `xmax = txn`, then chain a new version at the head.
+- **delete**: stamp the version visible to the writer with `xmax = txn`.
+- **get**: walk the chain newest-to-oldest, return the first version visible to the reader's snapshot.
+
+Critically, update/delete operate on the **version visible to the writer**, not the index head — the head can be a dead version from an aborted transaction. (This was caught by the property tests.)
+
+Every write logs an `Update` WAL record (WAL-before-page) so versions are durable.
+
+### Isolation levels
+
+`RepeatableRead` (default) reuses the begin-time snapshot for the whole transaction. `ReadCommitted` refreshes the snapshot before each `get`, so each statement sees commits that landed since the transaction began. The only difference is *when* the snapshot is taken; the visibility rule is shared.
+
+### Scope and deferrals
+
+- **Write-write conflict detection** (first-committer-wins / Serializable, SSI) is a Sprint 6 stretch. Sprint 5 delivers snapshot-stable concurrent **reads** (requirement M5).
+- **MVCC-aware crash recovery** (rebuilding the index, undoing versions) integrates with the executor in a later sprint. Writes are WAL-logged today.
+- **Version GC / vacuum** (reclaiming dead versions) is deferred; dead versions accumulate in the chain for now.
+
+The page header's `reserved: u32` field remains available for an on-page version-chain optimization; the current implementation stores the chain pointer inside the version payload instead.
 
 ---
 
@@ -320,10 +364,15 @@ Still open (resolve before the relevant sprint):
 |---|---|
 | Free-space tracking: per-page free-space map, or scan-on-demand? | Sprint 5 (executor needs it) |
 | MVCC garbage collection: epoch-based or vacuum scan? | Sprint 6 |
-| Checkpoint strategy: fuzzy vs sharp, and frequency (time / txn-count / WAL-size)? | Sprint 5 (when there is a long-running server to checkpoint) |
-| Page checksum maintenance on the write path (recompute on flush)? | Sprint 5 |
-| Group commit: batch fsync across multiple committers? | Sprint 5 (txn manager) |
-| Isolation levels above SI: ship Serializable (SSI) or stop at SI? | Sprint 6 |
+| Write-write conflict detection: first-committer-wins or SSI? | Sprint 6 |
+| Checkpoint strategy: fuzzy vs sharp, and frequency (time / txn-count / WAL-size)? | Sprint 6 (when there is a long-running server to checkpoint) |
+| Page checksum maintenance on the write path (recompute on flush)? | Sprint 6 |
+| Group commit: batch fsync across multiple committers? | Sprint 6 |
+
+Resolved during Sprint 5 (moved to the Transactions + MVCC section above):
+- ~~Snapshot model~~: txid-based (Postgres-style xmin/xmax/active set).
+- ~~Isolation levels~~: RepeatableRead (default) + ReadCommitted shipped; SI is the baseline.
+- ~~Version chain storage~~: chain pointer (prev `TupleRef`) inside the version payload, not the page header.
 
 ---
 

@@ -80,9 +80,16 @@ impl<'env> MvccTable<'env> {
         })
     }
 
-    /// Insert a new row. Creates the first version of `key`.
+    /// Insert a row. Creates a new version of `key` at the head of the row's
+    /// chain.
+    ///
+    /// If the key already has versions (for example a leftover version from
+    /// an aborted transaction), the new version chains onto the current head
+    /// rather than starting a fresh chain, so no older version is ever
+    /// orphaned and snapshots that should still reach it can.
     pub fn insert(&self, txn: &Transaction, key: u64, value: &[u8]) -> Result<()> {
-        let bytes = Version::encode(txn.xid(), 0, None, value);
+        let prev = self.index.search(key)?;
+        let bytes = Version::encode(txn.xid(), 0, prev, value);
         let new_ref = self.store_version(txn.xid(), &bytes)?;
         self.index.upsert(key, new_ref)?;
         Ok(())
@@ -90,9 +97,47 @@ impl<'env> MvccTable<'env> {
 
     /// Read the value of `key` visible to `txn`, or `None`.
     pub fn get(&self, txn: &Transaction, key: u64) -> Result<Option<Vec<u8>>> {
-        // Under ReadCommitted each statement sees a fresh snapshot, so it
-        // observes commits that landed after the transaction began. Under
-        // RepeatableRead the begin-time snapshot is reused unchanged.
+        match self.visible_ref(txn, key)? {
+            Some(at) => {
+                let bytes = self.read_version_bytes(at)?;
+                Ok(Some(Version::decode(&bytes)?.payload.to_vec()))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Update `key` to `value`. Marks the version currently visible to `txn`
+    /// as deleted by `txn`, then chains a new version at the head of the row.
+    pub fn update(&self, txn: &Transaction, key: u64, value: &[u8]) -> Result<()> {
+        let Some(visible) = self.visible_ref(txn, key)? else {
+            return Err(TxnError::KeyNotVisible(key));
+        };
+        // Mark the version this txn could see as deleted by this txn.
+        self.stamp_xmax(txn.xid(), visible)?;
+        // Chain the new version in front of the current head so no version is
+        // dropped from the chain (older snapshots still walk down to theirs).
+        let head = self.index.search(key)?.unwrap_or(visible);
+        let bytes = Version::encode(txn.xid(), 0, Some(head), value);
+        let new_ref = self.store_version(txn.xid(), &bytes)?;
+        self.index.upsert(key, new_ref)?;
+        Ok(())
+    }
+
+    /// Delete `key`. Marks the version currently visible to `txn` as deleted.
+    pub fn delete(&self, txn: &Transaction, key: u64) -> Result<()> {
+        let Some(visible) = self.visible_ref(txn, key)? else {
+            return Err(TxnError::KeyNotVisible(key));
+        };
+        self.stamp_xmax(txn.xid(), visible)?;
+        Ok(())
+    }
+
+    /// Walk the version chain for `key` newest-to-oldest and return the
+    /// reference of the first version visible to `txn`, or `None`.
+    ///
+    /// Under `ReadCommitted` the snapshot is refreshed for this statement;
+    /// under `RepeatableRead` the begin-time snapshot is reused.
+    fn visible_ref(&self, txn: &Transaction, key: u64) -> Result<Option<TupleRef>> {
         if txn.level() == IsolationLevel::ReadCommitted {
             txn.set_snapshot(self.mgr.current_snapshot());
         }
@@ -104,35 +149,13 @@ impl<'env> MvccTable<'env> {
             let bytes = self.read_version_bytes(current)?;
             let v = Version::decode(&bytes)?;
             if snapshot.is_visible(v.xmin, v.xmax, self.mgr, txn.xid()) {
-                return Ok(Some(v.payload.to_vec()));
+                return Ok(Some(current));
             }
             match v.prev {
                 Some(prev) => current = prev,
                 None => return Ok(None),
             }
         }
-    }
-
-    /// Update `key` to `value`. Stamps the current newest version as deleted
-    /// by `txn` and chains a new version in front of it.
-    pub fn update(&self, txn: &Transaction, key: u64, value: &[u8]) -> Result<()> {
-        let Some(head) = self.index.search(key)? else {
-            return Err(TxnError::KeyNotVisible(key));
-        };
-        self.stamp_xmax(txn.xid(), head)?;
-        let bytes = Version::encode(txn.xid(), 0, Some(head), value);
-        let new_ref = self.store_version(txn.xid(), &bytes)?;
-        self.index.upsert(key, new_ref)?;
-        Ok(())
-    }
-
-    /// Delete `key`. Stamps the newest version's `xmax` with `txn`.
-    pub fn delete(&self, txn: &Transaction, key: u64) -> Result<()> {
-        let Some(head) = self.index.search(key)? else {
-            return Err(TxnError::KeyNotVisible(key));
-        };
-        self.stamp_xmax(txn.xid(), head)?;
-        Ok(())
     }
 
     // --- internals ---
