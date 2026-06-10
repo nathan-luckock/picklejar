@@ -431,6 +431,35 @@ impl<'a> LeafPage<'a> {
         None
     }
 
+    /// Overwrite the tuple reference for an existing `key`, in place.
+    /// Returns `true` if the key was found and updated, `false` otherwise.
+    ///
+    /// The key set and ordering are unchanged (only the value bytes move),
+    /// so this never splits or relocates anything. MVCC uses it to point a
+    /// key at its newest version.
+    pub fn update_value(&mut self, key: u64, new_ref: TupleRef) -> bool {
+        let count = self.key_count();
+        let mut lo: u16 = 0;
+        let mut hi: u16 = count;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let (k, _) = self.entry_at(mid);
+            match k.cmp(&key) {
+                std::cmp::Ordering::Equal => {
+                    let off = LEAF_ENTRIES_OFFSET + (mid as usize) * LEAF_ENTRY_SIZE;
+                    self.buf[off + 8..off + 16]
+                        .copy_from_slice(&new_ref.page_id.get().to_le_bytes());
+                    self.buf[off + 16..off + 18]
+                        .copy_from_slice(&new_ref.slot_id.get().to_le_bytes());
+                    return true;
+                }
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+            }
+        }
+        false
+    }
+
     /// Set `key_count`. Internal helper for split / merge paths.
     fn set_key_count(&mut self, count: u16) {
         self.buf[LEAF_KEY_COUNT_OFFSET..LEAF_KEY_COUNT_OFFSET + 2]
@@ -726,6 +755,39 @@ impl<'pool> BTree<'pool> {
                 }
             }
         }
+    }
+
+    /// Insert `key` if absent, or overwrite its tuple reference if present.
+    /// Used by MVCC to point a key at its newest version.
+    pub fn upsert(&self, key: u64, tuple: TupleRef) -> Result<()> {
+        // Walk to the leaf that owns `key` and try an in-place update first.
+        let mut current = self.root.get();
+        let leaf_id = loop {
+            let guard = self.pool.fetch_page(current)?;
+            let header = PageHeader::read(guard.page())?;
+            match header.page_type {
+                PageType::BTreeLeaf => break current,
+                PageType::BTreeInternal => {
+                    let internal = InternalView::new(guard.page())?;
+                    current = internal.find_child(key);
+                }
+                other => {
+                    return Err(StorageError::WrongPageType {
+                        expected: PageType::BTreeLeaf,
+                        actual: other,
+                    });
+                }
+            }
+        };
+        {
+            let mut guard = self.pool.fetch_page_mut(leaf_id)?;
+            let mut leaf = LeafPage::from_bytes(guard.page_mut())?;
+            if leaf.update_value(key, tuple) {
+                return Ok(());
+            }
+        }
+        // Key absent: fall through to a normal insert (which may split).
+        self.insert(key, tuple)
     }
 
     /// Insert `(key, tuple)`. Splits and propagates as needed; allocates a
@@ -1592,5 +1654,43 @@ mod tests {
         let tree = BTree::open(&pool, root_id);
         assert_eq!(tree.search(7).expect("search"), Some(tr(7)));
         assert_eq!(tree.search(42).expect("search"), Some(tr(42)));
+    }
+
+    #[test]
+    fn btree_upsert_inserts_when_absent() {
+        let (_dir, pool) = fresh_tree(16);
+        let tree = BTree::create(&pool).expect("create");
+        tree.upsert(5, tr(1)).expect("upsert new");
+        assert_eq!(tree.search(5).expect("search"), Some(tr(1)));
+    }
+
+    #[test]
+    fn btree_upsert_overwrites_when_present() {
+        let (_dir, pool) = fresh_tree(16);
+        let tree = BTree::create(&pool).expect("create");
+        tree.insert(5, tr(1)).expect("insert");
+        tree.upsert(5, tr(9)).expect("upsert existing");
+        assert_eq!(
+            tree.search(5).expect("search"),
+            Some(tr(9)),
+            "upsert should overwrite the value, not duplicate the key"
+        );
+    }
+
+    #[test]
+    fn btree_upsert_across_split_boundary() {
+        // Upsert many keys (forcing splits), then overwrite some and verify.
+        let (_dir, pool) = fresh_tree(32);
+        let tree = BTree::create(&pool).expect("create");
+        let n = u64::from(MAX_LEAF_KEYS_U16) + 50;
+        for i in 0..n {
+            tree.upsert(i, tr(0)).expect("upsert");
+        }
+        // Overwrite a key that lives past the first split.
+        let target = n - 10;
+        tree.upsert(target, tr(7)).expect("overwrite");
+        assert_eq!(tree.search(target).expect("search"), Some(tr(7)));
+        // A neighbor is untouched.
+        assert_eq!(tree.search(target - 1).expect("search"), Some(tr(0)));
     }
 }
