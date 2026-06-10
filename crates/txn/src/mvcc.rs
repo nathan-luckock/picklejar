@@ -90,8 +90,12 @@ impl<'env> MvccTable<'env> {
 
     /// Read the value of `key` visible to `txn`, or `None`.
     pub fn get(&self, txn: &Transaction, key: u64) -> Result<Option<Vec<u8>>> {
-        // ReadCommitted refreshes its snapshot for each statement; the
-        // refresh itself is wired up in issue #47.
+        // Under ReadCommitted each statement sees a fresh snapshot, so it
+        // observes commits that landed after the transaction began. Under
+        // RepeatableRead the begin-time snapshot is reused unchanged.
+        if txn.level() == IsolationLevel::ReadCommitted {
+            txn.set_snapshot(self.mgr.current_snapshot());
+        }
         let snapshot = txn.snapshot();
         let Some(mut current) = self.index.search(key)? else {
             return Ok(None);
@@ -392,5 +396,72 @@ mod tests {
         let t = e.mgr.begin();
         let err = table.update(&t, 99, b"x").expect_err("must error");
         assert!(matches!(err, TxnError::KeyNotVisible(99)));
+    }
+
+    #[test]
+    fn repeatable_read_does_not_see_concurrent_commit() {
+        let e = env();
+        let table = MvccTable::create(&e.pool, e.wal.clone(), &e.mgr).expect("create");
+        let setup = e.mgr.begin();
+        table.insert(&setup, 1, b"v1").expect("insert");
+        e.mgr.commit(&setup);
+
+        let a = e.mgr.begin_with(IsolationLevel::RepeatableRead);
+        assert_eq!(table.get(&a, 1).expect("get").as_deref(), Some(&b"v1"[..]));
+
+        let b = e.mgr.begin();
+        table.update(&b, 1, b"v2").expect("update");
+        e.mgr.commit(&b);
+
+        // RepeatableRead: A's snapshot is frozen, still "v1".
+        assert_eq!(
+            table.get(&a, 1).expect("re-get").as_deref(),
+            Some(&b"v1"[..]),
+            "RepeatableRead must not see B's concurrent commit",
+        );
+    }
+
+    #[test]
+    fn read_committed_sees_concurrent_commit_after_it_lands() {
+        let e = env();
+        let table = MvccTable::create(&e.pool, e.wal.clone(), &e.mgr).expect("create");
+        let setup = e.mgr.begin();
+        table.insert(&setup, 1, b"v1").expect("insert");
+        e.mgr.commit(&setup);
+
+        let a = e.mgr.begin_with(IsolationLevel::ReadCommitted);
+        assert_eq!(table.get(&a, 1).expect("get").as_deref(), Some(&b"v1"[..]));
+
+        let b = e.mgr.begin();
+        table.update(&b, 1, b"v2").expect("update");
+        e.mgr.commit(&b);
+
+        // ReadCommitted: A refreshes its snapshot per statement, so the next
+        // read sees B's committed value.
+        assert_eq!(
+            table.get(&a, 1).expect("re-get").as_deref(),
+            Some(&b"v2"[..]),
+            "ReadCommitted must see B's commit on the next statement",
+        );
+    }
+
+    #[test]
+    fn read_committed_still_hides_uncommitted_writes() {
+        // ReadCommitted refreshes the snapshot, but an in-progress writer's
+        // changes are still invisible until that writer commits.
+        let e = env();
+        let table = MvccTable::create(&e.pool, e.wal.clone(), &e.mgr).expect("create");
+        let setup = e.mgr.begin();
+        table.insert(&setup, 1, b"v1").expect("insert");
+        e.mgr.commit(&setup);
+
+        let a = e.mgr.begin_with(IsolationLevel::ReadCommitted);
+        let b = e.mgr.begin();
+        table.update(&b, 1, b"v2").expect("update"); // NOT committed
+        assert_eq!(
+            table.get(&a, 1).expect("get").as_deref(),
+            Some(&b"v1"[..]),
+            "uncommitted writes stay invisible even under ReadCommitted",
+        );
     }
 }
