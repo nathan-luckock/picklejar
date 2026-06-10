@@ -15,10 +15,12 @@ pub mod ast;
 pub mod error;
 pub mod lexer;
 pub mod parser;
+pub mod statement;
 pub mod token;
 
 pub use ast::{BinOp, Expr, UnOp, Value};
 pub use error::{Result, SqlError};
 pub use lexer::Lexer;
 pub use parser::Parser;
+pub use statement::{ColumnDef, DataType, Statement};
 pub use token::{Keyword, Span, Token, TokenKind};
