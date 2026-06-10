@@ -232,6 +232,31 @@ pub enum Statement {
     },
     /// A `SELECT` query.
     Select(Box<Select>),
+    /// `INSERT INTO t (cols) VALUES (...), (...)`.
+    Insert {
+        /// Target table.
+        table: String,
+        /// Column list.
+        columns: Vec<String>,
+        /// One or more value rows; each row has one expression per column.
+        rows: Vec<Vec<Expr>>,
+    },
+    /// `UPDATE t SET c = e, ... [WHERE pred]`.
+    Update {
+        /// Target table.
+        table: String,
+        /// `(column, value)` assignments.
+        assignments: Vec<(String, Expr)>,
+        /// Optional WHERE predicate.
+        where_clause: Option<Expr>,
+    },
+    /// `DELETE FROM t [WHERE pred]`.
+    Delete {
+        /// Target table.
+        table: String,
+        /// Optional WHERE predicate.
+        where_clause: Option<Expr>,
+    },
 }
 
 impl fmt::Display for Statement {
@@ -254,6 +279,61 @@ impl fmt::Display for Statement {
                 column,
             } => write!(f, "CREATE INDEX {name} ON {table} ({column})"),
             Self::Select(s) => write!(f, "{s}"),
+            Self::Insert {
+                table,
+                columns,
+                rows,
+            } => {
+                write!(f, "INSERT INTO {table} (")?;
+                for (i, c) in columns.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    f.write_str(c)?;
+                }
+                f.write_str(") VALUES ")?;
+                for (ri, row) in rows.iter().enumerate() {
+                    if ri > 0 {
+                        f.write_str(", ")?;
+                    }
+                    f.write_str("(")?;
+                    for (i, v) in row.iter().enumerate() {
+                        if i > 0 {
+                            f.write_str(", ")?;
+                        }
+                        write!(f, "{v}")?;
+                    }
+                    f.write_str(")")?;
+                }
+                Ok(())
+            }
+            Self::Update {
+                table,
+                assignments,
+                where_clause,
+            } => {
+                write!(f, "UPDATE {table} SET ")?;
+                for (i, (col, val)) in assignments.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{col} = {val}")?;
+                }
+                if let Some(w) = where_clause {
+                    write!(f, " WHERE {w}")?;
+                }
+                Ok(())
+            }
+            Self::Delete {
+                table,
+                where_clause,
+            } => {
+                write!(f, "DELETE FROM {table}")?;
+                if let Some(w) = where_clause {
+                    write!(f, " WHERE {w}")?;
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -267,6 +347,9 @@ impl Parser {
             TokenKind::Keyword(Keyword::Select) => {
                 Statement::Select(Box::new(self.parse_select()?))
             }
+            TokenKind::Keyword(Keyword::Insert) => self.parse_insert()?,
+            TokenKind::Keyword(Keyword::Update) => self.parse_update()?,
+            TokenKind::Keyword(Keyword::Delete) => self.parse_delete()?,
             other => {
                 return Err(SqlError::parse(
                     format!("expected a statement, found {other:?}"),
@@ -433,6 +516,90 @@ impl Parser {
         self.expect_keyword(Keyword::Table)?;
         let name = self.parse_ident()?;
         Ok(Statement::DropTable { name })
+    }
+
+    fn parse_insert(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Insert)?;
+        self.expect_keyword(Keyword::Into)?;
+        let table = self.parse_ident()?;
+        self.expect(&TokenKind::LParen)?;
+        let columns = self.parse_ident_list()?;
+        self.expect(&TokenKind::RParen)?;
+        self.expect_keyword(Keyword::Values)?;
+        let mut rows = Vec::new();
+        loop {
+            self.expect(&TokenKind::LParen)?;
+            let mut row = Vec::new();
+            loop {
+                row.push(self.parse_expr()?);
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
+            }
+            self.expect(&TokenKind::RParen)?;
+            rows.push(row);
+            if !self.eat(&TokenKind::Comma) {
+                break;
+            }
+        }
+        Ok(Statement::Insert {
+            table,
+            columns,
+            rows,
+        })
+    }
+
+    fn parse_update(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Update)?;
+        let table = self.parse_ident()?;
+        self.expect_keyword(Keyword::Set)?;
+        let mut assignments = Vec::new();
+        loop {
+            let col = self.parse_ident()?;
+            self.expect(&TokenKind::Eq)?;
+            let val = self.parse_expr()?;
+            assignments.push((col, val));
+            if !self.eat(&TokenKind::Comma) {
+                break;
+            }
+        }
+        let where_clause = if self.eat_keyword(Keyword::Where) {
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+        Ok(Statement::Update {
+            table,
+            assignments,
+            where_clause,
+        })
+    }
+
+    fn parse_delete(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Delete)?;
+        self.expect_keyword(Keyword::From)?;
+        let table = self.parse_ident()?;
+        let where_clause = if self.eat_keyword(Keyword::Where) {
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+        Ok(Statement::Delete {
+            table,
+            where_clause,
+        })
+    }
+
+    /// Parse a comma-separated list of bareword identifiers (at least one).
+    fn parse_ident_list(&mut self) -> Result<Vec<String>> {
+        let mut idents = Vec::new();
+        loop {
+            idents.push(self.parse_ident()?);
+            if !self.eat(&TokenKind::Comma) {
+                break;
+            }
+        }
+        Ok(idents)
     }
 }
 
@@ -627,6 +794,105 @@ mod tests {
     #[test]
     fn select_missing_from_errors() {
         let mut p = Parser::from_sql("SELECT a").expect("lex");
+        assert!(p.parse_statement().is_err());
+    }
+
+    // --- DML ---
+
+    #[test]
+    fn insert_single_row() {
+        let s = round_trip("INSERT INTO t (a, b) VALUES (1, 'x')");
+        assert_eq!(
+            s,
+            Statement::Insert {
+                table: "t".into(),
+                columns: vec!["a".into(), "b".into()],
+                rows: vec![vec![
+                    Expr::Literal(crate::ast::Value::Int(1)),
+                    Expr::Literal(crate::ast::Value::Text("x".into())),
+                ]],
+            }
+        );
+    }
+
+    #[test]
+    fn insert_multi_row() {
+        let s = round_trip("INSERT INTO t (a) VALUES (1), (2), (3)");
+        let Statement::Insert { rows, .. } = s else {
+            panic!("wrong variant");
+        };
+        assert_eq!(rows.len(), 3);
+    }
+
+    #[test]
+    fn update_with_where() {
+        let s = round_trip("UPDATE t SET a = 1, b = a + 2 WHERE id = 5");
+        let Statement::Update {
+            table,
+            assignments,
+            where_clause,
+        } = s
+        else {
+            panic!("wrong variant");
+        };
+        assert_eq!(table, "t");
+        assert_eq!(assignments.len(), 2);
+        assert_eq!(assignments[0].0, "a");
+        assert!(where_clause.is_some());
+    }
+
+    #[test]
+    fn update_without_where() {
+        let s = round_trip("UPDATE t SET a = 1");
+        let Statement::Update { where_clause, .. } = s else {
+            panic!("wrong variant");
+        };
+        assert!(where_clause.is_none());
+    }
+
+    #[test]
+    fn delete_with_and_without_where() {
+        assert_eq!(
+            round_trip("DELETE FROM t WHERE a = 1"),
+            Statement::Delete {
+                table: "t".into(),
+                where_clause: Some(Expr::binary(
+                    crate::ast::BinOp::Eq,
+                    Expr::Column("a".into()),
+                    Expr::Literal(crate::ast::Value::Int(1))
+                )),
+            }
+        );
+        assert_eq!(
+            round_trip("DELETE FROM t"),
+            Statement::Delete {
+                table: "t".into(),
+                where_clause: None,
+            }
+        );
+    }
+
+    #[test]
+    fn dml_display_normalizes() {
+        assert_eq!(
+            parse("insert into t ( a , b ) values ( 1 , 2 )").to_string(),
+            "INSERT INTO t (a, b) VALUES (1, 2)"
+        );
+        assert_eq!(
+            parse("update t set a=1 where b=2").to_string(),
+            "UPDATE t SET a = 1 WHERE (b = 2)"
+        );
+    }
+
+    #[test]
+    fn insert_missing_values_errors() {
+        let mut p = Parser::from_sql("INSERT INTO t (a)").expect("lex");
+        assert!(p.parse_statement().is_err());
+    }
+
+    #[test]
+    fn update_empty_set_errors() {
+        let mut p = Parser::from_sql("UPDATE t SET WHERE a = 1").expect("lex");
         assert!(p.parse_statement().is_err());
     }
 }
