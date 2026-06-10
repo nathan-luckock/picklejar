@@ -10,9 +10,162 @@
 
 use std::fmt;
 
+use crate::ast::Expr;
 use crate::error::{Result, SqlError};
 use crate::parser::Parser;
 use crate::token::{Keyword, TokenKind};
+
+/// A reference to a table in a FROM or JOIN clause, with optional alias.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TableRef {
+    /// Table name.
+    pub name: String,
+    /// Optional alias (`t` in `FROM table AS t`).
+    pub alias: Option<String>,
+}
+
+impl fmt::Display for TableRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.name)?;
+        if let Some(a) = &self.alias {
+            write!(f, " AS {a}")?;
+        }
+        Ok(())
+    }
+}
+
+/// One item in a SELECT projection list.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SelectItem {
+    /// `*` — all columns.
+    Star,
+    /// An expression with an optional alias.
+    Expr(Expr, Option<String>),
+}
+
+impl fmt::Display for SelectItem {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Star => f.write_str("*"),
+            Self::Expr(e, None) => write!(f, "{e}"),
+            Self::Expr(e, Some(a)) => write!(f, "{e} AS {a}"),
+        }
+    }
+}
+
+/// The kind of a join.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum JoinKind {
+    /// `INNER JOIN`.
+    Inner,
+    /// `LEFT JOIN`.
+    Left,
+}
+
+impl fmt::Display for JoinKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Inner => "INNER JOIN",
+            Self::Left => "LEFT JOIN",
+        })
+    }
+}
+
+/// A join clause: `<kind> <table> ON <predicate>`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Join {
+    /// Inner or left.
+    pub kind: JoinKind,
+    /// The joined table.
+    pub table: TableRef,
+    /// The ON predicate.
+    pub on: Expr,
+}
+
+impl fmt::Display for Join {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} {} ON {}", self.kind, self.table, self.on)
+    }
+}
+
+/// An ORDER BY item.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OrderItem {
+    /// The sort key.
+    pub expr: Expr,
+    /// True for descending.
+    pub desc: bool,
+}
+
+impl fmt::Display for OrderItem {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.expr)?;
+        if self.desc {
+            f.write_str(" DESC")?;
+        }
+        Ok(())
+    }
+}
+
+/// A SELECT query.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Select {
+    /// Projection list.
+    pub projections: Vec<SelectItem>,
+    /// The driving table.
+    pub from: TableRef,
+    /// Joins (empty for a single-table select). Parsed in #61.
+    pub joins: Vec<Join>,
+    /// Optional WHERE predicate.
+    pub where_clause: Option<Expr>,
+    /// GROUP BY keys (empty if none). Parsed in #61.
+    pub group_by: Vec<Expr>,
+    /// ORDER BY items (empty if none). Parsed in #61.
+    pub order_by: Vec<OrderItem>,
+    /// LIMIT (None if none). Parsed in #61.
+    pub limit: Option<u64>,
+}
+
+impl fmt::Display for Select {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SELECT ")?;
+        for (i, p) in self.projections.iter().enumerate() {
+            if i > 0 {
+                f.write_str(", ")?;
+            }
+            write!(f, "{p}")?;
+        }
+        write!(f, " FROM {}", self.from)?;
+        for j in &self.joins {
+            write!(f, " {j}")?;
+        }
+        if let Some(w) = &self.where_clause {
+            write!(f, " WHERE {w}")?;
+        }
+        if !self.group_by.is_empty() {
+            f.write_str(" GROUP BY ")?;
+            for (i, g) in self.group_by.iter().enumerate() {
+                if i > 0 {
+                    f.write_str(", ")?;
+                }
+                write!(f, "{g}")?;
+            }
+        }
+        if !self.order_by.is_empty() {
+            f.write_str(" ORDER BY ")?;
+            for (i, o) in self.order_by.iter().enumerate() {
+                if i > 0 {
+                    f.write_str(", ")?;
+                }
+                write!(f, "{o}")?;
+            }
+        }
+        if let Some(n) = self.limit {
+            write!(f, " LIMIT {n}")?;
+        }
+        Ok(())
+    }
+}
 
 /// A column data type.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -77,6 +230,8 @@ pub enum Statement {
         /// Indexed column.
         column: String,
     },
+    /// A `SELECT` query.
+    Select(Box<Select>),
 }
 
 impl fmt::Display for Statement {
@@ -98,6 +253,7 @@ impl fmt::Display for Statement {
                 table,
                 column,
             } => write!(f, "CREATE INDEX {name} ON {table} ({column})"),
+            Self::Select(s) => write!(f, "{s}"),
         }
     }
 }
@@ -108,6 +264,9 @@ impl Parser {
         let stmt = match self.peek() {
             TokenKind::Keyword(Keyword::Create) => self.parse_create()?,
             TokenKind::Keyword(Keyword::Drop) => self.parse_drop()?,
+            TokenKind::Keyword(Keyword::Select) => {
+                Statement::Select(Box::new(self.parse_select()?))
+            }
             other => {
                 return Err(SqlError::parse(
                     format!("expected a statement, found {other:?}"),
@@ -117,6 +276,73 @@ impl Parser {
         };
         self.eat(&TokenKind::Semicolon);
         Ok(stmt)
+    }
+
+    /// Parse a SELECT query. JOIN / GROUP BY / ORDER BY / LIMIT parsing is
+    /// added in #61; for now those fields come back empty.
+    fn parse_select(&mut self) -> Result<Select> {
+        self.expect_keyword(Keyword::Select)?;
+        let projections = self.parse_projections()?;
+        self.expect_keyword(Keyword::From)?;
+        let from = self.parse_table_ref()?;
+        let where_clause = if self.eat_keyword(Keyword::Where) {
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+        Ok(Select {
+            projections,
+            from,
+            joins: Vec::new(),
+            where_clause,
+            group_by: Vec::new(),
+            order_by: Vec::new(),
+            limit: None,
+        })
+    }
+
+    fn parse_projections(&mut self) -> Result<Vec<SelectItem>> {
+        let mut items = Vec::new();
+        loop {
+            let expr = self.parse_expr()?;
+            let item = if expr == Expr::Star {
+                SelectItem::Star
+            } else {
+                SelectItem::Expr(expr, self.parse_optional_alias())
+            };
+            items.push(item);
+            if !self.eat(&TokenKind::Comma) {
+                break;
+            }
+        }
+        Ok(items)
+    }
+
+    /// Parse a table reference with an optional alias.
+    fn parse_table_ref(&mut self) -> Result<TableRef> {
+        let name = self.parse_ident()?;
+        Ok(TableRef {
+            name,
+            alias: self.parse_optional_alias(),
+        })
+    }
+
+    /// Parse an optional alias: `AS ident`, or a bare trailing identifier.
+    fn parse_optional_alias(&mut self) -> Option<String> {
+        if self.eat_keyword(Keyword::As) {
+            // After AS an identifier is required, but tolerate a missing one
+            // by returning None (the next expect will report the real error).
+            if let TokenKind::Ident(name) = self.peek().clone() {
+                self.advance();
+                return Some(name);
+            }
+            return None;
+        }
+        if let TokenKind::Ident(name) = self.peek().clone() {
+            self.advance();
+            return Some(name);
+        }
+        None
     }
 
     fn parse_create(&mut self) -> Result<Statement> {
@@ -315,6 +541,92 @@ mod tests {
     #[test]
     fn non_statement_keyword_errors() {
         let mut p = Parser::from_sql("WHERE a = 1").expect("lex");
+        assert!(p.parse_statement().is_err());
+    }
+
+    // --- SELECT ---
+
+    fn as_select(src: &str) -> Select {
+        match round_trip(src) {
+            Statement::Select(s) => *s,
+            other => panic!("expected SELECT, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn select_star() {
+        let s = as_select("SELECT * FROM t");
+        assert_eq!(s.projections, vec![SelectItem::Star]);
+        assert_eq!(s.from.name, "t");
+        assert!(s.where_clause.is_none());
+    }
+
+    #[test]
+    fn select_columns() {
+        let s = as_select("SELECT a, b, c FROM t");
+        assert_eq!(s.projections.len(), 3);
+        assert_eq!(
+            s.projections[0],
+            SelectItem::Expr(Expr::Column("a".into()), None)
+        );
+    }
+
+    #[test]
+    fn select_expr_with_alias() {
+        let s = as_select("SELECT a + 1 AS x, b AS y FROM t");
+        assert_eq!(
+            s.projections[0],
+            SelectItem::Expr(
+                Expr::binary(
+                    crate::ast::BinOp::Add,
+                    Expr::Column("a".into()),
+                    Expr::Literal(crate::ast::Value::Int(1))
+                ),
+                Some("x".into())
+            )
+        );
+        assert_eq!(
+            s.projections[1],
+            SelectItem::Expr(Expr::Column("b".into()), Some("y".into()))
+        );
+    }
+
+    #[test]
+    fn select_from_with_alias() {
+        let s = as_select("SELECT * FROM orders AS o");
+        assert_eq!(s.from.name, "orders");
+        assert_eq!(s.from.alias.as_deref(), Some("o"));
+    }
+
+    #[test]
+    fn select_with_where() {
+        let s = as_select("SELECT a FROM t WHERE a = 1 AND b > 2");
+        assert!(s.where_clause.is_some());
+        // The WHERE expression keeps its precedence.
+        assert_eq!(s.where_clause.unwrap().to_string(), "((a = 1) AND (b > 2))");
+    }
+
+    #[test]
+    fn select_qualified_columns() {
+        let s = as_select("SELECT o.id, c.name FROM orders AS o WHERE o.id = 5");
+        assert_eq!(
+            s.projections[0],
+            SelectItem::Expr(Expr::QualifiedColumn("o".into(), "id".into()), None)
+        );
+    }
+
+    #[test]
+    fn select_display_normalizes() {
+        assert_eq!(
+            Statement::Select(Box::new(as_select("select  a ,  b  from  t  where a=1")))
+                .to_string(),
+            "SELECT a, b FROM t WHERE (a = 1)"
+        );
+    }
+
+    #[test]
+    fn select_missing_from_errors() {
+        let mut p = Parser::from_sql("SELECT a").expect("lex");
         assert!(p.parse_statement().is_err());
     }
 }
