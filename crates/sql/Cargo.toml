@@ -11,5 +11,8 @@ description = "Hand-written SQL lexer and parser for rustdb. No sqlparser-rs."
 [dependencies]
 thiserror.workspace = true
 
+[dev-dependencies]
+proptest = "1"
+
 [lints]
 workspace = true

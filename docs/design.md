@@ -24,8 +24,10 @@ Non-goals: distributed replication, network protocol compatibility with Postgres
 | 3 | WAL: record format, writer, reader, buffer pool integration, proptests | ✅ shipped (PRs #27–#31) |
 | 4 | ARIES recovery (analysis + redo + undo + forced-kill torture test) | ✅ shipped (PRs #37–#42) |
 | 5 | Transactions + MVCC (manager, visibility, versions, MvccTable, isolation levels) | ✅ shipped (PRs #49–#54) |
-| 6 | MVCC polish: write-write conflict detection, version GC | ⏳ next |
-| 7–9 | SQL parser → planner → executor | ⏳ |
+| 6 | MVCC polish: write-write conflict detection, version GC | ⏳ deferred |
+| 7 | SQL parser (lexer, Pratt expressions, DDL, DML, SELECT + JOIN/GROUP/ORDER/LIMIT) | ✅ shipped (PRs #62–#67) |
+| 8 | Cost-based planner (M6) | ⏳ next |
+| 9 | Executor + CLI wiring (M1) | ⏳ |
 | 10 | Torture test + polish | ⏳ |
 | 11 | Demo + write-up + SPED talk | ⏳ |
 
@@ -311,14 +313,32 @@ The page header's `reserved: u32` field remains available for an on-page version
 
 ---
 
-## SQL parser (Sprint 7 — planned)
+## SQL parser (Sprint 7 — shipped)
 
-Hand-written. Lexer produces a flat token stream; recursive-descent parser produces an AST. Pratt-style precedence for expressions.
+Hand-written, no `sqlparser-rs`. Implemented in `rustdb-sql`.
 
-Target subset:
-- DDL: `CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`.
-- DML: `INSERT`, `UPDATE`, `DELETE`.
-- Query: `SELECT` with `WHERE`, `GROUP BY`, `ORDER BY`, `LIMIT`, `JOIN` (inner + left).
+### Lexer (`lexer.rs`, `token.rs`)
+
+A single forward pass turns SQL text into `Vec<Token>` ending in `Eof`. Each token carries a byte `Span` so every downstream error can point at exact source text. Keywords are matched case-insensitively (`INT`/`INTEGER`, `TEXT`/`VARCHAR` aliased); identifiers keep their case. String literals are single-quoted with `''` as the quote escape. Whitespace and `-- line comments` are skipped. `!=` and `<>` both lex to `NotEq`.
+
+### Expression parser (`parser.rs`)
+
+Precedence-climbing (Pratt): a single `parse_bp` plus a binding-power table. Precedence (loosest first): `OR < AND < NOT < comparison < + - < * / < unary -`, binary operators left-associative. `NOT` is a prefix operator whose operand is parsed at comparison binding power, so `NOT a = b` is `NOT (a = b)` and `NOT a AND b` is `(NOT a) AND b`. The `Parser` cursor (peek / advance / eat / expect / expect_keyword / parse_ident) is shared by every statement parser.
+
+### Statement parsers (`statement.rs`)
+
+- **DDL**: `CREATE TABLE name (col type [PRIMARY KEY], ...)`, `DROP TABLE name`, `CREATE INDEX name ON table (column)`.
+- **DML**: `INSERT INTO t (cols) VALUES (...), (...)`, `UPDATE t SET c = e, ... [WHERE]`, `DELETE FROM t [WHERE]`.
+- **SELECT**: projection list (`*`, expressions with optional `[AS] alias`), `FROM` with alias, `INNER`/`LEFT JOIN ... ON`, `WHERE`, `GROUP BY`, `ORDER BY [ASC|DESC]`, `LIMIT n`.
+
+### Correctness: Display round-trip
+
+Every AST node has a `Display` that prints canonical SQL, fully parenthesizing expressions. The property test (`tests/proptests.rs`) generates arbitrary ASTs, prints them, re-parses, and asserts equality: `parse(print(ast)) == ast`. The printer and parser are exact inverses by construction, which is the parser's correctness oracle.
+
+### Scope and deferrals
+
+- The parser is **schema-free**: it enforces grammar only. Semantic checks (INSERT column/value arity, unknown columns, type errors) are the planner's job, since they need the catalog.
+- Subqueries, `HAVING`, set operations (`UNION`), and right/full outer joins are out of scope for the capstone.
 
 ---
 
