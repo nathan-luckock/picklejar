@@ -1,0 +1,361 @@
+//! Recursive-descent parser with a Pratt expression core.
+//!
+//! Statement parsing (DDL / SELECT / DML) is layered on in later commits;
+//! this module provides the [`Parser`] cursor over the token stream and the
+//! precedence-climbing [`Parser::parse_expr`].
+//!
+//! # Precedence (lowest binds loosest)
+//!
+//! `OR` < `AND` < `NOT` < comparison (`= <> < <= > >=`) < `+ -` < `* /` <
+//! unary `-` < atoms. Binary operators are left-associative.
+//!
+//! `NOT` sits between `AND` and comparison, matching SQL: `NOT a = b` parses
+//! as `NOT (a = b)`, and `NOT a AND b` as `(NOT a) AND b`.
+
+use crate::ast::{BinOp, Expr, UnOp, Value};
+use crate::error::{Result, SqlError};
+use crate::token::{Keyword, Span, Token, TokenKind};
+
+/// A cursor over a token slice with the shared parsing helpers.
+#[derive(Debug)]
+pub struct Parser {
+    tokens: Vec<Token>,
+    pos: usize,
+}
+
+impl Parser {
+    /// Build a parser over an already-tokenized statement. The token vector
+    /// is expected to end in [`TokenKind::Eof`].
+    #[must_use]
+    pub const fn new(tokens: Vec<Token>) -> Self {
+        Self { tokens, pos: 0 }
+    }
+
+    /// Tokenize `src` and build a parser over it.
+    pub fn from_sql(src: &str) -> Result<Self> {
+        let tokens = crate::lexer::Lexer::new(src).tokenize()?;
+        Ok(Self::new(tokens))
+    }
+
+    // --- cursor helpers (shared by all statement parsers) ---
+
+    /// The current token's kind.
+    #[must_use]
+    pub fn peek(&self) -> &TokenKind {
+        &self.tokens[self.pos].kind
+    }
+
+    /// The current token (kind + span).
+    #[must_use]
+    pub fn peek_token(&self) -> &Token {
+        &self.tokens[self.pos]
+    }
+
+    /// The current token's span.
+    #[must_use]
+    pub fn span(&self) -> Span {
+        self.tokens[self.pos].span
+    }
+
+    /// True if the parser is at end of input.
+    #[must_use]
+    pub fn at_eof(&self) -> bool {
+        matches!(self.peek(), TokenKind::Eof)
+    }
+
+    /// Consume and return the current token.
+    pub fn advance(&mut self) -> Token {
+        let tok = self.tokens[self.pos].clone();
+        if !matches!(tok.kind, TokenKind::Eof) {
+            self.pos += 1;
+        }
+        tok
+    }
+
+    /// Consume the current token if its kind equals `kind`.
+    pub fn eat(&mut self, kind: &TokenKind) -> bool {
+        if self.peek() == kind {
+            self.advance();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Consume the current token if it is the given keyword.
+    pub fn eat_keyword(&mut self, kw: Keyword) -> bool {
+        if matches!(self.peek(), TokenKind::Keyword(k) if *k == kw) {
+            self.advance();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Require the current token to equal `kind`, consuming it.
+    pub fn expect(&mut self, kind: &TokenKind) -> Result<Token> {
+        if self.peek() == kind {
+            Ok(self.advance())
+        } else {
+            Err(SqlError::parse(
+                format!("expected {kind:?}, found {:?}", self.peek()),
+                self.span(),
+            ))
+        }
+    }
+
+    /// Require the given keyword, consuming it.
+    pub fn expect_keyword(&mut self, kw: Keyword) -> Result<()> {
+        if self.eat_keyword(kw) {
+            Ok(())
+        } else {
+            Err(SqlError::parse(
+                format!("expected keyword {kw:?}, found {:?}", self.peek()),
+                self.span(),
+            ))
+        }
+    }
+
+    /// Parse a bareword identifier, returning its text.
+    pub fn parse_ident(&mut self) -> Result<String> {
+        match self.peek().clone() {
+            TokenKind::Ident(name) => {
+                self.advance();
+                Ok(name)
+            }
+            other => Err(SqlError::parse(
+                format!("expected identifier, found {other:?}"),
+                self.span(),
+            )),
+        }
+    }
+
+    // --- Pratt expression parser ---
+
+    /// Parse a full scalar expression.
+    pub fn parse_expr(&mut self) -> Result<Expr> {
+        self.parse_bp(0)
+    }
+
+    /// Precedence-climbing core. `min_bp` is the minimum left binding power
+    /// an infix operator must have to be consumed at this level.
+    fn parse_bp(&mut self, min_bp: u8) -> Result<Expr> {
+        let mut lhs = self.parse_prefix()?;
+        while let Some((op, l_bp, r_bp)) = infix_binding_power(self.peek()) {
+            if l_bp < min_bp {
+                break;
+            }
+            self.advance(); // consume the operator
+            let rhs = self.parse_bp(r_bp)?;
+            lhs = Expr::binary(op, lhs, rhs);
+        }
+        Ok(lhs)
+    }
+
+    /// Parse a prefix position: literals, columns, parens, and the prefix
+    /// operators `NOT` and unary `-`.
+    fn parse_prefix(&mut self) -> Result<Expr> {
+        match self.peek().clone() {
+            TokenKind::Keyword(Keyword::Not) => {
+                self.advance();
+                // NOT binds looser than comparison: its operand is parsed at
+                // comparison binding power so `NOT a = b` is `NOT (a = b)`.
+                let operand = self.parse_bp(NOT_OPERAND_BP)?;
+                Ok(Expr::unary(UnOp::Not, operand))
+            }
+            TokenKind::Minus => {
+                self.advance();
+                // Unary minus binds tighter than any binary operator.
+                let operand = self.parse_bp(NEG_OPERAND_BP)?;
+                Ok(Expr::unary(UnOp::Neg, operand))
+            }
+            TokenKind::LParen => {
+                self.advance();
+                let inner = self.parse_expr()?;
+                self.expect(&TokenKind::RParen)?;
+                Ok(inner)
+            }
+            TokenKind::Int(n) => {
+                self.advance();
+                Ok(Expr::Literal(Value::Int(n)))
+            }
+            TokenKind::Str(s) => {
+                self.advance();
+                Ok(Expr::Literal(Value::Text(s)))
+            }
+            TokenKind::Keyword(Keyword::Null) => {
+                self.advance();
+                Ok(Expr::Literal(Value::Null))
+            }
+            TokenKind::Keyword(Keyword::True) => {
+                self.advance();
+                Ok(Expr::Literal(Value::Bool(true)))
+            }
+            TokenKind::Keyword(Keyword::False) => {
+                self.advance();
+                Ok(Expr::Literal(Value::Bool(false)))
+            }
+            TokenKind::Star => {
+                self.advance();
+                Ok(Expr::Star)
+            }
+            TokenKind::Ident(name) => {
+                self.advance();
+                // Qualified column: name '.' name.
+                if self.eat(&TokenKind::Dot) {
+                    let col = self.parse_ident()?;
+                    Ok(Expr::QualifiedColumn(name, col))
+                } else {
+                    Ok(Expr::Column(name))
+                }
+            }
+            other => Err(SqlError::parse(
+                format!("expected an expression, found {other:?}"),
+                self.span(),
+            )),
+        }
+    }
+}
+
+/// `NOT`'s operand binding power: above `AND` (3/4), at/below comparison (5).
+const NOT_OPERAND_BP: u8 = 5;
+/// Unary minus binds tighter than `* /` (9/10).
+const NEG_OPERAND_BP: u8 = 11;
+
+/// Left and right binding powers for an infix operator, or `None` if the
+/// token is not an infix operator. Left-associative: `r_bp = l_bp + 1`.
+const fn infix_binding_power(kind: &TokenKind) -> Option<(BinOp, u8, u8)> {
+    let (op, l_bp) = match kind {
+        TokenKind::Keyword(Keyword::Or) => (BinOp::Or, 1),
+        TokenKind::Keyword(Keyword::And) => (BinOp::And, 3),
+        TokenKind::Eq => (BinOp::Eq, 5),
+        TokenKind::NotEq => (BinOp::Ne, 5),
+        TokenKind::Lt => (BinOp::Lt, 5),
+        TokenKind::LtEq => (BinOp::Le, 5),
+        TokenKind::Gt => (BinOp::Gt, 5),
+        TokenKind::GtEq => (BinOp::Ge, 5),
+        TokenKind::Plus => (BinOp::Add, 7),
+        TokenKind::Minus => (BinOp::Sub, 7),
+        TokenKind::Star => (BinOp::Mul, 9),
+        TokenKind::Slash => (BinOp::Div, 9),
+        _ => return None,
+    };
+    Some((op, l_bp, l_bp + 1))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(src: &str) -> Expr {
+        let mut p = Parser::from_sql(src).expect("lex");
+        let e = p.parse_expr().expect("parse");
+        assert!(
+            p.at_eof(),
+            "leftover tokens parsing {src:?}: {:?}",
+            p.peek()
+        );
+        e
+    }
+
+    /// Display fully parenthesizes, so it shows the parse structure.
+    fn shape(src: &str) -> String {
+        parse(src).to_string()
+    }
+
+    #[test]
+    fn literals_and_columns() {
+        assert_eq!(shape("42"), "42");
+        assert_eq!(shape("'hi'"), "'hi'");
+        assert_eq!(shape("NULL"), "NULL");
+        assert_eq!(shape("TRUE"), "TRUE");
+        assert_eq!(shape("col"), "col");
+        assert_eq!(shape("t.col"), "t.col");
+        assert_eq!(shape("*"), "*");
+    }
+
+    #[test]
+    fn and_binds_tighter_than_or() {
+        // a OR b AND c  ==  a OR (b AND c)
+        assert_eq!(shape("a OR b AND c"), "(a OR (b AND c))");
+    }
+
+    #[test]
+    fn comparison_binds_tighter_than_and() {
+        // a = 1 AND b = 2  ==  (a = 1) AND (b = 2)
+        assert_eq!(shape("a = 1 AND b = 2"), "((a = 1) AND (b = 2))");
+    }
+
+    #[test]
+    fn arithmetic_precedence() {
+        // a + b * c  ==  a + (b * c)
+        assert_eq!(shape("a + b * c"), "(a + (b * c))");
+        // a * b + c  ==  (a * b) + c
+        assert_eq!(shape("a * b + c"), "((a * b) + c)");
+    }
+
+    #[test]
+    fn left_associativity() {
+        // a - b - c  ==  (a - b) - c
+        assert_eq!(shape("a - b - c"), "((a - b) - c)");
+    }
+
+    #[test]
+    fn parens_override_precedence() {
+        assert_eq!(shape("(a + b) * c"), "((a + b) * c)");
+        assert_eq!(shape("a AND (b OR c)"), "(a AND (b OR c))");
+    }
+
+    #[test]
+    fn not_is_looser_than_comparison_tighter_than_and() {
+        // NOT a = b  ==  NOT (a = b)
+        assert_eq!(shape("NOT a = b"), "(NOT (a = b))");
+        // NOT a AND b  ==  (NOT a) AND b
+        assert_eq!(shape("NOT a AND b"), "((NOT a) AND b)");
+    }
+
+    #[test]
+    fn unary_minus_binds_tightest() {
+        // -a * b  ==  (-a) * b
+        assert_eq!(shape("-a * b"), "((-a) * b)");
+    }
+
+    #[test]
+    fn full_predicate() {
+        assert_eq!(
+            shape("a = 1 AND b <> 'x' OR c >= 3"),
+            "(((a = 1) AND (b <> 'x')) OR (c >= 3))"
+        );
+    }
+
+    #[test]
+    fn dangling_operator_errors() {
+        let mut p = Parser::from_sql("a +").expect("lex");
+        assert!(p.parse_expr().is_err());
+    }
+
+    #[test]
+    fn unclosed_paren_errors() {
+        let mut p = Parser::from_sql("(a + b").expect("lex");
+        assert!(p.parse_expr().is_err());
+    }
+
+    #[test]
+    fn display_round_trips_through_reparse() {
+        for src in [
+            "a = 1 AND b = 2",
+            "NOT a OR b",
+            "a + b * c - d",
+            "(a OR b) AND NOT c",
+            "x.y = z.w",
+        ] {
+            let first = parse(src);
+            let printed = first.to_string();
+            let second = parse(&printed);
+            assert_eq!(
+                first, second,
+                "round-trip failed for {src:?} -> {printed:?}"
+            );
+        }
+    }
+}
