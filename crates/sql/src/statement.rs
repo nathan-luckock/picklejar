@@ -1,9 +1,10 @@
 //! Statement AST nodes and their parsers.
 //!
 //! Built on top of the expression core in [`crate::parser`]. Each statement
-//! type's parser is a method on [`Parser`] added alongside its AST node.
-//! This commit covers DDL (CREATE TABLE, DROP TABLE, CREATE INDEX); SELECT
-//! and DML follow.
+//! type's parser is a method on [`Parser`], sharing the cursor helpers and
+//! the Pratt `parse_expr`. Covers DDL (CREATE TABLE, DROP TABLE, CREATE
+//! INDEX), DML (INSERT, UPDATE, DELETE), and SELECT (projections, joins,
+//! WHERE, GROUP BY, ORDER BY, LIMIT).
 //!
 //! Every node implements `Display` back to canonical SQL, which doubles as a
 //! normalizer and is the oracle for the parser round-trip property test.
@@ -114,15 +115,15 @@ pub struct Select {
     pub projections: Vec<SelectItem>,
     /// The driving table.
     pub from: TableRef,
-    /// Joins (empty for a single-table select). Parsed in #61.
+    /// Joins (empty for a single-table select).
     pub joins: Vec<Join>,
     /// Optional WHERE predicate.
     pub where_clause: Option<Expr>,
-    /// GROUP BY keys (empty if none). Parsed in #61.
+    /// GROUP BY keys (empty if none).
     pub group_by: Vec<Expr>,
-    /// ORDER BY items (empty if none). Parsed in #61.
+    /// ORDER BY items (empty if none).
     pub order_by: Vec<OrderItem>,
-    /// LIMIT (None if none). Parsed in #61.
+    /// LIMIT (None if none).
     pub limit: Option<u64>,
 }
 
@@ -361,27 +362,110 @@ impl Parser {
         Ok(stmt)
     }
 
-    /// Parse a SELECT query. JOIN / GROUP BY / ORDER BY / LIMIT parsing is
-    /// added in #61; for now those fields come back empty.
+    /// Parse a SELECT query, including JOIN / WHERE / GROUP BY / ORDER BY /
+    /// LIMIT.
     fn parse_select(&mut self) -> Result<Select> {
         self.expect_keyword(Keyword::Select)?;
         let projections = self.parse_projections()?;
         self.expect_keyword(Keyword::From)?;
         let from = self.parse_table_ref()?;
+        let joins = self.parse_joins()?;
         let where_clause = if self.eat_keyword(Keyword::Where) {
             Some(self.parse_expr()?)
         } else {
             None
         };
+        let group_by = self.parse_group_by()?;
+        let order_by = self.parse_order_by()?;
+        let limit = self.parse_limit()?;
         Ok(Select {
             projections,
             from,
-            joins: Vec::new(),
+            joins,
             where_clause,
-            group_by: Vec::new(),
-            order_by: Vec::new(),
-            limit: None,
+            group_by,
+            order_by,
+            limit,
         })
+    }
+
+    /// Parse zero or more JOIN clauses. A bare `JOIN` means `INNER JOIN`.
+    fn parse_joins(&mut self) -> Result<Vec<Join>> {
+        let mut joins = Vec::new();
+        loop {
+            let kind = if self.eat_keyword(Keyword::Inner) {
+                self.expect_keyword(Keyword::Join)?;
+                JoinKind::Inner
+            } else if self.eat_keyword(Keyword::Left) {
+                self.expect_keyword(Keyword::Join)?;
+                JoinKind::Left
+            } else if self.eat_keyword(Keyword::Join) {
+                JoinKind::Inner
+            } else {
+                break;
+            };
+            let table = self.parse_table_ref()?;
+            self.expect_keyword(Keyword::On)?;
+            let on = self.parse_expr()?;
+            joins.push(Join { kind, table, on });
+        }
+        Ok(joins)
+    }
+
+    fn parse_group_by(&mut self) -> Result<Vec<Expr>> {
+        if !self.eat_keyword(Keyword::Group) {
+            return Ok(Vec::new());
+        }
+        self.expect_keyword(Keyword::By)?;
+        let mut keys = Vec::new();
+        loop {
+            keys.push(self.parse_expr()?);
+            if !self.eat(&TokenKind::Comma) {
+                break;
+            }
+        }
+        Ok(keys)
+    }
+
+    fn parse_order_by(&mut self) -> Result<Vec<OrderItem>> {
+        if !self.eat_keyword(Keyword::Order) {
+            return Ok(Vec::new());
+        }
+        self.expect_keyword(Keyword::By)?;
+        let mut items = Vec::new();
+        loop {
+            let expr = self.parse_expr()?;
+            // ASC is the default; DESC flips it.
+            let desc = if self.eat_keyword(Keyword::Desc) {
+                true
+            } else {
+                self.eat_keyword(Keyword::Asc);
+                false
+            };
+            items.push(OrderItem { expr, desc });
+            if !self.eat(&TokenKind::Comma) {
+                break;
+            }
+        }
+        Ok(items)
+    }
+
+    fn parse_limit(&mut self) -> Result<Option<u64>> {
+        if !self.eat_keyword(Keyword::Limit) {
+            return Ok(None);
+        }
+        match self.peek().clone() {
+            TokenKind::Int(n) if n >= 0 => {
+                self.advance();
+                // n >= 0 just checked, so the cast is exact.
+                #[allow(clippy::cast_sign_loss)]
+                Ok(Some(n as u64))
+            }
+            other => Err(SqlError::parse(
+                format!("expected a non-negative integer after LIMIT, found {other:?}"),
+                self.span(),
+            )),
+        }
     }
 
     fn parse_projections(&mut self) -> Result<Vec<SelectItem>> {
@@ -893,6 +977,68 @@ mod tests {
     #[test]
     fn update_empty_set_errors() {
         let mut p = Parser::from_sql("UPDATE t SET WHERE a = 1").expect("lex");
+        assert!(p.parse_statement().is_err());
+    }
+
+    // --- SELECT extensions ---
+
+    #[test]
+    fn inner_join() {
+        let s = as_select("SELECT * FROM a JOIN b ON a.id = b.aid");
+        assert_eq!(s.joins.len(), 1);
+        assert_eq!(s.joins[0].kind, JoinKind::Inner);
+        assert_eq!(s.joins[0].table.name, "b");
+    }
+
+    #[test]
+    fn left_join_and_explicit_inner() {
+        let s =
+            as_select("SELECT * FROM a LEFT JOIN b ON a.id = b.aid INNER JOIN c ON b.id = c.bid");
+        assert_eq!(s.joins.len(), 2);
+        assert_eq!(s.joins[0].kind, JoinKind::Left);
+        assert_eq!(s.joins[1].kind, JoinKind::Inner);
+    }
+
+    #[test]
+    fn group_by_order_by_limit() {
+        let s = as_select("SELECT a FROM t GROUP BY a, b ORDER BY a DESC, b LIMIT 10");
+        assert_eq!(s.group_by.len(), 2);
+        assert_eq!(s.order_by.len(), 2);
+        assert!(s.order_by[0].desc);
+        assert!(!s.order_by[1].desc);
+        assert_eq!(s.limit, Some(10));
+    }
+
+    #[test]
+    fn order_by_asc_is_default() {
+        let s = as_select("SELECT a FROM t ORDER BY a ASC");
+        assert!(!s.order_by[0].desc);
+        // ASC is not re-emitted (it is the default), but the AST is the same.
+        assert_eq!(
+            Statement::Select(Box::new(s)).to_string(),
+            "SELECT a FROM t ORDER BY a"
+        );
+    }
+
+    #[test]
+    fn full_complex_query_round_trips() {
+        let src = "SELECT o.id, c.name FROM orders AS o \
+                   INNER JOIN customers AS c ON o.cid = c.id \
+                   WHERE o.total > 100 GROUP BY c.name ORDER BY o.id DESC LIMIT 5";
+        let s = round_trip(src);
+        let Statement::Select(sel) = &s else {
+            panic!("expected select");
+        };
+        assert_eq!(sel.joins.len(), 1);
+        assert!(sel.where_clause.is_some());
+        assert_eq!(sel.group_by.len(), 1);
+        assert_eq!(sel.order_by.len(), 1);
+        assert_eq!(sel.limit, Some(5));
+    }
+
+    #[test]
+    fn negative_limit_errors() {
+        let mut p = Parser::from_sql("SELECT a FROM t LIMIT -1").expect("lex");
         assert!(p.parse_statement().is_err());
     }
 }
