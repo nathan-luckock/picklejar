@@ -16,9 +16,11 @@
 
 pub mod error;
 pub mod manager;
+pub mod mvcc;
 pub mod version;
 pub mod visibility;
 
 pub use error::{Result, TxnError};
 pub use manager::{IsolationLevel, Snapshot, Transaction, TransactionManager, TxnState, Xid};
+pub use mvcc::MvccTable;
 pub use version::{set_xmax, Version, VERSION_HEADER_SIZE};
