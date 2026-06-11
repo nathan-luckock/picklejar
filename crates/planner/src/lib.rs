@@ -15,8 +15,12 @@
 
 #![forbid(unsafe_code)]
 
+pub mod binder;
 pub mod catalog;
 pub mod error;
+pub mod logical;
 
+pub use binder::bind;
 pub use catalog::{Catalog, Column, ColumnStats, IndexMeta, TableMeta, TableStats};
 pub use error::{PlanError, Result};
+pub use logical::LogicalPlan;
