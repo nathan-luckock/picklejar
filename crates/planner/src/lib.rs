@@ -4,6 +4,19 @@
 //! choosing between scan strategies (seq scan vs index scan) and join
 //! algorithms (hash join vs nested-loop join) based on table statistics.
 //!
-//! Outputs an `EXPLAIN`-friendly representation alongside the executable plan.
+//! Outputs an `EXPLAIN`-friendly representation alongside the executable
+//! plan.
+//!
+//! # Sprint 8 surface
+//!
+//! - [`catalog::Catalog`]: schema metadata + statistics.
+//! - Logical plan, cost model, physical plan, and EXPLAIN land in
+//!   subsequent commits.
 
 #![forbid(unsafe_code)]
+
+pub mod catalog;
+pub mod error;
+
+pub use catalog::{Catalog, Column, ColumnStats, IndexMeta, TableMeta, TableStats};
+pub use error::{PlanError, Result};
