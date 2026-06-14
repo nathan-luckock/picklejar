@@ -35,6 +35,18 @@ pub enum ExecError {
         /// Zero-based column index.
         column: usize,
     },
+    /// An expression referenced a column not in the current row.
+    #[error("unknown column in expression: {0}")]
+    UnknownColumn(String),
+    /// An expression combined values of incompatible types.
+    #[error("type error: {0}")]
+    Type(String),
+    /// The underlying table source failed (storage or transaction error).
+    #[error("table source error: {0}")]
+    Source(String),
+    /// A plan node the executor does not run yet.
+    #[error("{0} is not supported by the executor yet")]
+    Unsupported(String),
 }
 
 /// Executor result alias.

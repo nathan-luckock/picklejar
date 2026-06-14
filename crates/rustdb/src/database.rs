@@ -27,12 +27,12 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use rustdb_executor::encode_row;
-use rustdb_planner::Catalog;
+use rustdb_executor::{decode_row, encode_row, run, Relation, TableSource};
+use rustdb_planner::{bind, plan, Catalog};
 use rustdb_sql::statement::DataType;
 use rustdb_sql::{Expr, Parser, Statement, UnOp, Value};
 use rustdb_storage::{BufferPool, FileManager, PageId};
-use rustdb_txn::{MvccTable, TransactionManager};
+use rustdb_txn::{MvccTable, Transaction, TransactionManager};
 use rustdb_wal::{WalSyncHandle, WalWriter};
 
 use crate::error::{DbError, Result};
@@ -134,7 +134,7 @@ impl Database {
                 columns,
                 rows,
             } => self.insert(&table, &columns, &rows),
-            Statement::Select(_) => Err(DbError::Unsupported("SELECT".into())),
+            Statement::Select(_) => self.run_select(&stmt),
             Statement::Update { .. } => Err(DbError::Unsupported("UPDATE".into())),
             Statement::Delete { .. } => Err(DbError::Unsupported("DELETE".into())),
             Statement::Explain(_) => Err(DbError::Unsupported("EXPLAIN".into())),
@@ -240,6 +240,67 @@ impl Database {
         store.index_root = handle.index_root();
         store.version_page = handle.version_page();
         Ok(QueryOutcome::Mutation { affected })
+    }
+
+    fn run_select(&self, stmt: &Statement) -> Result<QueryOutcome> {
+        // Bind and plan against the catalog, then run the physical plan over
+        // a reader snapshot. Base tables are read through `EngineSource`.
+        let logical = bind(&self.catalog, stmt)?;
+        let physical = plan(&logical, &self.catalog)?;
+        let txn = self.mgr.begin();
+        let source = EngineSource {
+            pool: &self.pool,
+            wal: self.wal.clone(),
+            mgr: &self.mgr,
+            catalog: &self.catalog,
+            tables: &self.tables,
+            txn: &txn,
+        };
+        let (columns, rows) = run(&physical, &source)?;
+        self.mgr.commit(&txn);
+        Ok(QueryOutcome::Rows { columns, rows })
+    }
+}
+
+/// Bridges the executor to storage: scans a table's MVCC store under the
+/// query's snapshot and decodes each row for the operators above.
+struct EngineSource<'a> {
+    pool: &'a BufferPool,
+    wal: WalSyncHandle,
+    mgr: &'a TransactionManager,
+    catalog: &'a Catalog,
+    tables: &'a HashMap<String, TableStore>,
+    txn: &'a Transaction,
+}
+
+impl TableSource for EngineSource<'_> {
+    fn scan(&self, table: &str) -> std::result::Result<Relation, rustdb_executor::ExecError> {
+        use rustdb_executor::ExecError;
+        let meta = self
+            .catalog
+            .get_table(table)
+            .ok_or_else(|| ExecError::Source(format!("unknown table {table}")))?;
+        let columns: Vec<String> = meta.columns.iter().map(|c| c.name.clone()).collect();
+        let schema: Vec<DataType> = meta.columns.iter().map(|c| c.ty).collect();
+        let store = self
+            .tables
+            .get(table)
+            .ok_or_else(|| ExecError::Source(format!("no store for table {table}")))?;
+        let handle = MvccTable::open(
+            self.pool,
+            self.wal.clone(),
+            self.mgr,
+            store.index_root,
+            store.version_page,
+        );
+        let raw = handle
+            .scan(self.txn)
+            .map_err(|e| ExecError::Source(e.to_string()))?;
+        let rows = raw
+            .into_iter()
+            .map(|(_key, bytes)| decode_row(&bytes, &schema))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(Relation { columns, rows })
     }
 }
 
@@ -405,13 +466,74 @@ mod tests {
         assert!(matches!(err, DbError::UnknownTable(t) if t == "t"));
     }
 
+    /// Run a query and unwrap its rows.
+    fn query(db: &mut Database, sql: &str) -> (Vec<String>, Vec<Vec<Value>>) {
+        match db.execute(sql).unwrap() {
+            QueryOutcome::Rows { columns, rows } => (columns, rows),
+            other => panic!("expected rows, got {other:?}"),
+        }
+    }
+
+    fn names(cols: &[String]) -> Vec<&str> {
+        cols.iter().map(String::as_str).collect()
+    }
+
     #[test]
-    fn select_is_not_supported_yet() {
+    fn select_star_returns_all_rows() {
+        let (_dir, mut db) = db();
+        db.execute("CREATE TABLE t (id INT, name TEXT)").unwrap();
+        db.execute("INSERT INTO t (id, name) VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+            .unwrap();
+        let (cols, rows) = query(&mut db, "SELECT * FROM t");
+        assert_eq!(names(&cols), ["id", "name"]);
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Int(1), Value::Text("a".into())],
+                vec![Value::Int(2), Value::Text("b".into())],
+                vec![Value::Int(3), Value::Text("c".into())],
+            ]
+        );
+    }
+
+    #[test]
+    fn select_where_and_projection() {
+        let (_dir, mut db) = db();
+        db.execute("CREATE TABLE t (id INT, name TEXT)").unwrap();
+        db.execute("INSERT INTO t (id, name) VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+            .unwrap();
+        let (cols, rows) = query(&mut db, "SELECT name FROM t WHERE id > 1");
+        assert_eq!(names(&cols), ["name"]);
+        assert_eq!(
+            rows,
+            vec![vec![Value::Text("b".into())], vec![Value::Text("c".into())],]
+        );
+    }
+
+    #[test]
+    fn select_order_by_desc_and_limit() {
         let (_dir, mut db) = db();
         db.execute("CREATE TABLE t (id INT)").unwrap();
-        assert!(matches!(
-            db.execute("SELECT * FROM t"),
-            Err(DbError::Unsupported(_))
-        ));
+        db.execute("INSERT INTO t (id) VALUES (2), (5), (1), (4), (3)")
+            .unwrap();
+        let (_cols, rows) = query(&mut db, "SELECT id FROM t ORDER BY id DESC LIMIT 2");
+        assert_eq!(rows, vec![vec![Value::Int(5)], vec![Value::Int(4)]]);
+    }
+
+    #[test]
+    fn select_with_or_predicate() {
+        let (_dir, mut db) = db();
+        db.execute("CREATE TABLE t (id INT)").unwrap();
+        db.execute("INSERT INTO t (id) VALUES (1), (2), (3), (4)")
+            .unwrap();
+        let (_cols, rows) = query(&mut db, "SELECT id FROM t WHERE id = 1 OR id = 4");
+        assert_eq!(rows, vec![vec![Value::Int(1)], vec![Value::Int(4)]]);
+    }
+
+    #[test]
+    fn select_unknown_column_errors() {
+        let (_dir, mut db) = db();
+        db.execute("CREATE TABLE t (id INT)").unwrap();
+        assert!(db.execute("SELECT bogus FROM t").is_err());
     }
 }
