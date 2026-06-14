@@ -504,6 +504,7 @@ dependencies = [
 name = "rustdb-planner"
 version = "0.0.1"
 dependencies = [
+ "proptest",
  "rustdb-sql",
  "rustdb-storage",
  "thiserror",

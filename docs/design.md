@@ -26,8 +26,8 @@ Non-goals: distributed replication, network protocol compatibility with Postgres
 | 5 | Transactions + MVCC (manager, visibility, versions, MvccTable, isolation levels) | ✅ shipped (PRs #49–#54) |
 | 6 | MVCC polish: write-write conflict detection, version GC | ⏳ deferred |
 | 7 | SQL parser (lexer, Pratt expressions, DDL, DML, SELECT + JOIN/GROUP/ORDER/LIMIT) | ✅ shipped (PRs #62–#67) |
-| 8 | Cost-based planner (M6) | ⏳ next |
-| 9 | Executor + CLI wiring (M1) | ⏳ |
+| 8 | Cost-based planner (M6): catalog, logical plan, cost model, join selection, EXPLAIN | ✅ shipped (PRs #73–#77) |
+| 9 | Executor + CLI wiring (M1) | ⏳ next |
 | 10 | Torture test + polish | ⏳ |
 | 11 | Demo + write-up + SPED talk | ⏳ |
 
@@ -342,12 +342,83 @@ Every AST node has a `Display` that prints canonical SQL, fully parenthesizing e
 
 ---
 
-## Planner (Sprint 8 — planned)
+## Planner (Sprint 8 — shipped, M6)
 
-1. **Logical plan.** AST → relational algebra tree (Scan, Filter, Project, Join, Aggregate, Sort).
-2. **Logical rewrites.** Predicate pushdown, projection pushdown, constant folding.
-3. **Physical plan.** Choose between SeqScan vs IndexScan per relation; choose between NestedLoopJoin vs HashJoin per join. Costs from per-table stats (row count, NDV, min/max per column).
-4. **`EXPLAIN`** output: pretty-printed plan tree with per-node estimated cost.
+The planner is the cost-based optimizer (requirement M6). It turns a parsed
+`SELECT` into a logical plan, then into a cost-annotated physical plan,
+making two cost-driven choices: sequential scan vs index scan per table, and
+nested-loop vs hash join per join. `crates/planner`, no external dependencies.
+
+### Pipeline
+
+1. **Catalog** (`catalog.rs`). In-memory schema + statistics: tables,
+   columns, indexes, per-table `row_count`, and per-column distinct-value
+   counts (`ColumnStats`). DDL is applied through `Catalog::apply`; stats are
+   set via `set_row_count` / `set_column_stats`. A column with no recorded
+   stats defaults to `distinct = 1` (pessimistic: it makes equality look
+   non-selective, so the planner does not reach for an index on a column it
+   knows nothing about).
+2. **Logical plan** (`logical.rs`, `binder.rs`). The binder resolves table and
+   column names against the catalog and emits a relational-algebra tree
+   bottom-up in SQL's evaluation order: `Scan -> Join* -> Filter (WHERE) ->
+   Aggregate (GROUP BY) -> Project (SELECT) -> Sort (ORDER BY) -> Limit`. A
+   single-table WHERE is placed directly above its Scan (predicate pushdown)
+   so the physical planner can fuse it into the access path.
+3. **Cost model** (`cost.rs`). Selectivity is estimated from catalog stats:
+   - `col = const` -> `1 / distinct(col)` (uniform-distribution guess),
+     floored at `1e-6` so a huge cardinality never estimates zero rows.
+   - a range comparison (`<`, `<=`, `>`, `>=`) -> `0.3` (textbook default).
+   - `a AND b` -> `sel(a) * sel(b)` (independence); `a OR b` ->
+     `sel(a) + sel(b) - sel(a)*sel(b)` (inclusion-exclusion); `NOT a` ->
+     `1 - sel(a)`.
+   - Scan costs: `seq_scan_cost(rows) = rows`; `index_scan_cost(rows, sel) =
+     log2(rows+1) + sel*rows` (a logarithmic B+ tree descent plus one unit
+     per matched row).
+4. **Physical plan** (`physical.rs`). Every node carries `est_rows` and
+   `est_cost`. `choose_scan` fuses a Filter-over-Scan into an `IndexScan`
+   when the predicate is sargable on an indexed column *and* the index cost
+   beats the seq cost, otherwise a `SeqScan`. `choose_join` picks a
+   `HashJoin` for an equi-join (every AND conjunct an equality) when its
+   linear `left + right` cost beats the nested loop's `left * right`,
+   otherwise a `NestedLoopJoin`.
+5. **`EXPLAIN`** (`explain.rs`). `EXPLAIN <statement>` is a parser keyword
+   (`Statement::Explain`). The renderer prints the physical plan as an
+   indented tree; each node shows its operator and `(rows=.. cost=..)`, with
+   scan/filter predicates on an indented line. Example:
+
+   ```
+   Project name  (rows=1 cost=11.0)
+     IndexScan parts USING idx_id  (rows=1 cost=11.0)
+       predicate: (id = 5)
+   ```
+
+### Design decisions
+
+- **Monotone, not maximal.** The model targets a *defensible ordering*, not
+  perfect cardinalities. A more selective predicate on an indexed column
+  always lowers the index cost relative to seq, so the planner flips to the
+  index exactly when it pays off. The property test
+  (`tests/proptests.rs`) pins the invariant that the chosen scan never costs
+  more than a full seq scan, for any catalog and predicate.
+- **Cost is chosen, never assumed.** Both the index scan and the hash join
+  are taken only when cost says so. A low-cardinality equality keeps the seq
+  scan even with an index present; a one-row-per-side join keeps the nested
+  loop rather than building a hash table. The crossover falls out of the
+  formulas, not a magic constant.
+- **Join output rows are the cross-product bound for both algorithms.**
+  Without join-key histograms the match ratio is unknown, so the row
+  estimate is identical for hash and loop and cannot bias the choice; only
+  the access cost (linear vs quadratic) decides.
+- **Abstract cost units (rows touched), not milliseconds.** The optimizer
+  only needs a consistent ordering between plans. `EXPLAIN` prints these
+  absolute units so the seq-vs-index and hash-vs-loop crossovers are
+  inspectable side by side. This is the artifact shown at defense.
+
+What is deliberately *not* here yet: logical rewrites beyond single-table
+predicate pushdown (no projection pushdown or constant folding), multi-index
+intersection, and join-order enumeration (joins are planned in written
+order). These are optimizer refinements, not correctness gaps, and are out of
+scope for the must-have M6.
 
 ---
 
