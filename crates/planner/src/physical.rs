@@ -9,7 +9,7 @@
 //! Every node carries `est_rows` and `est_cost` so EXPLAIN can show them and
 //! parent operators can cost themselves from their children.
 
-use rustdb_sql::{Expr, JoinKind, SelectItem};
+use rustdb_sql::{BinOp, Expr, JoinKind, SelectItem};
 
 use crate::catalog::Catalog;
 use crate::cost::{estimate_rows, index_scan_cost, sargable_index, selectivity, seq_scan_cost};
@@ -99,7 +99,8 @@ pub enum PhysicalPlan {
         /// Estimated cost.
         est_cost: f64,
     },
-    /// Nested-loop join. (Hash-join selection lands in #71.)
+    /// Nested-loop join: scan the right input once per left row. Works for
+    /// any join predicate; cost is the cross product.
     NestedLoopJoin {
         /// Inner or left.
         kind: JoinKind,
@@ -108,6 +109,23 @@ pub enum PhysicalPlan {
         /// Right input.
         right: Box<Self>,
         /// Join predicate.
+        on: Expr,
+        /// Estimated output rows.
+        est_rows: u64,
+        /// Estimated cost.
+        est_cost: f64,
+    },
+    /// Hash join: build a hash table on one side, probe with the other.
+    /// Valid only for an equality (equi-join) predicate; linear in the
+    /// inputs rather than quadratic.
+    HashJoin {
+        /// Inner or left.
+        kind: JoinKind,
+        /// Build (left) input.
+        left: Box<Self>,
+        /// Probe (right) input.
+        right: Box<Self>,
+        /// Join predicate (an equality).
         on: Expr,
         /// Estimated output rows.
         est_rows: u64,
@@ -128,7 +146,8 @@ impl PhysicalPlan {
             | Self::Sort { est_rows, .. }
             | Self::Limit { est_rows, .. }
             | Self::Aggregate { est_rows, .. }
-            | Self::NestedLoopJoin { est_rows, .. } => *est_rows,
+            | Self::NestedLoopJoin { est_rows, .. }
+            | Self::HashJoin { est_rows, .. } => *est_rows,
         }
     }
 
@@ -143,7 +162,8 @@ impl PhysicalPlan {
             | Self::Sort { est_cost, .. }
             | Self::Limit { est_cost, .. }
             | Self::Aggregate { est_cost, .. }
-            | Self::NestedLoopJoin { est_cost, .. } => *est_cost,
+            | Self::NestedLoopJoin { est_cost, .. }
+            | Self::HashJoin { est_cost, .. } => *est_cost,
         }
     }
 }
@@ -243,23 +263,64 @@ pub fn plan(logical: &LogicalPlan, catalog: &Catalog) -> Result<PhysicalPlan> {
             left,
             right,
             on,
-        } => {
-            let lp = plan(left, catalog)?;
-            let rp = plan(right, catalog)?;
-            #[allow(clippy::cast_precision_loss)]
-            let nl_cost =
-                (lp.est_rows() as f64).mul_add(rp.est_rows() as f64, lp.est_cost() + rp.est_cost());
-            // Cross-product upper bound on output rows (refined in #71).
-            let est_rows = lp.est_rows().saturating_mul(rp.est_rows()).max(1);
-            Ok(PhysicalPlan::NestedLoopJoin {
-                kind: *kind,
+        } => Ok(choose_join(
+            *kind,
+            plan(left, catalog)?,
+            plan(right, catalog)?,
+            on,
+        )),
+    }
+}
+
+/// Choose a join algorithm. A nested-loop join works for any predicate but
+/// costs the cross product (`left * right`); a hash join is linear
+/// (`left + right`) but needs an equality predicate. Pick the hash join for
+/// an equi-join whenever it is cheaper, which on any non-trivial input it
+/// always is.
+fn choose_join(kind: JoinKind, lp: PhysicalPlan, rp: PhysicalPlan, on: &Expr) -> PhysicalPlan {
+    let child_cost = lp.est_cost() + rp.est_cost();
+    #[allow(clippy::cast_precision_loss)]
+    let nl_cost = (lp.est_rows() as f64).mul_add(rp.est_rows() as f64, child_cost);
+    // Output-row estimate: the cross-product upper bound. Without join-key
+    // statistics we cannot do better, so both algorithms share it.
+    let est_rows = lp.est_rows().saturating_mul(rp.est_rows()).max(1);
+
+    if is_equi_join(on) {
+        #[allow(clippy::cast_precision_loss)]
+        let hash_cost = (lp.est_rows() + rp.est_rows()) as f64 + child_cost;
+        if hash_cost < nl_cost {
+            return PhysicalPlan::HashJoin {
+                kind,
                 left: Box::new(lp),
                 right: Box::new(rp),
                 on: on.clone(),
                 est_rows,
-                est_cost: nl_cost,
-            })
+                est_cost: hash_cost,
+            };
         }
+    }
+
+    PhysicalPlan::NestedLoopJoin {
+        kind,
+        left: Box::new(lp),
+        right: Box::new(rp),
+        on: on.clone(),
+        est_rows,
+        est_cost: nl_cost,
+    }
+}
+
+/// An equi-join predicate is one whose every `AND` conjunct is an equality.
+/// Such a predicate yields hash keys, so a hash join is applicable.
+fn is_equi_join(on: &Expr) -> bool {
+    match on {
+        Expr::Binary { op: BinOp::Eq, .. } => true,
+        Expr::Binary {
+            op: BinOp::And,
+            left,
+            right,
+        } => is_equi_join(left) && is_equi_join(right),
+        _ => false,
     }
 }
 
@@ -425,5 +486,68 @@ mod tests {
         let logical = bind(&c, &stmt("SELECT * FROM t LIMIT 10")).unwrap();
         let p = plan(&logical, &c).unwrap();
         assert_eq!(p.est_rows(), 10);
+    }
+
+    /// Two tables of `rows` rows each, for join tests.
+    fn join_catalog(rows: u64) -> Catalog {
+        let mut c = Catalog::new();
+        c.apply(&stmt("CREATE TABLE orders (id INT, cid INT)"))
+            .unwrap();
+        c.apply(&stmt("CREATE TABLE customers (id INT, name TEXT)"))
+            .unwrap();
+        c.set_row_count("orders", rows).unwrap();
+        c.set_row_count("customers", rows).unwrap();
+        c
+    }
+
+    fn join_plan(cat: &Catalog, src: &str) -> PhysicalPlan {
+        let logical = bind(cat, &stmt(src)).unwrap();
+        let LogicalPlan::Project { input, .. } = logical else {
+            panic!("expected Project at root");
+        };
+        plan(&input, cat).unwrap()
+    }
+
+    #[test]
+    fn equi_join_on_sizable_inputs_picks_hash_join() {
+        let c = join_catalog(1000);
+        let p = join_plan(
+            &c,
+            "SELECT o.id FROM orders AS o INNER JOIN customers AS c ON o.cid = c.id",
+        );
+        assert!(
+            matches!(p, PhysicalPlan::HashJoin { .. }),
+            "equi-join should use a hash join, got {p:?}"
+        );
+        // Hash join (linear) must beat the nested-loop cross product.
+        assert!(p.est_cost() < 1000.0 * 1000.0, "hash join should be linear");
+    }
+
+    #[test]
+    fn non_equi_join_falls_back_to_nested_loop() {
+        let c = join_catalog(1000);
+        let p = join_plan(
+            &c,
+            "SELECT o.id FROM orders AS o INNER JOIN customers AS c ON o.cid > c.id",
+        );
+        assert!(
+            matches!(p, PhysicalPlan::NestedLoopJoin { .. }),
+            "a range join predicate has no hash key, got {p:?}"
+        );
+    }
+
+    #[test]
+    fn tiny_equi_join_keeps_nested_loop() {
+        // With one row per side, the cross product (1) ties or beats the
+        // hash build+probe (2), so the simpler nested loop wins.
+        let c = join_catalog(1);
+        let p = join_plan(
+            &c,
+            "SELECT o.id FROM orders AS o INNER JOIN customers AS c ON o.cid = c.id",
+        );
+        assert!(
+            matches!(p, PhysicalPlan::NestedLoopJoin { .. }),
+            "a trivially small join should not pay for a hash table, got {p:?}"
+        );
     }
 }

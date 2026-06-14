@@ -258,6 +258,8 @@ pub enum Statement {
         /// Optional WHERE predicate.
         where_clause: Option<Expr>,
     },
+    /// `EXPLAIN <statement>`: plan the inner statement instead of running it.
+    Explain(Box<Self>),
 }
 
 impl fmt::Display for Statement {
@@ -335,6 +337,7 @@ impl fmt::Display for Statement {
                 }
                 Ok(())
             }
+            Self::Explain(inner) => write!(f, "EXPLAIN {inner}"),
         }
     }
 }
@@ -351,6 +354,10 @@ impl Parser {
             TokenKind::Keyword(Keyword::Insert) => self.parse_insert()?,
             TokenKind::Keyword(Keyword::Update) => self.parse_update()?,
             TokenKind::Keyword(Keyword::Delete) => self.parse_delete()?,
+            TokenKind::Keyword(Keyword::Explain) => {
+                self.advance();
+                Statement::Explain(Box::new(self.parse_statement()?))
+            }
             other => {
                 return Err(SqlError::parse(
                     format!("expected a statement, found {other:?}"),
@@ -965,6 +972,26 @@ mod tests {
         assert_eq!(
             parse("update t set a=1 where b=2").to_string(),
             "UPDATE t SET a = 1 WHERE (b = 2)"
+        );
+    }
+
+    #[test]
+    fn explain_wraps_inner_statement() {
+        let s = round_trip("EXPLAIN SELECT id FROM t WHERE id = 5");
+        let Statement::Explain(inner) = s else {
+            panic!("expected Explain");
+        };
+        assert!(
+            matches!(*inner, Statement::Select(_)),
+            "inner must be Select"
+        );
+    }
+
+    #[test]
+    fn explain_display_prefixes_keyword() {
+        assert_eq!(
+            parse("explain select * from t").to_string(),
+            "EXPLAIN SELECT * FROM t"
         );
     }
 

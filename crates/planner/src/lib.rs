@@ -19,11 +19,13 @@ pub mod binder;
 pub mod catalog;
 pub mod cost;
 pub mod error;
+pub mod explain;
 pub mod logical;
 pub mod physical;
 
 pub use binder::bind;
 pub use catalog::{Catalog, Column, ColumnStats, IndexMeta, TableMeta, TableStats};
 pub use error::{PlanError, Result};
+pub use explain::explain;
 pub use logical::LogicalPlan;
 pub use physical::{plan, PhysicalPlan};
