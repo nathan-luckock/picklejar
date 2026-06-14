@@ -38,7 +38,7 @@ impl fmt::Display for TableRef {
 /// One item in a SELECT projection list.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SelectItem {
-    /// `*` — all columns.
+    /// `*` - all columns.
     Star,
     /// An expression with an optional alias.
     Expr(Expr, Option<String>),

@@ -1,4 +1,4 @@
-# rustdb — Design Document
+# rustdb - Design Document
 
 > Working document. Updated as decisions are made. The goal is for any reviewer (and future-you) to be able to reconstruct **why** the engine is shaped the way it is from this single file.
 
@@ -12,6 +12,12 @@ A relational database engine built from scratch with:
 
 Non-goals: distributed replication, network protocol compatibility with Postgres, performance parity with mature engines.
 
+## Ground rules
+
+1. **Everything graded is hand-written.** The storage engine, WAL and recovery, MVCC, the SQL parser, and the planner are all implemented from scratch. External crates are restricted to plumbing that is not part of the graded engine: error handling (`thiserror`), logging (`tracing`), CLI argument parsing (`clap`). No embedded database (SQLite, sled, RocksDB), no SQL parser crate (`sqlparser`), no checksum crate (`crc32fast`).
+2. **Every change carries its reasoning.** Each commit ships with a `Design notes:` section recording what was chosen and why, and the larger decisions land in this document with the alternatives that were rejected.
+3. **Test before commit.** `cargo build`, `fmt`, `clippy -D warnings`, and the full test suite pass on every change.
+
 ---
 
 ## Implementation status (running)
@@ -19,14 +25,14 @@ Non-goals: distributed replication, network protocol compatibility with Postgres
 | Sprint | What | Status |
 |---|---|---|
 | 0 | Bootstrap: workspace, CI, design doc, working agreement | ✅ shipped (PR #1) |
-| 1 | Storage I: file manager, page header + CRC32, slotted page, proptests | ✅ shipped (PRs #7–#10) |
-| 2 | Storage II: buffer pool + B+ tree + proptests | ✅ shipped (PRs #17–#21) |
-| 3 | WAL: record format, writer, reader, buffer pool integration, proptests | ✅ shipped (PRs #27–#31) |
-| 4 | ARIES recovery (analysis + redo + undo + forced-kill torture test) | ✅ shipped (PRs #37–#42) |
-| 5 | Transactions + MVCC (manager, visibility, versions, MvccTable, isolation levels) | ✅ shipped (PRs #49–#54) |
+| 1 | Storage I: file manager, page header + CRC32, slotted page, proptests | ✅ shipped (PRs #7-#10) |
+| 2 | Storage II: buffer pool + B+ tree + proptests | ✅ shipped (PRs #17-#21) |
+| 3 | WAL: record format, writer, reader, buffer pool integration, proptests | ✅ shipped (PRs #27-#31) |
+| 4 | ARIES recovery (analysis + redo + undo + forced-kill torture test) | ✅ shipped (PRs #37-#42) |
+| 5 | Transactions + MVCC (manager, visibility, versions, MvccTable, isolation levels) | ✅ shipped (PRs #49-#54) |
 | 6 | MVCC polish: write-write conflict detection, version GC | ⏳ deferred |
-| 7 | SQL parser (lexer, Pratt expressions, DDL, DML, SELECT + JOIN/GROUP/ORDER/LIMIT) | ✅ shipped (PRs #62–#67) |
-| 8 | Cost-based planner (M6): catalog, logical plan, cost model, join selection, EXPLAIN | ✅ shipped (PRs #73–#77) |
+| 7 | SQL parser (lexer, Pratt expressions, DDL, DML, SELECT + JOIN/GROUP/ORDER/LIMIT) | ✅ shipped (PRs #62-#67) |
+| 8 | Cost-based planner (M6): catalog, logical plan, cost model, join selection, EXPLAIN | ✅ shipped (PRs #73-#77) |
 | 9 | Executor + CLI wiring (M1) | ⏳ next |
 | 10 | Torture test + polish | ⏳ |
 | 11 | Demo + write-up + SPED talk | ⏳ |
@@ -80,7 +86,7 @@ Non-goals: distributed replication, network protocol compatibility with Postgres
 
 Exposed as `rustdb_storage::PAGE_SIZE` (`usize`) and `PAGE_SIZE_U16` (typed mirror for `u16` arithmetic in the slot directory). A compile-time assertion in `page.rs` keeps them in sync.
 
-### File manager (Sprint 1 — shipped)
+### File manager (Sprint 1 - shipped)
 
 `rustdb_storage::FileManager` owns the database file and exposes page-granular I/O. Single source of truth for raw page reads and writes; higher layers (buffer pool, WAL flush path) go through it.
 
@@ -101,10 +107,10 @@ impl FileManager {
 - `allocate_page` uses `set_len` to extend the file. OS guarantees zero-fill for the new region; faster than a `seek + write_zeros` loop and identical semantics.
 - File opened with `truncate(false)` AND `create(true)`. Explicit so a refactor doesn't accidentally start truncating live databases.
 - `MisalignedFile` is a real error, not a panic. A wrong-page-size build or a half-written torture-test artifact needs to surface to the caller so they can decide to abort, repair, or ignore.
-- **Rejected**: `O_DIRECT`. We want the OS page cache for the demo — cache effects are part of what the buffer pool buys.
+- **Rejected**: `O_DIRECT`. We want the OS page cache for the demo - cache effects are part of what the buffer pool buys.
 - **Rejected**: positional I/O for now. Sprint 1 surface is small enough that seeking is fine; revisit if benchmarks show seek overhead matters.
 
-### Page header (Sprint 1 — shipped)
+### Page header (Sprint 1 - shipped)
 
 Every page starts with a 24-byte header, little-endian:
 
@@ -122,7 +128,7 @@ Every page starts with a 24-byte header, little-endian:
 
 - `page_type` is a `u16` even though we have <8 variants. Room for visibility map / free-space map page types later without breaking the binary format.
 - `reserved: u32` exists specifically for the MVCC chain pointer. Reserving the space now means Sprint 6 doesn't force a layout migration.
-- `FLAG_DIRTY` is in-memory only — the flush path clears it before write-back.
+- `FLAG_DIRTY` is in-memory only - the flush path clears it before write-back.
 
 ### Checksum
 
@@ -132,12 +138,12 @@ Every page starts with a 24-byte header, little-endian:
 
 **Decisions:**
 
-- **Scope: `[12..PAGE_SIZE]`** — the page **excluding the LSN and the checksum field itself**. The LSN is updated on every WAL-acknowledged page write; including it in the checksum would force a recompute on every update. Excluding it still catches what the checksum is for: torn writes and silent bit-rot in the payload. Postgres makes the same tradeoff.
-- **Hand-written over `crc32fast`.** Per [CLAUDE.md rule 6](../CLAUDE.md), storage-related code is from scratch. CRC32 is small enough that a from-scratch impl is justified by clarity alone — no dependency wins back enough complexity to matter.
-- **Rejected**: SIMD-accelerated CRC32 (e.g. `crc32` intrinsic). The page checksum runs over 8 KiB at a time — not the hot path that benefits from intrinsics.
+- **Scope: `[12..PAGE_SIZE]`** - the page **excluding the LSN and the checksum field itself**. The LSN is updated on every WAL-acknowledged page write; including it in the checksum would force a recompute on every update. Excluding it still catches what the checksum is for: torn writes and silent bit-rot in the payload. Postgres makes the same tradeoff.
+- **Hand-written over `crc32fast`.** Per ground rule 1 (above), storage-related code is from scratch. CRC32 is small enough that a from-scratch impl is justified by clarity alone, and no dependency wins back enough complexity to matter.
+- **Rejected**: SIMD-accelerated CRC32 (e.g. `crc32` intrinsic). The page checksum runs over 8 KiB at a time - not the hot path that benefits from intrinsics.
 - **Rejected**: blake3 / xxHash. CRC32 catches accidental corruption (the documented threat model). Cryptographic strength isn't needed for a single-node DB.
 
-### Slotted-page heap layout (Sprint 1 — shipped)
+### Slotted-page heap layout (Sprint 1 - shipped)
 
 ```
  0       24      ...                  free_space_ptr        PAGE_SIZE
@@ -152,24 +158,24 @@ Slot directory entry (4 bytes, little-endian): `(offset: u16, length: u16)`. Len
 
 **Decisions:**
 
-- **Slot IDs are stable for the page's lifetime and never recycled.** Once a `SlotId` is assigned by an `insert`, it always refers to the same logical slot, even after `delete`. This is the foundation that secondary B+ tree indexes (Sprint 2) rely on. The alternative — reusing freed slot IDs on the next insert — saves 4 bytes per delete but silently breaks any external `(page_id, slot_id)` reference. Hard no.
+- **Slot IDs are stable for the page's lifetime and never recycled.** Once a `SlotId` is assigned by an `insert`, it always refers to the same logical slot, even after `delete`. This is the foundation that secondary B+ tree indexes (Sprint 2) rely on. The alternative - reusing freed slot IDs on the next insert - saves 4 bytes per delete but silently breaks any external `(page_id, slot_id)` reference. Hard no.
 - **Tombstone marker = slot length 0**, not a separate flag bit. Smaller (no extra bit per slot), simpler (one comparison in `get`, not two). Cost: empty tuples can't be stored. Schemas with zero-length columns will use NULL bitmaps; not a real loss.
-- **`compact` is explicit, never implicit.** Inserts and reads never trigger compaction on their own. The buffer pool will decide when to schedule it based on the `FLAG_NEEDS_VACUUM` hint. Keeps the hot path predictable — no "this insert took 50ms because it compacted" surprises.
-- **`FLAG_NEEDS_VACUUM` threshold: 1024 bytes** of tombstoned space. Arbitrary for the capstone — real systems use adaptive thresholds based on page utilization and access patterns.
+- **`compact` is explicit, never implicit.** Inserts and reads never trigger compaction on their own. The buffer pool will decide when to schedule it based on the `FLAG_NEEDS_VACUUM` hint. Keeps the hot path predictable - no "this insert took 50ms because it compacted" surprises.
+- **`FLAG_NEEDS_VACUUM` threshold: 1024 bytes** of tombstoned space. Arbitrary for the capstone - real systems use adaptive thresholds based on page utilization and access patterns.
 - **`compact` allocates a small temp `Vec<(u16, Vec<u8>)>`.** Page-local, ~30 tuples max at typical sizes, not on the hot path. A zero-alloc in-place compaction is doable via overlapping copies but adds complexity unjustified for Sprint 1's budget.
 - **Rejected**: storing tuples in slot order. Insertion order makes `compact` a simple "walk live slots, copy to end" pass. Keeping tuples sorted by slot ID would force a re-sort after every `compact`.
 
-### B+ tree (Sprint 2 — planned)
+### B+ tree (Sprint 2 - planned)
 
 Branching factor TBD (target ~128 for 8 KiB pages with `u64` keys). Internal node = sorted keys + child page IDs. Leaf node = sorted keys + tuple references `(PageId, SlotId)`. Sibling pointer in leaves for range scans.
 
-### Buffer pool (Sprint 2 — planned)
+### Buffer pool (Sprint 2 - planned)
 
 LRU-K (K=2) replacement. Pin/unpin via RAII `PageGuard`. Pinned pages are evict-immune. Dirty bit set on first write through a guard.
 
 ---
 
-## WAL (Sprint 3 — shipped)
+## WAL (Sprint 3 - shipped)
 
 ### Log record layout (29-byte header + payload + 4-byte trailer)
 
@@ -216,7 +222,7 @@ Forward `Iterator<Item = Result<(RecordHeader, LogRecord)>>`. Clean `None` on EO
 - WAL segment rotation. Single-file fits demo scope.
 - `O_DIRECT` for the WAL. OS page cache hides write latency without changing semantics, since we explicitly `sync_all` for durability.
 
-## Recovery (Sprint 4 — planned)
+## Recovery (Sprint 4 - planned)
 
 Original log record sketch (kept for reference):
 
@@ -234,22 +240,22 @@ Original log record sketch (kept for reference):
 └────────────────────────────────────────────────┘
 ```
 
-### Three-phase recovery (ARIES) — Sprint 4, shipped
+### Three-phase recovery (ARIES) - Sprint 4, shipped
 
 Implemented in `crates/wal/src/recovery.rs`. `recover(pool, wal_path)` runs all three phases and returns a `RecoveryStats { winners, losers, redone, undone }`.
 
-1. **Analysis** (`analyze`). Scan the WAL forward and rebuild the transaction table: each transaction's last LSN and whether it committed. Committed transactions are *winners*; everything else is a *loser*. Sprint 4 scans from the start of the log (the dirty page table optimization is deferred — see below).
+1. **Analysis** (`analyze`). Scan the WAL forward and rebuild the transaction table: each transaction's last LSN and whether it committed. Committed transactions are *winners*; everything else is a *loser*. Sprint 4 scans from the start of the log (the dirty page table optimization is deferred - see below).
 2. **Redo** (`redo`). Replay history: re-apply every `Update` after-image and every `Clr` undo-image to its page, but only when the page's stored LSN is strictly less than the record's LSN (the page-LSN gate). This makes redo idempotent. Redo runs for winners and losers alike so undo starts from a known state. Pages the crashed data file never persisted are materialized via `BufferPool::ensure_allocated`.
 3. **Undo** (`undo`). For each loser, walk its `prev_lsn` chain backward from its last LSN. Revert each `Update` by applying its before-image, and append a fsync'd CLR whose `undo_next` points at the next record to undo. CLRs left by a prior crashed undo are skipped straight to their `undo_next`; a loser already ending in `Abort` is skipped entirely.
 
 ### Why CLRs
 
-A CLR (compensation log record) is **redo-only**: redo replays it, undo never undoes it. `undo_next` chains the rollback so that a crash *during* undo is safe — re-recovery replays the CLRs already on disk (idempotent via the page-LSN gate) and resumes undo from the last CLR's `undo_next` instead of re-reverting compensated work. This is what makes the whole recovery process idempotent: running it twice, or crashing partway through and rerunning, converges to the same state.
+A CLR (compensation log record) is **redo-only**: redo replays it, undo never undoes it. `undo_next` chains the rollback so that a crash *during* undo is safe - re-recovery replays the CLRs already on disk (idempotent via the page-LSN gate) and resumes undo from the last CLR's `undo_next` instead of re-reverting compensated work. This is what makes the whole recovery process idempotent: running it twice, or crashing partway through and rerunning, converges to the same state.
 
 ### Crash model and the torture test
 
 The graded requirement is a forced crash with no committed data loss. Two layers prove it:
-- **In-process** (`crates/wal/tests/recovery_integration.rs`): drive a `MiniHeap` workload, drop the buffer pool *without* flushing (dirty pages lost, only the fsync'd WAL survives — exactly what a kill does to unflushed pages), recover, assert committed rows survive and uncommitted rows are rolled back.
+- **In-process** (`crates/wal/tests/recovery_integration.rs`): drive a `MiniHeap` workload, drop the buffer pool *without* flushing (dirty pages lost, only the fsync'd WAL survives - exactly what a kill does to unflushed pages), recover, assert committed rows survive and uncommitted rows are rolled back.
 - **Forced process kill** (`crates/wal/tests/torture.rs` + the `crash_harness` binary): spawn a child process that commits rows forever and records each durably-committed row to a ground-truth file *after* its commit is on disk, then hard-kill it (`TerminateProcess` on Windows / `SIGKILL`), recover, and assert every ground-truth row is present. Runs several rounds so the kill lands at different points.
 
 `MiniHeap` (`crates/wal/src/workload.rs`) is the recoverable workload harness standing in for the not-yet-built SQL executor: begin / insert / update / delete / commit / abort, logging WAL-before-page and stamping each page's LSN exactly the way recovery expects to replay it.
@@ -260,7 +266,7 @@ A dirty page cannot be flushed before its corresponding log records are fsync'd.
 
 ---
 
-## Transactions + MVCC (Sprint 5 — shipped)
+## Transactions + MVCC (Sprint 5 - shipped)
 
 Implemented in the `rustdb-txn` crate. Snapshot isolation is the default; Read Committed is also available.
 
@@ -285,7 +291,7 @@ Snapshot stability falls out for free: `is_visible` reads only state frozen at b
 ### Versioned values (`version.rs`)
 
 Each row is a chain of versions, each stored in a heap slot as:
-`[ xmin u64 | xmax u64 | prev_page u64 | prev_slot u16 | payload ]` (26-byte header). `prev` (a `TupleRef`, `INVALID` = oldest) links a version to the previous one. Deleting or updating stamps the old version's `xmax` in place — a fixed 8-byte write, never a payload rewrite.
+`[ xmin u64 | xmax u64 | prev_page u64 | prev_slot u16 | payload ]` (26-byte header). `prev` (a `TupleRef`, `INVALID` = oldest) links a version to the previous one. Deleting or updating stamps the old version's `xmax` in place - a fixed 8-byte write, never a payload rewrite.
 
 ### MVCC table (`mvcc.rs`)
 
@@ -295,7 +301,7 @@ A B+ tree index maps `key -> newest version ref`; versions live in heap pages.
 - **delete**: stamp the version visible to the writer with `xmax = txn`.
 - **get**: walk the chain newest-to-oldest, return the first version visible to the reader's snapshot.
 
-Critically, update/delete operate on the **version visible to the writer**, not the index head — the head can be a dead version from an aborted transaction. (This was caught by the property tests.)
+Critically, update/delete operate on the **version visible to the writer**, not the index head - the head can be a dead version from an aborted transaction. (This was caught by the property tests.)
 
 Every write logs an `Update` WAL record (WAL-before-page) so versions are durable.
 
@@ -313,7 +319,7 @@ The page header's `reserved: u32` field remains available for an on-page version
 
 ---
 
-## SQL parser (Sprint 7 — shipped)
+## SQL parser (Sprint 7 - shipped)
 
 Hand-written, no `sqlparser-rs`. Implemented in `rustdb-sql`.
 
@@ -342,7 +348,7 @@ Every AST node has a `Display` that prints canonical SQL, fully parenthesizing e
 
 ---
 
-## Planner (Sprint 8 — shipped, M6)
+## Planner (Sprint 8 - shipped, M6)
 
 The planner is the cost-based optimizer (requirement M6). It turns a parsed
 `SELECT` into a logical plan, then into a cost-annotated physical plan,
@@ -446,7 +452,7 @@ Resolved during Sprint 2/3 (moved to relevant sections above):
 
 Resolved during Sprint 4 (moved to relevant sections above):
 - ~~CLR granularity~~: one CLR per undo step, with `undo_next` chaining for crash-safe, idempotent rollback.
-- ~~Recovery start point~~: scan from the start of the WAL. The dirty-page-table optimization (start redo at the earliest recovery LSN) is deferred — with no long-running server, a full scan is fast and far simpler to reason about. The `Checkpoint` record type exists and carries the active txn table so adding a checkpoint-bounded analysis later is additive.
+- ~~Recovery start point~~: scan from the start of the WAL. The dirty-page-table optimization (start redo at the earliest recovery LSN) is deferred - with no long-running server, a full scan is fast and far simpler to reason about. The `Checkpoint` record type exists and carries the active txn table so adding a checkpoint-bounded analysis later is additive.
 - ~~Crash model for testing~~: forced process kill of a child harness, plus an in-process "drop the pool without flushing" simulation.
 
 Still open (resolve before the relevant sprint):
@@ -472,4 +478,4 @@ Resolved during Sprint 5 (moved to the Transactions + MVCC section above):
 - Mohan et al., *ARIES: A Transaction Recovery Method Supporting Fine-Granularity Locking and Partial Rollbacks Using Write-Ahead Logging* (1992).
 - CMU 15-445 / 15-721 lectures (Pavlo).
 - Petrov, *Database Internals*.
-- Postgres source — `src/backend/storage/buffer/` and `src/backend/access/transam/xlog.c` as a sanity check on real-world layouts.
+- Postgres source - `src/backend/storage/buffer/` and `src/backend/access/transam/xlog.c` as a sanity check on real-world layouts.

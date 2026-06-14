@@ -7,7 +7,7 @@
 //! Every node has a `Display` that prints back to canonical SQL. For
 //! expressions the printer fully parenthesizes binary and unary operators,
 //! so `parse(print(expr)) == expr` for any expression regardless of
-//! operator precedence — the basis of the parser round-trip property test.
+//! operator precedence - the basis of the parser round-trip property test.
 
 use std::fmt;
 

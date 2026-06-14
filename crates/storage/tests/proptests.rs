@@ -12,8 +12,8 @@
 //! 1. **Page header round-trip.** For any combination of field values,
 //!    `PageHeader::write` then `PageHeader::read` returns the original
 //!    struct.
-//! 2. **Checksum bit-flip coverage.** A full sweep — every byte offset in
-//!    the payload, every bit position — verifies that flipping any single
+//! 2. **Checksum bit-flip coverage.** A full sweep - every byte offset in
+//!    the payload, every bit position - verifies that flipping any single
 //!    bit invalidates the stored checksum. The unit test samples 64
 //!    offsets; the prop test does the whole 8 KiB.
 //! 3. **Insert round-trip.** Any tuple in the legal size range either
@@ -110,7 +110,7 @@ proptest! {
 // --- test 2: full checksum bit-flip sweep ---
 
 proptest! {
-    // Heavier per-case work — keep the case count modest.
+    // Heavier per-case work - keep the case count modest.
     #![proptest_config(ProptestConfig {
         cases: 8,
         ..ProptestConfig::default()
@@ -278,7 +278,7 @@ proptest! {
             match op {
                 Op::Insert(tuple) => {
                     if tuple.is_empty() || tuple.len() > MAX_TUPLE_SIZE {
-                        // Don't bother — those error paths are covered above.
+                        // Don't bother - those error paths are covered above.
                         continue;
                     }
                     match page.insert(&tuple) {
@@ -307,7 +307,7 @@ proptest! {
                 }
                 Op::Compact => {
                     page.compact();
-                    // Oracle unchanged — compact preserves logical state.
+                    // Oracle unchanged - compact preserves logical state.
                 }
             }
             assert_invariants(&page, &oracle)?;
@@ -340,7 +340,7 @@ proptest! {
         }
         fm.fsync().expect("fsync");
 
-        // Drop and reopen — verify durability + read-back.
+        // Drop and reopen - verify durability + read-back.
         drop(fm);
         let mut fm = FileManager::open(&path).expect("reopen");
         prop_assert_eq!(

@@ -3,7 +3,7 @@
 //! The oracle: for any AST the generator produces, printing it via `Display`
 //! and re-parsing yields the identical AST. `parse(print(ast)) == ast`.
 //! Because `Display` fully parenthesizes expressions and emits canonical
-//! clauses, this holds regardless of operator precedence — a structural
+//! clauses, this holds regardless of operator precedence - a structural
 //! check that the printer and parser are exact inverses.
 
 use proptest::prelude::*;

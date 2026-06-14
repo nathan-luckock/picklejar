@@ -23,8 +23,3 @@ Thumbs.db
 # Crash dumps / cores
 *.core
 core.*
-
-# Local Claude session noise (we keep .claude/skills/ and .mcp.json tracked)
-.claude/cache/
-.claude/projects/
-.claude/sessions/

@@ -1,4 +1,4 @@
-# capstone — a relational database from scratch (Rust)
+# capstone - a relational database from scratch (Rust)
 
 > CSE 499 senior project. A real disk-based relational database engine with ACID guarantees, written from scratch in Rust.
 
@@ -6,20 +6,20 @@ Not a SQLite/Postgres wrapper. Not a key-value store with SQL on top. A real eng
 
 ## Status
 
-Pre-Sprint-1. Bootstrap in progress.
+Storage, durability (WAL + ARIES recovery), transactions (MVCC), the SQL
+parser, and the cost-based planner are built and tested. The query executor
+and CLI wiring come next, which will let typed SQL run end to end.
 
-## What's planned
-
-| Layer | Crate | What it does |
-|---|---|---|
-| CLI | [`rustdb-cli`](crates/rustdb-cli/) | `psql`-style interactive shell |
-| Library entry | [`rustdb`](crates/rustdb/) | Top-level DB handle, embeds all layers |
-| Execution | [`executor`](crates/executor/) | Seq scan, index scan, hash join, nested-loop join |
-| Optimization | [`planner`](crates/planner/) | Cost-based query planner |
-| Parsing | [`sql`](crates/sql/) | Hand-written SQL parser (lexer + recursive-descent) |
-| Concurrency | [`txn`](crates/txn/) | Transaction manager + MVCC + lock manager |
-| Durability | [`wal`](crates/wal/) | Write-ahead log + ARIES recovery |
-| Storage | [`storage`](crates/storage/) | Pages, buffer pool, B+ tree |
+| Layer | Crate | What it does | Status |
+|---|---|---|---|
+| Storage | [`storage`](crates/storage/) | Pages, buffer pool, B+ tree | built |
+| Durability | [`wal`](crates/wal/) | Write-ahead log + ARIES recovery | built |
+| Concurrency | [`txn`](crates/txn/) | Transaction manager + MVCC | built |
+| Parsing | [`sql`](crates/sql/) | Hand-written SQL parser (lexer + recursive-descent) | built |
+| Optimization | [`planner`](crates/planner/) | Cost-based query planner + EXPLAIN | built |
+| Execution | [`executor`](crates/executor/) | Seq scan, index scan, hash join, nested-loop join | in progress |
+| Library entry | [`rustdb`](crates/rustdb/) | Top-level DB handle, embeds all layers | in progress |
+| CLI | [`rustdb-cli`](crates/rustdb-cli/) | `psql`-style interactive shell | in progress |
 
 ## Build
 
@@ -31,11 +31,9 @@ cargo run --bin rustdb        # CLI
 
 ## Architecture
 
-See [docs/design.md](docs/design.md).
-
-## How AI is used in this project
-
-This project is built with [Claude Code](https://claude.com/claude-code) as a pair programmer. Every commit ships with a `Design notes:` section documenting what was picked and why. See [CLAUDE.md](CLAUDE.md) for the working agreement.
+Every design decision, with the alternatives considered and rejected, is
+written up in [docs/design.md](docs/design.md). Each commit also carries a
+`Design notes:` section explaining what was chosen and why.
 
 ## License
 

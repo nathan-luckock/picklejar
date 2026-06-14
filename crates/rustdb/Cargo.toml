@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Top-level rustdb library — embeds storage, WAL, txn, SQL, planner, and executor."
+description = "Top-level rustdb library - embeds storage, WAL, txn, SQL, planner, and executor."
 
 [dependencies]
 rustdb-storage.workspace = true

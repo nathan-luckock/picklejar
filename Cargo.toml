@@ -29,8 +29,8 @@ rustdb-planner = { path = "crates/planner" }
 rustdb-executor = { path = "crates/executor" }
 rustdb = { path = "crates/rustdb" }
 
-# Plumbing only — nothing storage/parser/planner-related is allowed here.
-# The graded must-haves are hand-written. See CLAUDE.md rule 6.
+# Plumbing only. Nothing storage/parser/planner-related is allowed here.
+# The graded must-haves are hand-written (see docs/design.md ground rules).
 thiserror = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

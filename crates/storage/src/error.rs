@@ -4,7 +4,7 @@
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
     /// Underlying I/O failed. Wraps [`std::io::Error`] without further
-    /// classification — most callers will surface this directly.
+    /// classification - most callers will surface this directly.
     #[error("storage io error: {0}")]
     Io(#[from] std::io::Error),
 
@@ -57,7 +57,7 @@ pub enum StorageError {
         size: usize,
     },
 
-    /// Empty tuples are rejected — a zero-length payload would collide with
+    /// Empty tuples are rejected - a zero-length payload would collide with
     /// the tombstone encoding (slot length = 0 ⇒ deleted).
     #[error("empty tuples are not supported on heap pages")]
     EmptyTuple,

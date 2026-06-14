@@ -2,7 +2,7 @@
 //!
 //! The buffer pool caches a fixed number of pages from a [`FileManager`] in
 //! memory and hands out RAII pin/unpin guards to callers. Everything above
-//! the storage layer reads and writes through this pool — it's the only
+//! the storage layer reads and writes through this pool - it's the only
 //! place that sees the file directly.
 //!
 //! # Concurrency
@@ -13,7 +13,7 @@
 //! panic). Frame *metadata* (pin count, access history) lives outside the
 //! `RefCell` in `Cell`s so the pool can poll pin counts and update access
 //! timestamps without conflicting with held guards. Concurrent reads /
-//! one writer comes in Sprint 6 with MVCC — this will upgrade to
+//! one writer comes in Sprint 6 with MVCC - this will upgrade to
 //! `RwLock<FrameInner>` then.
 //!
 //! # Replacement: LRU-K (K=2)
@@ -21,12 +21,12 @@
 //! Each frame remembers the timestamps of its K most recent accesses.
 //! The eviction victim is the unpinned frame whose **K-th-most-recent**
 //! access is oldest. Frames with fewer than K accesses ("infrequent")
-//! sort oldest by construction — they're evicted before well-warmed
+//! sort oldest by construction - they're evicted before well-warmed
 //! frames, which is the entire reason to use LRU-K over plain LRU.
 //! Empty frames win the lottery first; pinned frames are never evicted.
 //!
 //! **Why LRU-K over CLOCK or 2Q?** LRU-K with K=2 is exactly what
-//! "scan-resistant LRU" looks like — a single full-table scan can't kick
+//! "scan-resistant LRU" looks like - a single full-table scan can't kick
 //! out the working set, because a single access doesn't promote a frame
 //! past the K-access threshold. CLOCK is faster but doesn't have this
 //! property. 2Q has it but adds a second queue, more code, more state.
@@ -35,7 +35,7 @@
 //! # The dirty bit lives in memory only
 //!
 //! `FrameInner::dirty` is purely an in-memory flag. The on-disk page's
-//! `FLAG_DIRTY` byte is **never** set — that flag exists for vacuum-hint
+//! `FLAG_DIRTY` byte is **never** set - that flag exists for vacuum-hint
 //! propagation, not durability. Recovery reads the WAL, not the dirty
 //! bit.
 
@@ -75,7 +75,7 @@ pub const K: usize = 2;
 /// `BufferPool`; not comparable across pools.
 type Timestamp = u64;
 
-/// "Never accessed" sentinel — distinguishable from a real timestamp
+/// "Never accessed" sentinel - distinguishable from a real timestamp
 /// because the clock starts at 1.
 const NEVER: Timestamp = 0;
 
@@ -89,7 +89,7 @@ struct FrameInner {
 
 impl std::fmt::Debug for FrameInner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Skip `page` — 8 KiB of bytes is not useful in Debug output.
+        // Skip `page` - 8 KiB of bytes is not useful in Debug output.
         f.debug_struct("FrameInner")
             .field("page_id", &self.page_id)
             .field("dirty", &self.dirty)
@@ -439,7 +439,7 @@ impl BufferPool {
         // Pass 1: empty + unpinned frame.
         for (idx, frame) in self.frames.iter().enumerate() {
             if frame.pin_count.get() == 0 {
-                // Quick check via try_borrow — empty frames have page_id None.
+                // Quick check via try_borrow - empty frames have page_id None.
                 // try_borrow lets us peek without panicking if a guard is alive
                 // on a DIFFERENT frame (this loop iterates all, but the borrow
                 // is per-frame).
@@ -629,7 +629,7 @@ mod tests {
         assert_eq!(
             pool.resident_count(),
             2,
-            "pool size 2 — only 2 frames resident",
+            "pool size 2 - only 2 frames resident",
         );
     }
 
@@ -653,7 +653,7 @@ mod tests {
         let (_dir, pool) = fresh_pool(2);
         let (id_a, g_a) = pool.new_page().expect("new a");
         let (_id_b, g_b) = pool.new_page().expect("new b");
-        let err = pool.new_page().expect_err("must error — all frames pinned");
+        let err = pool.new_page().expect_err("must error - all frames pinned");
         assert!(matches!(err, StorageError::BufferPoolFull));
         drop(g_a);
         drop(g_b);
@@ -722,7 +722,7 @@ mod tests {
         };
         // Touch warm a second time so it has K=2 accesses.
         drop(pool.fetch_page(id_warm).expect("touch warm"));
-        // Now allocate a 3rd page — id_cold (1 access) should be the victim.
+        // Now allocate a 3rd page - id_cold (1 access) should be the victim.
         let _ = pool.new_page().expect("new third");
         assert!(
             pool.index.borrow().contains_key(&id_warm),
@@ -741,7 +741,7 @@ mod tests {
         let g1 = pool.fetch_page(id).expect("read 1");
         let g2 = pool.fetch_page(id).expect("read 2");
         assert_eq!(g1.page_id(), g2.page_id());
-        // pinned_count counts FRAMES, not pins — one frame, pin_count=2.
+        // pinned_count counts FRAMES, not pins - one frame, pin_count=2.
         assert_eq!(pool.pinned_count(), 1);
         drop(g1);
         // Frame still pinned (pin_count goes 2 -> 1).

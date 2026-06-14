@@ -24,7 +24,7 @@
 //!
 //! `delete` sets a slot's length to 0; the slot ID stays valid and is never
 //! recycled. This keeps index entries pointing at slot IDs stable across
-//! deletes — important once secondary B+ tree indexes exist (Sprint 2). The
+//! deletes - important once secondary B+ tree indexes exist (Sprint 2). The
 //! tuple bytes are not reclaimed until [`HeapPage::compact`] runs.
 //!
 //! # Invariants
@@ -32,7 +32,7 @@
 //! - `header.free_space_ptr` ≥ end of slot directory at all times.
 //! - Live tuples occupy `[header.free_space_ptr..PAGE_SIZE)` with no
 //!   overlap; gaps between them are tombstoned regions awaiting `compact`.
-//! - Empty tuples are not allowed — length 0 is the tombstone marker.
+//! - Empty tuples are not allowed - length 0 is the tombstone marker.
 //!
 //! [`PageHeader`]: crate::header::PageHeader
 
@@ -51,7 +51,7 @@ const _: () = assert!(
     "SLOT_SIZE and SLOT_SIZE_U16 must agree",
 );
 
-/// Maximum tuple size in bytes — anything larger needs an overflow page
+/// Maximum tuple size in bytes - anything larger needs an overflow page
 /// (Sprint 2). Currently `PAGE_SIZE - HEADER_SIZE - SLOT_SIZE = 8164`.
 pub const MAX_TUPLE_SIZE: usize = PAGE_SIZE - HEADER_SIZE - SLOT_SIZE;
 
@@ -62,7 +62,7 @@ const VACUUM_HINT_THRESHOLD: u16 = 1024;
 
 /// Identifier for a slot within a heap page. Stable for the page's lifetime.
 ///
-/// Slot IDs are assigned sequentially on insert and never recycled — even
+/// Slot IDs are assigned sequentially on insert and never recycled - even
 /// after a `delete`, the same `SlotId` will continue to refer to the now-
 /// tombstoned slot. This stability is what lets external structures
 /// (indexes, MVCC version chains) hold direct references.
@@ -225,7 +225,7 @@ impl<'a> HeapPage<'a> {
             return Err(StorageError::SlotAlreadyDeleted(slot.0));
         }
         let off = self.slot_offset_at(slot.0);
-        // Keep `offset` for debugging — only length=0 marks tombstone.
+        // Keep `offset` for debugging - only length=0 marks tombstone.
         self.write_slot_at(slot.0, off, 0);
 
         // Maintain the FLAG_NEEDS_VACUUM hint so the buffer pool / future
@@ -344,7 +344,7 @@ impl<'a> HeapPage<'a> {
             .collect();
 
         if live.is_empty() {
-            // Reset free_space_ptr to PAGE_SIZE — no live data.
+            // Reset free_space_ptr to PAGE_SIZE - no live data.
             let mut h = self.header();
             h.free_space_ptr = PAGE_SIZE_U16;
             h.flags &= !FLAG_NEEDS_VACUUM;
@@ -356,7 +356,7 @@ impl<'a> HeapPage<'a> {
         // toward the end of the page without overlapping subsequent reads.
         live.sort_by_key(|entry| std::cmp::Reverse(entry.1));
 
-        // Copy tuple bytes into a temp buffer (allocation here is fine —
+        // Copy tuple bytes into a temp buffer (allocation here is fine -
         // page-local compaction is not in the hot path).
         let payloads: Vec<(u16, Vec<u8>)> = live
             .iter()
@@ -399,7 +399,7 @@ impl<'a> HeapPage<'a> {
         self.buf[off + 2..off + 4].copy_from_slice(&length.to_le_bytes());
     }
 
-    /// Bytes locked up in tombstoned slots — the would-be space reclaimed
+    /// Bytes locked up in tombstoned slots - the would-be space reclaimed
     /// by a `compact`. Internal accounting for the vacuum-hint flag.
     fn tombstoned_bytes(&self) -> u16 {
         let count = self.slot_count();
@@ -516,9 +516,9 @@ mod tests {
             }
         }
         // ~30 tuples of 256 bytes + slots in an 8 KiB page after the
-        // 24-byte header — exact value is implementation-detail, but it
+        // 24-byte header - exact value is implementation-detail, but it
         // should be at least 25.
-        assert!(inserted >= 25, "fit only {inserted} tuples — too few");
+        assert!(inserted >= 25, "fit only {inserted} tuples - too few");
         assert_eq!(page.tuple_count(), u16::try_from(inserted).unwrap());
     }
 
@@ -531,7 +531,7 @@ mod tests {
         page.delete(id).expect("delete");
         assert_eq!(page.get(id), None);
         assert_eq!(page.tuple_count(), 0);
-        // Slot directory entry still exists — slot_count unchanged.
+        // Slot directory entry still exists - slot_count unchanged.
         assert_eq!(page.slot_count(), 1);
     }
 
@@ -609,7 +609,7 @@ mod tests {
         assert_eq!(page.get(ids[2]), None);
         assert_eq!(page.get(ids[3]), Some(&payload[..]));
         assert_eq!(page.tuple_count(), 2);
-        // slot_count is preserved — IDs stay stable.
+        // slot_count is preserved - IDs stay stable.
         assert_eq!(page.slot_count(), 4);
     }
 

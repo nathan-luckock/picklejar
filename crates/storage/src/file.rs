@@ -7,14 +7,14 @@
 //! # Concurrency
 //!
 //! `FileManager` requires `&mut self` for I/O. Concurrent reads are the job
-//! of the buffer pool layer — it caches pages in memory and serializes I/O
+//! of the buffer pool layer - it caches pages in memory and serializes I/O
 //! through a single `FileManager`. Pushing pread/pwrite-style positional I/O
 //! down here would be premature optimization for the capstone scope.
 //!
 //! # Durability
 //!
 //! [`FileManager::fsync`] is the only durability primitive. It is never
-//! called implicitly by reads or writes — callers (the WAL flush path,
+//! called implicitly by reads or writes - callers (the WAL flush path,
 //! transaction commit) decide when bytes need to be on platters.
 
 use std::fs::{File, OpenOptions};
@@ -92,7 +92,7 @@ impl FileManager {
     ///
     /// Returns [`StorageError::PageOutOfBounds`] if `id` refers to a page
     /// beyond the current end of the file. The write is NOT durable until
-    /// [`FileManager::fsync`] is called — callers (the WAL flush path) are
+    /// [`FileManager::fsync`] is called - callers (the WAL flush path) are
     /// responsible for ordering.
     pub fn write_page(&mut self, id: PageId, buf: &Page) -> Result<()> {
         self.check_in_bounds(id)?;

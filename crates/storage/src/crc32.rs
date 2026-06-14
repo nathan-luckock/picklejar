@@ -1,17 +1,17 @@
 //! CRC32 (IEEE 802.3 polynomial, reflected), hand-written.
 //!
 //! Used by the page header to detect accidental on-disk corruption. NOT a
-//! cryptographic hash — a determined attacker can craft collisions. This is
+//! cryptographic hash - a determined attacker can craft collisions. This is
 //! the same algorithm gzip and Ethernet use, suitable for catching bit-rot
 //! and torn writes.
 //!
 //! # Why hand-written instead of `crc32fast`
 //!
-//! The capstone's design rule (see [`CLAUDE.md`]) is that anything
-//! storage-related is from scratch. CRC32 is small enough that a from-scratch
-//! impl is ~25 lines and finishes in const context, so no dependency is
-//! justified. A SIMD-accelerated version would be measurably faster on long
-//! buffers, but the page checksum runs over 8 KiB at a time — not the
+//! A core project rule is that anything storage-related is written from
+//! scratch. CRC32 is small enough that a from-scratch impl is ~25 lines and
+//! finishes in const context, so no dependency is justified. A
+//! SIMD-accelerated version would be measurably faster on long
+//! buffers, but the page checksum runs over 8 KiB at a time - not the
 //! hot path that would benefit from intrinsics.
 
 /// IEEE 802.3 / Ethernet polynomial in reflected form.
@@ -40,7 +40,7 @@ const TABLE: [u32; 256] = {
 pub fn crc32(bytes: &[u8]) -> u32 {
     let mut crc = !0u32;
     for &b in bytes {
-        // The low byte of `crc` is exactly the table index we want — the
+        // The low byte of `crc` is exactly the table index we want - the
         // truncation cast is the whole point of the algorithm.
         #[allow(clippy::cast_possible_truncation)]
         let idx = ((crc as u8) ^ b) as usize;

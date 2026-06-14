@@ -33,7 +33,7 @@ fn op_strategy() -> impl Strategy<Value = (Op, bool)> {
         3 => (0..KEYS, any::<u8>()).prop_map(|(k, v)| Op::Set(k, v)),
         1 => key.prop_map(Op::Delete),
     ];
-    // (op, commit?) — about 80% commit.
+    // (op, commit?) - about 80% commit.
     (kind, prop::bool::weighted(0.8))
 }
 

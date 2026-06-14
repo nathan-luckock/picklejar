@@ -3,7 +3,7 @@
 //! Provides page-based on-disk storage, a buffer pool with pin/unpin
 //! semantics (Sprint 2), and a B+ tree index (Sprint 2). Everything above
 //! this crate (WAL, MVCC, SQL) treats storage as the canonical source of
-//! truth for committed data — but mutations flow through the WAL first
+//! truth for committed data - but mutations flow through the WAL first
 //! (see `rustdb-wal`).
 //!
 //! # Layout
@@ -22,7 +22,7 @@
 //! # Sprint 1 surface
 //!
 //! - [`page::PageId`], [`page::PAGE_SIZE`], [`page::Page`]
-//! - [`file::FileManager`] — raw page-granular I/O
+//! - [`file::FileManager`] - raw page-granular I/O
 //! - [`error::StorageError`]
 
 #![forbid(unsafe_code)]

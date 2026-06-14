@@ -23,7 +23,7 @@ fn main() {
         .init();
 
     let args = Args::parse();
-    println!("rustdb 0.0.1 — type \\q to quit");
+    println!("rustdb 0.0.1 - type \\q to quit");
     println!("(connected to {})", args.database);
     // TODO: REPL loop wired up once parser + executor are real.
 }

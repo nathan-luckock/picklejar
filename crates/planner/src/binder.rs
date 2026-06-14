@@ -209,7 +209,7 @@ mod tests {
     #[test]
     fn where_pushes_filter_directly_above_scan() {
         let p = plan("SELECT id FROM orders WHERE total > 100");
-        // Project { Filter { Scan } } — the Filter sits adjacent to Scan.
+        // Project { Filter { Scan } } - the Filter sits adjacent to Scan.
         let LogicalPlan::Project { input, .. } = p else {
             panic!("expected Project");
         };

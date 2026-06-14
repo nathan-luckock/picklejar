@@ -15,7 +15,7 @@
 //!
 //! # Checksum scope
 //!
-//! The checksum covers bytes `[12..PAGE_SIZE]` — the page **excluding the LSN
+//! The checksum covers bytes `[12..PAGE_SIZE]` - the page **excluding the LSN
 //! and the checksum field itself**. Excluding the LSN means a WAL flush that
 //! updates only the LSN doesn't require recomputing the checksum (a
 //! micro-optimization that adds up at high write rates). The checksum is
@@ -30,7 +30,7 @@ use crate::page::{Page, PAGE_SIZE, PAGE_SIZE_U16};
 pub const HEADER_SIZE: usize = 24;
 
 /// [`HEADER_SIZE`] re-typed as a `u16`. Same trick as
-/// [`crate::page::PAGE_SIZE_U16`] — lets `u16` arithmetic stay clean in
+/// [`crate::page::PAGE_SIZE_U16`] - lets `u16` arithmetic stay clean in
 /// the slotted-page layout without per-call `try_from` ceremony.
 pub const HEADER_SIZE_U16: u16 = 24;
 
@@ -313,7 +313,7 @@ mod tests {
 
     #[test]
     fn lsn_change_does_not_invalidate_checksum() {
-        // The checksum range starts at byte 12 — LSN changes (bytes 0..8)
+        // The checksum range starts at byte 12 - LSN changes (bytes 0..8)
         // must NOT require recomputing.
         let mut page = make_page();
         PageHeader::new_heap().write(&mut page);

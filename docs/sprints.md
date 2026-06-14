@@ -1,4 +1,4 @@
-# Sprint Plan — rustdb capstone
+# Sprint Plan - rustdb capstone
 
 Each sprint = ~1 calendar week, ~9-10 hours of work. Sprint label aligns with the proposal timeline. Each sprint maps to a milestone on GitHub.
 
@@ -17,24 +17,24 @@ Each sprint = ~1 calendar week, ~9-10 hours of work. Sprint label aligns with th
 | 10 | W12 | Torture test + polish | Multi-hour crash-restart torture test, EXPLAIN polish, isolation-level wiring, bug-fix pass. |
 | 11 | W13 | Demo + write-up + SPED talk | Demo script, recorded video, README polish, presentation slides. |
 
-## Sprint 0 — Bootstrap ✅ shipped
+## Sprint 0 - Bootstrap ✅ shipped
 
-- [x] PR #1: Cargo workspace + 8 crate stubs + CLAUDE.md + design.md + sprint plan + db-debug skill
+- [x] PR #1: Cargo workspace + 8 crate stubs + design doc + sprint plan
 - [x] `cargo build / fmt / clippy / test` pass locally on all PRs
-- [x] Sprint 1 milestone + 5 issues filed (#2–#6)
-- [ ] CI workflow file pushed to repo — **pending**, blocked on `workflow` OAuth scope; content stashed at `C:\Users\natha\AppData\Local\Temp\ci.yml.pending`
+- [x] Sprint 1 milestone + 5 issues filed (#2-#6)
+- [ ] CI workflow file pushed to repo - **pending**, blocked on `workflow` OAuth scope; content stashed at `C:\Users\natha\AppData\Local\Temp\ci.yml.pending`
 
-## Sprint 1 — Storage I ✅ shipped (5/5 issues)
+## Sprint 1 - Storage I ✅ shipped (5/5 issues)
 
-- [x] [#2](https://github.com/Nathan7108/capstone/issues/2) — file manager (PR #7)
-- [x] [#3](https://github.com/Nathan7108/capstone/issues/3) — page header + CRC32 (PR #8)
-- [x] [#4](https://github.com/Nathan7108/capstone/issues/4) — slotted page (PR #9)
-- [x] [#5](https://github.com/Nathan7108/capstone/issues/5) — proptests (PR #10)
-- [x] [#6](https://github.com/Nathan7108/capstone/issues/6) — design.md doc lockdown (this PR)
+- [x] [#2](https://github.com/Nathan7108/capstone/issues/2) - file manager (PR #7)
+- [x] [#3](https://github.com/Nathan7108/capstone/issues/3) - page header + CRC32 (PR #8)
+- [x] [#4](https://github.com/Nathan7108/capstone/issues/4) - slotted page (PR #9)
+- [x] [#5](https://github.com/Nathan7108/capstone/issues/5) - proptests (PR #10)
+- [x] [#6](https://github.com/Nathan7108/capstone/issues/6) - design.md doc lockdown (this PR)
 
 **Counts**: 45 tests (39 unit + 6 proptests), ~1500 LOC, all gates clean locally.
 
-## Sprint 2 — Storage II ✅ shipped (5/5 issues)
+## Sprint 2 - Storage II ✅ shipped (5/5 issues)
 
 - [x] [#12](https://github.com/Nathan7108/capstone/issues/12) buffer pool with LRU-K (PR #17)
 - [x] [#13](https://github.com/Nathan7108/capstone/issues/13) B+ tree internal node (PR #18)
@@ -42,7 +42,7 @@ Each sprint = ~1 calendar week, ~9-10 hours of work. Sprint label aligns with th
 - [x] [#15](https://github.com/Nathan7108/capstone/issues/15) B+ tree insert/search/range_scan (PR #20)
 - [x] [#16](https://github.com/Nathan7108/capstone/issues/16) B+ tree proptests (PR #21)
 
-## Sprint 3 — WAL ✅ shipped (5/5 issues)
+## Sprint 3 - WAL ✅ shipped (5/5 issues)
 
 - [x] [#22](https://github.com/Nathan7108/capstone/issues/22) record format + serialization (PR #27)
 - [x] [#23](https://github.com/Nathan7108/capstone/issues/23) writer (PR #28)
@@ -50,7 +50,7 @@ Each sprint = ~1 calendar week, ~9-10 hours of work. Sprint label aligns with th
 - [x] [#25](https://github.com/Nathan7108/capstone/issues/25) buffer pool integration (PR #30)
 - [x] [#26](https://github.com/Nathan7108/capstone/issues/26) proptests + doc lockdown (this PR)
 
-## Sprint 4 — ARIES recovery (next)
+## Sprint 4 - ARIES recovery (next)
 
 Theme: crash recovery. Take the WAL, replay it on startup, restore the database to a state consistent with everything committed before the crash.
 

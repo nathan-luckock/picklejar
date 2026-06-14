@@ -29,7 +29,7 @@ pub type Page = [u8; PAGE_SIZE];
 /// A monotonically increasing identifier for a page on disk.
 ///
 /// `PageId(0)` is the first page in the file. Page IDs are stable for the
-/// life of the database — once allocated, an ID always refers to the same
+/// life of the database - once allocated, an ID always refers to the same
 /// 8 KiB region in the file. Indexes and the WAL both rely on this.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, PartialOrd, Ord)]
 pub struct PageId(pub u64);
