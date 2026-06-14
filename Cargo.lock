@@ -494,7 +494,9 @@ dependencies = [
 name = "rustdb-executor"
 version = "0.0.1"
 dependencies = [
+ "proptest",
  "rustdb-planner",
+ "rustdb-sql",
  "rustdb-storage",
  "rustdb-txn",
  "thiserror",

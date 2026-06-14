@@ -10,9 +10,13 @@ description = "Iterator-style query executor for rustdb."
 
 [dependencies]
 rustdb-planner.workspace = true
+rustdb-sql.workspace = true
 rustdb-storage.workspace = true
 rustdb-txn.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+proptest = "1"
 
 [lints]
 workspace = true
