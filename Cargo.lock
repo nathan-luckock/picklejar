@@ -476,6 +476,7 @@ dependencies = [
  "rustdb-storage",
  "rustdb-txn",
  "rustdb-wal",
+ "tempfile",
  "thiserror",
  "tracing",
 ]

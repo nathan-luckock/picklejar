@@ -81,6 +81,42 @@ impl<'env> MvccTable<'env> {
         })
     }
 
+    /// Open an existing table: rebuild the handle from the index B+ tree's
+    /// root page and the current version heap page. The engine stores those
+    /// two ids per table and reconstructs a transient `MvccTable` for each
+    /// operation, which is how it avoids holding a self-referential borrow of
+    /// the buffer pool.
+    #[must_use]
+    pub const fn open(
+        pool: &'env BufferPool,
+        wal: WalSyncHandle,
+        mgr: &'env TransactionManager,
+        index_root: PageId,
+        version_page: PageId,
+    ) -> Self {
+        Self {
+            pool,
+            wal,
+            mgr,
+            index: BTree::open(pool, index_root),
+            version_page: Cell::new(version_page),
+        }
+    }
+
+    /// The index B+ tree's current root page. Changes when the root splits,
+    /// so the engine must read it back after a write and persist it.
+    #[must_use]
+    pub fn index_root(&self) -> PageId {
+        self.index.root_page()
+    }
+
+    /// The heap page currently receiving new versions. Advances as pages
+    /// fill, so the engine persists it back after a write.
+    #[must_use]
+    pub fn version_page(&self) -> PageId {
+        self.version_page.get()
+    }
+
     /// Insert a row. Creates a new version of `key` at the head of the row's
     /// chain.
     ///
