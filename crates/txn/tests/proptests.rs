@@ -117,6 +117,11 @@ proptest! {
             let got = table.get(&reader, k).expect("get");
             prop_assert_eq!(got, oracle.get(&k).cloned(), "key {} disagrees", k);
         }
+
+        // And a full scan must return exactly the oracle's committed rows,
+        // no more and no fewer. This is what SeqScan relies on.
+        let scanned: HashMap<u64, Vec<u8>> = table.scan(&reader).expect("scan").into_iter().collect();
+        prop_assert_eq!(scanned, oracle, "scan disagrees with oracle");
     }
 
     /// A RepeatableRead reader's view is frozen: committing more work after

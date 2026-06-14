@@ -38,12 +38,13 @@
 //! a later sprint.
 
 use std::cell::Cell;
+use std::ops::Bound;
 
 use rustdb_storage::{BTree, BufferPool, HeapPage, Page, PageHeader, PageId, SlotId, TupleRef};
 use rustdb_wal::{LogRecord, Lsn, TxnId, WalSyncHandle};
 
 use crate::error::{Result, TxnError};
-use crate::manager::{IsolationLevel, Transaction, TransactionManager};
+use crate::manager::{IsolationLevel, Snapshot, Transaction, TransactionManager};
 use crate::version::{set_xmax, Version};
 
 /// A multi-version key/value table. See the module docs.
@@ -132,23 +133,55 @@ impl<'env> MvccTable<'env> {
         Ok(())
     }
 
+    /// Return every key and its visible value, in ascending key order: a
+    /// snapshot-consistent full scan, which is what `SeqScan` reads.
+    ///
+    /// Like [`get`](Self::get) applied to every key, but the snapshot is
+    /// resolved once up front so the whole scan reflects a single point in
+    /// time even under `ReadCommitted`. A key whose visible version is a
+    /// delete (no live version under the snapshot) is omitted.
+    pub fn scan(&self, txn: &Transaction) -> Result<Vec<(u64, Vec<u8>)>> {
+        let snapshot = self.snapshot_for(txn);
+        let mut out = Vec::new();
+        for entry in self.index.range_scan(Bound::Unbounded, Bound::Unbounded)? {
+            let (key, _head) = entry?;
+            if let Some(at) = self.chain_visible(&snapshot, txn.xid(), key)? {
+                let bytes = self.read_version_bytes(at)?;
+                out.push((key, Version::decode(&bytes)?.payload.to_vec()));
+            }
+        }
+        Ok(out)
+    }
+
     /// Walk the version chain for `key` newest-to-oldest and return the
     /// reference of the first version visible to `txn`, or `None`.
     ///
     /// Under `ReadCommitted` the snapshot is refreshed for this statement;
     /// under `RepeatableRead` the begin-time snapshot is reused.
     fn visible_ref(&self, txn: &Transaction, key: u64) -> Result<Option<TupleRef>> {
+        let snapshot = self.snapshot_for(txn);
+        self.chain_visible(&snapshot, txn.xid(), key)
+    }
+
+    /// Resolve the snapshot a read should use: refreshed per statement under
+    /// `ReadCommitted`, frozen at begin under `RepeatableRead`.
+    fn snapshot_for(&self, txn: &Transaction) -> Snapshot {
         if txn.level() == IsolationLevel::ReadCommitted {
             txn.set_snapshot(self.mgr.current_snapshot());
         }
-        let snapshot = txn.snapshot();
+        txn.snapshot()
+    }
+
+    /// Walk `key`'s version chain from the index head, newest-to-oldest, and
+    /// return the first version visible under `snapshot`, or `None`.
+    fn chain_visible(&self, snapshot: &Snapshot, xid: u64, key: u64) -> Result<Option<TupleRef>> {
         let Some(mut current) = self.index.search(key)? else {
             return Ok(None);
         };
         loop {
             let bytes = self.read_version_bytes(current)?;
             let v = Version::decode(&bytes)?;
-            if snapshot.is_visible(v.xmin, v.xmax, self.mgr, txn.xid()) {
+            if snapshot.is_visible(v.xmin, v.xmax, self.mgr, xid) {
                 return Ok(Some(current));
             }
             match v.prev {
@@ -466,6 +499,71 @@ mod tests {
             Some(&b"v2"[..]),
             "ReadCommitted must see B's commit on the next statement",
         );
+    }
+
+    #[test]
+    fn scan_returns_visible_rows_in_key_order() {
+        let e = env();
+        let table = MvccTable::create(&e.pool, e.wal.clone(), &e.mgr).expect("create");
+        let t = e.mgr.begin();
+        // Insert out of order; scan must still come back sorted by key.
+        table.insert(&t, 3, b"three").expect("insert");
+        table.insert(&t, 1, b"one").expect("insert");
+        table.insert(&t, 2, b"two").expect("insert");
+        e.mgr.commit(&t);
+
+        let reader = e.mgr.begin();
+        let rows = table.scan(&reader).expect("scan");
+        let got: Vec<(u64, &[u8])> = rows.iter().map(|(k, v)| (*k, v.as_slice())).collect();
+        assert_eq!(
+            got,
+            vec![(1, &b"one"[..]), (2, &b"two"[..]), (3, &b"three"[..])]
+        );
+    }
+
+    #[test]
+    fn scan_skips_deleted_keys_and_honors_snapshot() {
+        let e = env();
+        let table = MvccTable::create(&e.pool, e.wal.clone(), &e.mgr).expect("create");
+        let setup = e.mgr.begin();
+        table.insert(&setup, 1, b"a").expect("insert");
+        table.insert(&setup, 2, b"b").expect("insert");
+        e.mgr.commit(&setup);
+
+        // A's snapshot predates the delete and the new insert.
+        let a = e.mgr.begin();
+
+        let w = e.mgr.begin();
+        table.delete(&w, 1).expect("delete");
+        table.insert(&w, 3, b"c").expect("insert");
+        e.mgr.commit(&w);
+
+        // A still sees the original two rows, not the delete or the insert.
+        let a_keys: Vec<u64> = table
+            .scan(&a)
+            .expect("scan")
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(a_keys, vec![1, 2], "A's RepeatableRead scan is frozen");
+
+        // A fresh reader sees key 1 gone and key 3 present.
+        let c = e.mgr.begin();
+        let c_keys: Vec<u64> = table
+            .scan(&c)
+            .expect("scan")
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(c_keys, vec![2, 3], "deleted key absent, new key present");
+    }
+
+    #[test]
+    fn scan_of_empty_table_is_empty() {
+        let e = env();
+        let table = MvccTable::create(&e.pool, e.wal.clone(), &e.mgr).expect("create");
+        let t = e.mgr.begin();
+        assert!(table.scan(&t).expect("scan").is_empty());
     }
 
     #[test]
