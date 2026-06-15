@@ -53,13 +53,20 @@ fn bind_select(catalog: &Catalog, select: &Select) -> Result<LogicalPlan> {
         };
     }
 
-    // 3. GROUP BY.
-    if !select.group_by.is_empty() {
+    // 3. Aggregation. Trigger on an explicit GROUP BY or on aggregate
+    //    functions in the projection (a bare `SELECT COUNT(*)` groups the
+    //    whole table into one row).
+    let aggregates = collect_aggregates(&select.projections);
+    if !select.group_by.is_empty() || !aggregates.is_empty() {
         for key in &select.group_by {
             resolve_expr(key, &scope)?;
         }
+        for agg in &aggregates {
+            resolve_expr(agg, &scope)?;
+        }
         plan = LogicalPlan::Aggregate {
             group_by: select.group_by.clone(),
+            aggregates,
             input: Box::new(plan),
         };
     }
@@ -139,6 +146,56 @@ fn resolve_expr(expr: &Expr, scope: &[ScopeEntry<'_>]) -> Result<()> {
             resolve_expr(right, scope)
         }
         Expr::Unary { expr, .. } => resolve_expr(expr, scope),
+        Expr::Func { args, .. } => {
+            for arg in args {
+                resolve_expr(arg, scope)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Whether `name` (already upper-cased by the parser) is an aggregate.
+fn is_aggregate(name: &str) -> bool {
+    matches!(name, "COUNT" | "SUM" | "MIN" | "MAX" | "AVG")
+}
+
+/// Push `expr` into `out` unless an equal (by printed form) entry is present.
+fn push_unique(out: &mut Vec<Expr>, expr: &Expr) {
+    let printed = expr.to_string();
+    if !out.iter().any(|e| e.to_string() == printed) {
+        out.push(expr.clone());
+    }
+}
+
+/// Collect the aggregate calls in the projection list, deduplicated by their
+/// printed form (so `SUM(x)` used twice is computed once).
+fn collect_aggregates(projections: &[SelectItem]) -> Vec<Expr> {
+    let mut found: Vec<Expr> = Vec::new();
+    for item in projections {
+        if let SelectItem::Expr(e, _) = item {
+            collect_aggs_in(e, &mut found);
+        }
+    }
+    found
+}
+
+/// Walk `expr`, pushing aggregate calls into `out`. Does not descend into an
+/// aggregate's own arguments (nested aggregates are not supported).
+fn collect_aggs_in(expr: &Expr, out: &mut Vec<Expr>) {
+    match expr {
+        Expr::Func { name, .. } if is_aggregate(name) => push_unique(out, expr),
+        Expr::Func { args, .. } => {
+            for a in args {
+                collect_aggs_in(a, out);
+            }
+        }
+        Expr::Binary { left, right, .. } => {
+            collect_aggs_in(left, out);
+            collect_aggs_in(right, out);
+        }
+        Expr::Unary { expr, .. } => collect_aggs_in(expr, out),
+        _ => {}
     }
 }
 

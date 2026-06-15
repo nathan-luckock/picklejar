@@ -152,6 +152,21 @@ impl Parser {
         Ok(lhs)
     }
 
+    /// Parse a function-call argument list (the inside of the parentheses),
+    /// up to but not including the closing `)`. Comma-separated expressions;
+    /// empty for `f()`. `COUNT(*)` arrives as a single [`Expr::Star`].
+    fn parse_call_args(&mut self) -> Result<Vec<Expr>> {
+        let mut args = Vec::new();
+        if matches!(self.peek(), TokenKind::RParen) {
+            return Ok(args);
+        }
+        args.push(self.parse_expr()?);
+        while self.eat(&TokenKind::Comma) {
+            args.push(self.parse_expr()?);
+        }
+        Ok(args)
+    }
+
     /// Parse a prefix position: literals, columns, parens, and the prefix
     /// operators `NOT` and unary `-`.
     fn parse_prefix(&mut self) -> Result<Expr> {
@@ -201,8 +216,17 @@ impl Parser {
             }
             TokenKind::Ident(name) => {
                 self.advance();
-                // Qualified column: name '.' name.
-                if self.eat(&TokenKind::Dot) {
+                if self.eat(&TokenKind::LParen) {
+                    // Function call: name '(' [args] ')', e.g. SUM(total) or
+                    // COUNT(*). The name is stored upper-cased and canonical.
+                    let args = self.parse_call_args()?;
+                    self.expect(&TokenKind::RParen)?;
+                    Ok(Expr::Func {
+                        name: name.to_ascii_uppercase(),
+                        args,
+                    })
+                } else if self.eat(&TokenKind::Dot) {
+                    // Qualified column: name '.' name.
                     let col = self.parse_ident()?;
                     Ok(Expr::QualifiedColumn(name, col))
                 } else {

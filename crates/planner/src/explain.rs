@@ -32,6 +32,7 @@ const fn kind_tag(kind: JoinKind) -> &'static str {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn render(plan: &PhysicalPlan, depth: usize, out: &mut String) {
     let pad = "  ".repeat(depth);
     let stats = format!("(rows={} cost={:.1})", plan.est_rows(), plan.est_cost());
@@ -90,14 +91,25 @@ fn render(plan: &PhysicalPlan, depth: usize, out: &mut String) {
             render(input, depth + 1, out);
         }
         PhysicalPlan::Aggregate {
-            group_by, input, ..
+            group_by,
+            aggregates,
+            input,
+            ..
         } => {
             let keys = group_by
                 .iter()
                 .map(ToString::to_string)
                 .collect::<Vec<_>>()
                 .join(", ");
-            let _ = writeln!(out, "{pad}Aggregate GROUP BY {keys}  {stats}");
+            let aggs = aggregates
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let _ = writeln!(
+                out,
+                "{pad}Aggregate GROUP BY [{keys}] AGG [{aggs}]  {stats}"
+            );
             render(input, depth + 1, out);
         }
         PhysicalPlan::NestedLoopJoin {

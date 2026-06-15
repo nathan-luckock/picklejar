@@ -134,6 +134,14 @@ pub enum Expr {
         /// Operand.
         expr: Box<Self>,
     },
+    /// A function call, e.g. an aggregate `COUNT(*)` or `SUM(total)`. The name
+    /// is canonical upper-case.
+    Func {
+        /// Upper-cased function name.
+        name: String,
+        /// Argument expressions (`COUNT(*)` carries a single [`Self::Star`]).
+        args: Vec<Self>,
+    },
 }
 
 impl Expr {
@@ -167,6 +175,16 @@ impl fmt::Display for Expr {
             // Fully parenthesized so re-parsing reproduces the same tree.
             Self::Binary { op, left, right } => write!(f, "({left} {op} {right})"),
             Self::Unary { op, expr } => write!(f, "({op}{expr})"),
+            Self::Func { name, args } => {
+                write!(f, "{name}(")?;
+                for (i, a) in args.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{a}")?;
+                }
+                f.write_str(")")
+            }
         }
     }
 }

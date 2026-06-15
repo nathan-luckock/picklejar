@@ -142,7 +142,7 @@ fn grouped_ordered_limited_query_stacks_operators() {
     assert!(lines[0].starts_with("Limit 5"), "{out}");
     assert!(lines[1].starts_with("Project cid"), "{out}");
     assert!(lines[2].starts_with("Sort cid DESC"), "{out}");
-    assert!(lines[3].starts_with("Aggregate GROUP BY cid"), "{out}");
+    assert!(lines[3].starts_with("Aggregate GROUP BY [cid]"), "{out}");
     assert!(out.contains("SeqScan orders"), "{out}");
     assert!(out.contains("predicate: (total > 0)"), "{out}");
 }

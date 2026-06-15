@@ -50,10 +50,12 @@ pub enum LogicalPlan {
         /// The ON predicate.
         on: Expr,
     },
-    /// Group rows by the given keys.
+    /// Group rows by the given keys and compute aggregate functions.
     Aggregate {
-        /// Grouping keys.
+        /// Grouping keys (empty for a whole-table aggregate).
         group_by: Vec<Expr>,
+        /// Aggregate function calls to compute (e.g. `COUNT(*)`, `SUM(x)`).
+        aggregates: Vec<Expr>,
         /// Child plan.
         input: Box<Self>,
     },
@@ -101,13 +103,22 @@ impl LogicalPlan {
                 left.fmt_indented(f, depth + 1)?;
                 right.fmt_indented(f, depth + 1)
             }
-            Self::Aggregate { group_by, input } => {
+            Self::Aggregate {
+                group_by,
+                aggregates,
+                input,
+            } => {
                 let keys = group_by
                     .iter()
                     .map(ToString::to_string)
                     .collect::<Vec<_>>()
                     .join(", ");
-                writeln!(f, "{pad}Aggregate GROUP BY {keys}")?;
+                let aggs = aggregates
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                writeln!(f, "{pad}Aggregate GROUP BY [{keys}] AGG [{aggs}]")?;
                 input.fmt_indented(f, depth + 1)
             }
             Self::Sort { keys, input } => {

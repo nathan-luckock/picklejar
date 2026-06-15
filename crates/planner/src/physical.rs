@@ -96,6 +96,8 @@ pub enum PhysicalPlan {
     Aggregate {
         /// Grouping keys.
         group_by: Vec<Expr>,
+        /// Aggregate function calls to compute.
+        aggregates: Vec<Expr>,
         /// Child plan.
         input: Box<Self>,
         /// Estimated output rows.
@@ -212,7 +214,11 @@ pub fn plan(logical: &LogicalPlan, catalog: &Catalog) -> Result<PhysicalPlan> {
             })
         }
 
-        LogicalPlan::Aggregate { group_by, input } => {
+        LogicalPlan::Aggregate {
+            group_by,
+            aggregates,
+            input,
+        } => {
             let child = plan(input, catalog)?;
             // Output is at most one row per group; without group stats,
             // estimate the square root of input rows as a rough distinct
@@ -229,6 +235,7 @@ pub fn plan(logical: &LogicalPlan, catalog: &Catalog) -> Result<PhysicalPlan> {
             let est_cost = child.est_cost() + in_rows as f64;
             Ok(PhysicalPlan::Aggregate {
                 group_by: group_by.clone(),
+                aggregates: aggregates.clone(),
                 input: Box::new(child),
                 est_rows,
                 est_cost,

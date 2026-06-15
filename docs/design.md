@@ -33,7 +33,7 @@ Non-goals: distributed replication, network protocol compatibility with Postgres
 | 6 | MVCC polish: write-write conflict detection, version GC | ⏳ deferred |
 | 7 | SQL parser (lexer, Pratt expressions, DDL, DML, SELECT + JOIN/GROUP/ORDER/LIMIT) | ✅ shipped (PRs #62-#67) |
 | 8 | Cost-based planner (M6): catalog, logical plan, cost model, join selection, EXPLAIN | ✅ shipped (PRs #73-#77) |
-| 9 | Executor + CLI wiring (M1): row codec, MVCC scan, engine glue, Volcano operators, joins, CLI | 🔨 in progress (CREATE/INSERT/SELECT/JOIN/EXPLAIN run; GROUP BY next) |
+| 9 | Executor + CLI wiring (M1): row codec, MVCC scan, engine glue, Volcano operators, joins, aggregates, CLI | 🔨 in progress (CREATE/INSERT/SELECT/JOIN/GROUP BY/EXPLAIN run; index scan + catalog persistence next) |
 | 10 | Torture test + polish | ⏳ |
 | 11 | Demo + write-up + SPED talk | ⏳ |
 
@@ -449,9 +449,11 @@ Operators are pull-based (`crates/executor/src/operator.rs`): construction is
 `open`, `next` yields one row, and `drop` is `close`. `build` lowers a
 `PhysicalPlan` into a tree and `run` drains it. Implemented: `SeqScan` (over a
 materialized snapshot scan), `Filter`, `Project` (expanding `*`), `Sort` (a
-blocking sort, NULLs last), `Limit`, and a nested-loop join (`INNER` and
-`LEFT`, materializing the right side so it can be rescanned per left row).
-Base-table rows arrive through a `TableSource` trait, so the executor never
+blocking sort, NULLs last), `Limit`, a nested-loop join (`INNER` and `LEFT`,
+materializing the right side so it can be rescanned per left row), and a
+group-by aggregate (`COUNT`, `SUM`, `MIN`, `MAX`, `AVG`, with or without a
+`GROUP BY`, emitting one row per group). Base-table rows arrive through a
+`TableSource` trait, so the executor never
 depends on the storage stack: the engine materializes a table's visible rows
 once via the MVCC scan and hands them over. Expression evaluation (`eval.rs`)
 follows SQL three-valued logic, where anything involving NULL yields NULL and a
@@ -495,8 +497,6 @@ and runs over a reader snapshot; `EXPLAIN` prints the cost-annotated plan.
 - Both join algorithms run through the nested-loop executor. The result is
   correct and the planner's hash-vs-loop choice is shown by EXPLAIN; the hash
   build/probe is a deferred runtime optimization, exactly like the index scan.
-- `GROUP BY` is parsed and planned but not yet executed (no aggregate
-  functions in the expression grammar yet).
 - The catalog is in-memory per session. A reopened database does not yet
   rediscover its tables; a persisted system catalog is the next durability
   step. Raw page durability is already provided by the WAL.

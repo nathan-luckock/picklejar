@@ -11,6 +11,7 @@
 //! operators above the scan are pure in-memory transforms.
 
 use std::cmp::Ordering;
+use std::collections::HashMap;
 
 use rustdb_planner::PhysicalPlan;
 use rustdb_sql::statement::SelectItem;
@@ -350,13 +351,246 @@ impl Executor for NestedLoopJoin {
     }
 }
 
+/// An aggregate function.
+#[derive(Clone, Copy)]
+enum AggFunc {
+    Count,
+    Sum,
+    Min,
+    Max,
+    Avg,
+}
+
+/// A parsed aggregate: a function and its argument (`None` for `COUNT(*)`).
+struct AggSpec {
+    func: AggFunc,
+    arg: Option<Expr>,
+}
+
+/// Per-group, per-aggregate running state. Each field is used only by the
+/// aggregate whose function needs it.
+#[derive(Default)]
+struct Acc {
+    /// Rows counted (all rows for `COUNT(*)`, non-null for `COUNT(expr)`).
+    count: u64,
+    /// Running sum and the count of summed integers (for SUM / AVG).
+    sum: i64,
+    num: u64,
+    /// Running min / max of non-null values.
+    min: Option<Value>,
+    max: Option<Value>,
+}
+
+/// Parse an aggregate call expression into a spec.
+fn parse_agg(expr: &Expr) -> Result<AggSpec> {
+    let Expr::Func { name, args } = expr else {
+        return Err(ExecError::Unsupported(format!(
+            "non-aggregate expression {expr} in an aggregate query"
+        )));
+    };
+    let func = match name.as_str() {
+        "COUNT" => AggFunc::Count,
+        "SUM" => AggFunc::Sum,
+        "MIN" => AggFunc::Min,
+        "MAX" => AggFunc::Max,
+        "AVG" => AggFunc::Avg,
+        other => return Err(ExecError::Unsupported(format!("aggregate {other}"))),
+    };
+    let arg = match args.as_slice() {
+        [Expr::Star] => None,
+        [e] => Some(e.clone()),
+        _ => {
+            return Err(ExecError::Unsupported(format!(
+                "{name} takes exactly one argument"
+            )))
+        }
+    };
+    Ok(AggSpec { func, arg })
+}
+
+/// Fold one input row into an accumulator.
+fn update_acc(acc: &mut Acc, spec: &AggSpec, row: &[Value], cols: &[String]) -> Result<()> {
+    let Some(arg) = &spec.arg else {
+        // COUNT(*): every row counts.
+        acc.count += 1;
+        return Ok(());
+    };
+    let v = eval(arg, row, cols)?;
+    if matches!(v, Value::Null) {
+        return Ok(());
+    }
+    acc.count += 1;
+    if let Value::Int(n) = &v {
+        acc.sum += *n;
+        acc.num += 1;
+    }
+    acc.min = Some(match acc.min.take() {
+        Some(m) if sort_cmp(&m, &v) == Ordering::Less => m,
+        _ => v.clone(),
+    });
+    acc.max = Some(match acc.max.take() {
+        Some(m) if sort_cmp(&m, &v) == Ordering::Greater => m,
+        _ => v,
+    });
+    Ok(())
+}
+
+/// Produce the final aggregate value from an accumulator.
+fn finalize_acc(acc: &Acc, spec: &AggSpec) -> Value {
+    let as_int = |n: u64| Value::Int(i64::try_from(n).unwrap_or(i64::MAX));
+    match spec.func {
+        AggFunc::Count => as_int(acc.count),
+        AggFunc::Sum => {
+            if acc.num == 0 {
+                Value::Null
+            } else {
+                Value::Int(acc.sum)
+            }
+        }
+        AggFunc::Avg => {
+            if acc.num == 0 {
+                Value::Null
+            } else {
+                Value::Int(acc.sum / i64::try_from(acc.num).unwrap_or(1).max(1))
+            }
+        }
+        AggFunc::Min => acc.min.clone().unwrap_or(Value::Null),
+        AggFunc::Max => acc.max.clone().unwrap_or(Value::Null),
+    }
+}
+
+/// A canonical byte key for a group, so equal value lists hash equal.
+fn group_key_bytes(values: &[Value]) -> Vec<u8> {
+    let mut b = Vec::new();
+    for v in values {
+        match v {
+            Value::Null => b.push(0),
+            Value::Int(n) => {
+                b.push(1);
+                b.extend_from_slice(&n.to_le_bytes());
+            }
+            Value::Text(s) => {
+                b.push(2);
+                b.extend_from_slice(&(s.len() as u64).to_le_bytes());
+                b.extend_from_slice(s.as_bytes());
+            }
+            Value::Bool(x) => {
+                b.push(3);
+                b.push(u8::from(*x));
+            }
+        }
+    }
+    b
+}
+
+/// Lexicographic order over two value lists, for deterministic group output.
+fn cmp_value_lists(a: &[Value], b: &[Value]) -> Ordering {
+    for (x, y) in a.iter().zip(b) {
+        let ord = sort_cmp(x, y);
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    a.len().cmp(&b.len())
+}
+
+/// Group-by aggregate (a blocking operator): read all input, group by the key
+/// expressions, compute each aggregate per group, and emit one row per group
+/// (`[group keys..., aggregates...]`). A keyless aggregate over an empty input
+/// still emits one row, matching SQL (`COUNT(*)` is 0, others NULL).
+struct Aggregate {
+    input: Box<dyn Executor>,
+    group_by: Vec<Expr>,
+    specs: Vec<AggSpec>,
+    columns: Vec<String>,
+    buffered: Option<std::vec::IntoIter<Row>>,
+}
+
+impl Aggregate {
+    fn new(input: Box<dyn Executor>, group_by: Vec<Expr>, aggregates: &[Expr]) -> Result<Self> {
+        let specs = aggregates
+            .iter()
+            .map(parse_agg)
+            .collect::<Result<Vec<_>>>()?;
+        let mut columns: Vec<String> = group_by.iter().map(ToString::to_string).collect();
+        columns.extend(aggregates.iter().map(ToString::to_string));
+        Ok(Self {
+            input,
+            group_by,
+            specs,
+            columns,
+            buffered: None,
+        })
+    }
+
+    fn materialize(&mut self) -> Result<()> {
+        let in_cols = self.input.columns().to_vec();
+        let mut groups: Vec<(Vec<Value>, Vec<Acc>)> = Vec::new();
+        let mut index: HashMap<Vec<u8>, usize> = HashMap::new();
+        let mut any_row = false;
+
+        while let Some(row) = self.input.next()? {
+            any_row = true;
+            let key = self
+                .group_by
+                .iter()
+                .map(|e| eval(e, &row, &in_cols))
+                .collect::<Result<Vec<_>>>()?;
+            let kb = group_key_bytes(&key);
+            let idx = if let Some(&i) = index.get(&kb) {
+                i
+            } else {
+                let i = groups.len();
+                index.insert(kb, i);
+                groups.push((key, self.specs.iter().map(|_| Acc::default()).collect()));
+                i
+            };
+            for (acc, spec) in groups[idx].1.iter_mut().zip(&self.specs) {
+                update_acc(acc, spec, &row, &in_cols)?;
+            }
+        }
+
+        // A whole-table aggregate over no rows still yields one summary row.
+        if self.group_by.is_empty() && !any_row {
+            groups.push((
+                Vec::new(),
+                self.specs.iter().map(|_| Acc::default()).collect(),
+            ));
+        }
+        groups.sort_by(|a, b| cmp_value_lists(&a.0, &b.0));
+
+        let mut out = Vec::with_capacity(groups.len());
+        for (key, accs) in groups {
+            let mut row = key;
+            for (acc, spec) in accs.iter().zip(&self.specs) {
+                row.push(finalize_acc(acc, spec));
+            }
+            out.push(row);
+        }
+        self.buffered = Some(out.into_iter());
+        Ok(())
+    }
+}
+
+impl Executor for Aggregate {
+    fn columns(&self) -> &[String] {
+        &self.columns
+    }
+    fn next(&mut self) -> Result<Option<Row>> {
+        if self.buffered.is_none() {
+            self.materialize()?;
+        }
+        Ok(self.buffered.as_mut().expect("materialized").next())
+    }
+}
+
 /// Lower a physical plan into an executor tree, reading base tables through
 /// `source`.
 ///
 /// # Errors
 ///
-/// Returns an error for plan nodes the executor does not run yet (aggregates)
-/// or if a base table cannot be read.
+/// Returns an error for plan nodes or expressions the executor does not run
+/// yet, or if a base table cannot be read.
 pub fn build(plan: &PhysicalPlan, source: &dyn TableSource) -> Result<Box<dyn Executor>> {
     match plan {
         PhysicalPlan::SeqScan {
@@ -427,7 +661,16 @@ pub fn build(plan: &PhysicalPlan, source: &dyn TableSource) -> Result<Box<dyn Ex
             *kind,
             on.clone(),
         )?)),
-        PhysicalPlan::Aggregate { .. } => Err(ExecError::Unsupported("GROUP BY".into())),
+        PhysicalPlan::Aggregate {
+            group_by,
+            aggregates,
+            input,
+            ..
+        } => Ok(Box::new(Aggregate::new(
+            build(input, source)?,
+            group_by.clone(),
+            aggregates,
+        )?)),
     }
 }
 

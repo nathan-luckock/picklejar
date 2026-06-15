@@ -996,6 +996,17 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_functions_parse_and_round_trip() {
+        // Function names canonicalize to upper-case; COUNT(*) carries a Star.
+        assert_eq!(
+            parse("select count(*), sum(amount) from t group by region").to_string(),
+            "SELECT COUNT(*), SUM(amount) FROM t GROUP BY region"
+        );
+        let s = round_trip("SELECT region, COUNT(*), SUM(amount) FROM sales GROUP BY region");
+        assert!(matches!(s, Statement::Select(_)));
+    }
+
+    #[test]
     fn insert_missing_values_errors() {
         let mut p = Parser::from_sql("INSERT INTO t (a)").expect("lex");
         assert!(p.parse_statement().is_err());

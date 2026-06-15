@@ -26,6 +26,9 @@ pub fn eval(expr: &Expr, row: &[Value], columns: &[String]) -> Result<Value> {
         Expr::Star => Err(ExecError::Unsupported("`*` used as a value".into())),
         Expr::Unary { op, expr } => eval_unary(*op, expr, row, columns),
         Expr::Binary { op, left, right } => eval_binary(*op, left, right, row, columns),
+        // An aggregate is computed by the Aggregate operator below; above it,
+        // the call resolves to that operator's output column by its name.
+        Expr::Func { .. } => resolve(&expr.to_string(), row, columns),
     }
 }
 

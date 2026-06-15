@@ -130,6 +130,50 @@ fn inner_and_left_joins() {
 }
 
 #[test]
+fn group_by_and_whole_table_aggregates() {
+    let dir = tempdir().expect("tempdir");
+    let mut db = Database::open(dir.path().join("agg.db")).expect("open");
+    db.execute("CREATE TABLE sales (region TEXT, amount INT)")
+        .unwrap();
+    db.execute(
+        "INSERT INTO sales (region, amount) VALUES ('west', 100), ('east', 50), ('west', 200)",
+    )
+    .unwrap();
+
+    // GROUP BY region with COUNT/SUM, groups sorted by key.
+    match db
+        .execute("SELECT region, COUNT(*), SUM(amount) FROM sales GROUP BY region")
+        .unwrap()
+    {
+        QueryOutcome::Rows { columns, rows } => {
+            assert_eq!(col_names(&columns), ["region", "COUNT(*)", "SUM(amount)"]);
+            assert_eq!(
+                rows,
+                vec![
+                    vec![Value::Text("east".into()), Value::Int(1), Value::Int(50)],
+                    vec![Value::Text("west".into()), Value::Int(2), Value::Int(300)],
+                ]
+            );
+        }
+        other => panic!("expected rows, got {other:?}"),
+    }
+
+    // Whole-table aggregate: one summary row, no GROUP BY.
+    match db
+        .execute("SELECT COUNT(*), MIN(amount), MAX(amount) FROM sales")
+        .unwrap()
+    {
+        QueryOutcome::Rows { rows, .. } => {
+            assert_eq!(
+                rows,
+                vec![vec![Value::Int(3), Value::Int(50), Value::Int(200)]]
+            );
+        }
+        other => panic!("expected rows, got {other:?}"),
+    }
+}
+
+#[test]
 fn introspection_lists_and_describes_tables() {
     let dir = tempdir().expect("tempdir");
     let mut db = Database::open(dir.path().join("introspect.db")).expect("open");
