@@ -33,7 +33,7 @@ Non-goals: distributed replication, network protocol compatibility with Postgres
 | 6 | MVCC polish: write-write conflict detection, version GC | ⏳ deferred |
 | 7 | SQL parser (lexer, Pratt expressions, DDL, DML, SELECT + JOIN/GROUP/ORDER/LIMIT) | ✅ shipped (PRs #62-#67) |
 | 8 | Cost-based planner (M6): catalog, logical plan, cost model, join selection, EXPLAIN | ✅ shipped (PRs #73-#77) |
-| 9 | Executor + CLI wiring (M1) | ⏳ next |
+| 9 | Executor + CLI wiring (M1): row codec, MVCC scan, engine glue, Volcano operators, CLI | 🔨 in progress (CREATE/INSERT/SELECT/EXPLAIN run; joins + GROUP BY next) |
 | 10 | Torture test + polish | ⏳ |
 | 11 | Demo + write-up + SPED talk | ⏳ |
 
@@ -425,6 +425,80 @@ predicate pushdown (no projection pushdown or constant folding), multi-index
 intersection, and join-order enumeration (joins are planned in written
 order). These are optimizer refinements, not correctness gaps, and are out of
 scope for the must-have M6.
+
+---
+
+## Executor and engine (Sprint 9 - M1)
+
+The executor runs a physical plan against stored data, and the `rustdb`
+engine ties every layer together so a SQL string produces rows. This is
+requirement M1 (CREATE / INSERT / SELECT with WHERE).
+
+### Row codec
+
+A stored row is the bytes the engine writes as an `MvccTable` value. The
+format is schema-driven (`crates/executor/src/row.rs`): a null bitmap
+(`ceil(n/8)` bytes, LSB first) followed by each non-null column, `INT` as 8
+little-endian bytes and `TEXT` as a 4-byte length prefix then UTF-8. The
+catalog supplies the types, so the bytes carry only data. A 500-case property
+test pins `decode(encode(row)) == row`.
+
+### Operator model
+
+Operators are pull-based (`crates/executor/src/operator.rs`): construction is
+`open`, `next` yields one row, and `drop` is `close`. `build` lowers a
+`PhysicalPlan` into a tree and `run` drains it. Implemented: `SeqScan` (over a
+materialized snapshot scan), `Filter`, `Project` (expanding `*`), `Sort` (a
+blocking sort, NULLs last), and `Limit`. Base-table rows arrive through a
+`TableSource` trait, so the executor never depends on the storage stack: the
+engine materializes a table's visible rows once via the MVCC scan and hands
+them over. Expression evaluation (`eval.rs`) follows SQL three-valued logic,
+where anything involving NULL yields NULL and a WHERE row passes only when its
+predicate is literally true.
+
+### Engine glue
+
+`rustdb::Database` owns the storage stack (file manager, buffer pool, WAL,
+transaction manager), an in-memory catalog, and a descriptor per table.
+`execute` parses and routes: DDL updates the catalog and creates or drops the
+backing `MvccTable`; `INSERT` encodes each row and stores it under an
+auto-increment rowid in one auto-commit transaction; `SELECT` binds, plans,
+and runs over a reader snapshot; `EXPLAIN` prints the cost-annotated plan.
+
+### Design decisions
+
+- **Tables are reopened per operation, not stored.** An `MvccTable` borrows
+  the pool and the transaction manager, so storing both the pool and a table
+  that borrows it would be a self-referential struct, which Rust forbids.
+  Each table's two anchor pages (index B+ tree root, current version heap
+  page) live in its descriptor, and a transient `MvccTable` is rebuilt per
+  call; after a write the anchors are read back and persisted (an insert can
+  split the root or advance the version page).
+- **Hidden rowid keying.** Every table uses an auto-increment rowid as its
+  storage key; user columns live entirely in the encoded row. Uniform storage,
+  and it defers secondary-index keying to the index-scan work.
+- **Materialized scans.** The engine reads a table's visible rows into a `Vec`
+  via the snapshot scan and hands them to the executor, keeping the executor
+  free of storage lifetimes and pin bookkeeping. Streaming is a later
+  optimization.
+
+### Known limitations (tracked, not gaps in M1)
+
+- `ORDER BY` resolves against the projected columns, because the planner puts
+  `Sort` above `Project`. Ordering by a column that is not in the select list
+  is not yet supported; the fix is to let the sort see the pre-projection
+  input.
+- `IndexScan` executes as a full scan with a residual filter (correct, not yet
+  faster); the physical index lookup lands with the index-scan work.
+- The catalog is in-memory per session. A reopened database does not yet
+  rediscover its tables; a persisted system catalog is the next durability
+  step. Raw page durability is already provided by the WAL.
+
+### CLI
+
+`rustdb-cli` is a psql-style REPL: SQL terminated by `;` prints an aligned
+table, `EXPLAIN <select>` prints the plan, and backslash meta-commands
+(`\dt`, `\d <table>`, `\q`) introspect and exit. This is the M1 demo surface.
 
 ---
 

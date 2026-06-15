@@ -28,7 +28,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use rustdb_executor::{decode_row, encode_row, run, Relation, TableSource};
-use rustdb_planner::{bind, plan, Catalog};
+use rustdb_planner::{bind, explain, plan, Catalog};
 use rustdb_sql::statement::DataType;
 use rustdb_sql::{Expr, Parser, Statement, UnOp, Value};
 use rustdb_storage::{BufferPool, FileManager, PageId};
@@ -63,13 +63,15 @@ pub enum QueryOutcome {
         /// Number of rows affected.
         affected: usize,
     },
-    /// A query returned rows. Populated once the executor lands.
+    /// A query returned rows.
     Rows {
         /// Output column names.
         columns: Vec<String>,
         /// Result rows, each one value per column.
         rows: Vec<Vec<Value>>,
     },
+    /// An `EXPLAIN`: the cost-annotated plan tree, ready to print.
+    Explain(String),
 }
 
 /// An embedded rustdb instance.
@@ -137,7 +139,7 @@ impl Database {
             Statement::Select(_) => self.run_select(&stmt),
             Statement::Update { .. } => Err(DbError::Unsupported("UPDATE".into())),
             Statement::Delete { .. } => Err(DbError::Unsupported("DELETE".into())),
-            Statement::Explain(_) => Err(DbError::Unsupported("EXPLAIN".into())),
+            Statement::Explain(_) => self.run_explain(&stmt),
         }
     }
 
@@ -145,6 +147,22 @@ impl Database {
     #[must_use]
     pub fn table_count(&self) -> usize {
         self.tables.len()
+    }
+
+    /// The names of all tables, sorted, for `\dt`-style listings.
+    #[must_use]
+    pub fn table_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.tables.keys().cloned().collect();
+        names.sort();
+        names
+    }
+
+    /// The `(name, type)` of each column of `table`, for `\d`-style describes.
+    #[must_use]
+    pub fn columns(&self, table: &str) -> Option<Vec<(String, DataType)>> {
+        self.catalog
+            .get_table(table)
+            .map(|m| m.columns.iter().map(|c| (c.name.clone(), c.ty)).collect())
     }
 
     // --- statement handlers ---
@@ -259,6 +277,22 @@ impl Database {
         let (columns, rows) = run(&physical, &source)?;
         self.mgr.commit(&txn);
         Ok(QueryOutcome::Rows { columns, rows })
+    }
+
+    fn run_explain(&self, stmt: &Statement) -> Result<QueryOutcome> {
+        let Statement::Explain(inner) = stmt else {
+            unreachable!("guarded by execute");
+        };
+        match inner.as_ref() {
+            Statement::Select(_) => {
+                let logical = bind(&self.catalog, inner)?;
+                let physical = plan(&logical, &self.catalog)?;
+                Ok(QueryOutcome::Explain(explain(&physical)))
+            }
+            _ => Err(DbError::Unsupported(
+                "EXPLAIN of a non-SELECT statement".into(),
+            )),
+        }
     }
 }
 
