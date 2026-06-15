@@ -1,8 +1,8 @@
-# capstone - a relational database from scratch (Rust)
+# capstone - a relational database engine (Rust)
 
-> CSE 499 senior project. A real disk-based relational database engine with ACID guarantees, written from scratch in Rust.
+> CSE 499 senior project. A real disk-based relational database engine with ACID guarantees, in Rust.
 
-Not a SQLite/Postgres wrapper. Not a key-value store with SQL on top. A real engine: page manager, buffer pool, B+ tree indexes, WAL + ARIES-style recovery, MVCC for concurrent reads, a hand-written SQL parser, a cost-based query planner, and a query executor.
+Not a SQLite/Postgres wrapper. Not a key-value store with SQL on top. A real engine: page manager, buffer pool, B+ tree indexes, WAL + ARIES-style recovery, MVCC for concurrent reads, a SQL parser, a cost-based query planner, and a query executor.
 
 ## Status
 
@@ -15,7 +15,7 @@ and CLI wiring come next, which will let typed SQL run end to end.
 | Storage | [`storage`](crates/storage/) | Pages, buffer pool, B+ tree | built |
 | Durability | [`wal`](crates/wal/) | Write-ahead log + ARIES recovery | built |
 | Concurrency | [`txn`](crates/txn/) | Transaction manager + MVCC | built |
-| Parsing | [`sql`](crates/sql/) | Hand-written SQL parser (lexer + recursive-descent) | built |
+| Parsing | [`sql`](crates/sql/) | SQL parser (lexer + recursive-descent) | built |
 | Optimization | [`planner`](crates/planner/) | Cost-based query planner + EXPLAIN | built |
 | Execution | [`executor`](crates/executor/) | Seq scan, index scan, hash join, nested-loop join | in progress |
 | Library entry | [`rustdb`](crates/rustdb/) | Top-level DB handle, embeds all layers | in progress |

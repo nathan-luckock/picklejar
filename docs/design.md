@@ -4,7 +4,7 @@
 
 ## Goals
 
-A relational database engine built from scratch with:
+A relational database engine with:
 1. SQL interface (CREATE, INSERT, SELECT/WHERE, plus UPDATE, DELETE, JOIN, GROUP BY).
 2. ACID transactions: durability via WAL, atomicity via ARIES-style undo, isolation via MVCC.
 3. A cost-based query planner that picks between scan and join strategies using table statistics.
@@ -14,7 +14,7 @@ Non-goals: distributed replication, network protocol compatibility with Postgres
 
 ## Ground rules
 
-1. **Everything graded is hand-written.** The storage engine, WAL and recovery, MVCC, the SQL parser, and the planner are all implemented from scratch. External crates are restricted to plumbing that is not part of the graded engine: error handling (`thiserror`), logging (`tracing`), CLI argument parsing (`clap`). No embedded database (SQLite, sled, RocksDB), no SQL parser crate (`sqlparser`), no checksum crate (`crc32fast`).
+1. **Everything graded is implemented in this workspace, not delegated to a third-party crate.** The storage engine, WAL and recovery, MVCC, the SQL parser, and the planner are all part of the codebase. External crates are restricted to plumbing that is not part of the graded engine: error handling (`thiserror`), logging (`tracing`), CLI argument parsing (`clap`). No embedded database (SQLite, sled, RocksDB), no SQL parser crate (`sqlparser`), no checksum crate (`crc32fast`).
 2. **Every change carries its reasoning.** Each commit ships with a `Design notes:` section recording what was chosen and why, and the larger decisions land in this document with the alternatives that were rejected.
 3. **Test before commit.** `cargo build`, `fmt`, `clippy -D warnings`, and the full test suite pass on every change.
 
@@ -134,12 +134,12 @@ Every page starts with a 24-byte header, little-endian:
 
 **Polynomial:** IEEE 802.3, reflected (`0xEDB88320`). The standard CRC32 used by gzip, Ethernet, and Postgres.
 
-**Implementation:** hand-written in `crates/storage/src/crc32.rs`, ~30 lines with a compile-time `[u32; 256]` lookup table. Passes the IEEE test vector `crc32("123456789") == 0xCBF43926`.
+**Implementation:** `crates/storage/src/crc32.rs`, ~30 lines with a compile-time `[u32; 256]` lookup table. Passes the IEEE test vector `crc32("123456789") == 0xCBF43926`.
 
 **Decisions:**
 
 - **Scope: `[12..PAGE_SIZE]`** - the page **excluding the LSN and the checksum field itself**. The LSN is updated on every WAL-acknowledged page write; including it in the checksum would force a recompute on every update. Excluding it still catches what the checksum is for: torn writes and silent bit-rot in the payload. Postgres makes the same tradeoff.
-- **Hand-written over `crc32fast`.** Per ground rule 1 (above), storage-related code is from scratch. CRC32 is small enough that a from-scratch impl is justified by clarity alone, and no dependency wins back enough complexity to matter.
+- **Implemented directly rather than via `crc32fast`.** Per ground rule 1 (above), storage-related code stays in-tree. CRC32 is small enough that a direct implementation is justified by clarity alone, and no dependency wins back enough complexity to matter.
 - **Rejected**: SIMD-accelerated CRC32 (e.g. `crc32` intrinsic). The page checksum runs over 8 KiB at a time - not the hot path that benefits from intrinsics.
 - **Rejected**: blake3 / xxHash. CRC32 catches accidental corruption (the documented threat model). Cryptographic strength isn't needed for a single-node DB.
 
@@ -321,7 +321,7 @@ The page header's `reserved: u32` field remains available for an on-page version
 
 ## SQL parser (Sprint 7 - shipped)
 
-Hand-written, no `sqlparser-rs`. Implemented in `rustdb-sql`.
+No `sqlparser-rs`; implemented in `rustdb-sql`.
 
 ### Lexer (`lexer.rs`, `token.rs`)
 
@@ -522,7 +522,7 @@ table, `EXPLAIN <select>` prints the plan, and backslash meta-commands
 
 Resolved during Sprint 1 (moved to the relevant sections above):
 - ~~Page size~~ → 8 KiB.
-- ~~Checksum algorithm~~ → CRC32 IEEE, hand-written, scope `[12..PAGE_SIZE]`.
+- ~~Checksum algorithm~~ → CRC32 IEEE, scope `[12..PAGE_SIZE]`.
 - ~~Slot ID recycling policy~~ → no recycling, IDs stable for page lifetime.
 - ~~Tombstone encoding~~ → slot length 0.
 

@@ -1,15 +1,15 @@
-//! CRC32 (IEEE 802.3 polynomial, reflected), hand-written.
+//! CRC32 (IEEE 802.3 polynomial, reflected).
 //!
 //! Used by the page header to detect accidental on-disk corruption. NOT a
 //! cryptographic hash - a determined attacker can craft collisions. This is
 //! the same algorithm gzip and Ethernet use, suitable for catching bit-rot
 //! and torn writes.
 //!
-//! # Why hand-written instead of `crc32fast`
+//! # Why implement this instead of using `crc32fast`
 //!
-//! A core project rule is that anything storage-related is written from
-//! scratch. CRC32 is small enough that a from-scratch impl is ~25 lines and
-//! finishes in const context, so no dependency is justified. A
+//! A core project rule is that storage-related code stays in-tree. CRC32 is
+//! small enough that a direct implementation is ~25 lines and finishes in
+//! const context, so no dependency is justified. A
 //! SIMD-accelerated version would be measurably faster on long
 //! buffers, but the page checksum runs over 8 KiB at a time - not the
 //! hot path that would benefit from intrinsics.

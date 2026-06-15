@@ -1,8 +1,8 @@
-//! SQL lexer and parser, hand-written.
+//! SQL lexer and parser.
 //!
-//! No `sqlparser-rs`. The point of the project is to write this from scratch.
-//! Target dialect: a meaningful subset - SELECT, INSERT, UPDATE, DELETE,
-//! CREATE TABLE, JOIN, WHERE, GROUP BY, ORDER BY, LIMIT.
+//! No `sqlparser-rs`; the parser is implemented in this crate. Target dialect:
+//! a meaningful subset - SELECT, INSERT, UPDATE, DELETE, CREATE TABLE, JOIN,
+//! WHERE, GROUP BY, ORDER BY, LIMIT.
 //!
 //! # Sprint 7 surface
 //!

@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Hand-written SQL lexer and parser for rustdb. No sqlparser-rs."
+description = "SQL lexer and parser for rustdb. No sqlparser-rs."
 
 [dependencies]
 thiserror.workspace = true

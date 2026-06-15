@@ -1,4 +1,4 @@
-//! Hand-written SQL lexer.
+//! SQL lexer.
 //!
 //! Turns a SQL string into a flat `Vec<Token>` ending in [`TokenKind::Eof`].
 //! No regex, no dependencies: a single forward pass over the bytes.
