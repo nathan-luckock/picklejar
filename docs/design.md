@@ -1,6 +1,6 @@
 # rustdb - Design Document
 
-> Working document. Updated as decisions are made. The goal is for any reviewer (and future-you) to be able to reconstruct **why** the engine is shaped the way it is from this single file.
+> Living design document. It records the architecture and the rationale behind each major decision, including the alternatives that were considered and rejected, so that a reviewer can reconstruct why the engine is shaped the way it is from this single file.
 
 ## Goals
 
@@ -22,58 +22,63 @@ Non-goals: distributed replication, network protocol compatibility with Postgres
 
 ## Implementation status (running)
 
-| Sprint | What | Status |
+| Sprint | Scope | Status |
 |---|---|---|
-| 0 | Bootstrap: workspace, CI, design doc, working agreement | ✅ shipped (PR #1) |
-| 1 | Storage I: file manager, page header + CRC32, slotted page, proptests | ✅ shipped (PRs #7-#10) |
-| 2 | Storage II: buffer pool + B+ tree + proptests | ✅ shipped (PRs #17-#21) |
-| 3 | WAL: record format, writer, reader, buffer pool integration, proptests | ✅ shipped (PRs #27-#31) |
-| 4 | ARIES recovery (analysis + redo + undo + forced-kill torture test) | ✅ shipped (PRs #37-#42) |
-| 5 | Transactions + MVCC (manager, visibility, versions, MvccTable, isolation levels) | ✅ shipped (PRs #49-#54) |
-| 6 | MVCC polish: write-write conflict detection, version GC | ⏳ deferred |
-| 7 | SQL parser (lexer, Pratt expressions, DDL, DML, SELECT + JOIN/GROUP/ORDER/LIMIT) | ✅ shipped (PRs #62-#67) |
-| 8 | Cost-based planner (M6): catalog, logical plan, cost model, join selection, EXPLAIN | ✅ shipped (PRs #73-#77) |
-| 9 | Executor + CLI wiring (M1): row codec, MVCC scan, engine glue, Volcano operators, joins, aggregates, CLI | 🔨 in progress (CREATE/INSERT/SELECT/JOIN/GROUP BY/EXPLAIN run; index scan + catalog persistence next) |
-| 10 | Torture test + polish | ⏳ |
-| 11 | Demo + write-up + SPED talk | ⏳ |
+| 0 | Bootstrap: workspace, CI, design doc, working agreement | Shipped (PR #1) |
+| 1 | Storage I: file manager, page header and CRC32, slotted page, property tests | Shipped (PRs #7-#10) |
+| 2 | Storage II: buffer pool and B+ tree, property tests | Shipped (PRs #17-#21) |
+| 3 | WAL: record format, writer, reader, buffer-pool integration, property tests | Shipped (PRs #27-#31) |
+| 4 | ARIES recovery: analysis, redo, undo, forced-kill torture test | Shipped (PRs #37-#42) |
+| 5 | Transactions and MVCC: manager, visibility, versions, `MvccTable`, isolation levels | Shipped (PRs #49-#54) |
+| 6 | MVCC polish: write-write conflict detection, version garbage collection | Deferred |
+| 7 | SQL parser: lexer, Pratt expressions, DDL, DML, SELECT with JOIN/GROUP/ORDER/LIMIT | Shipped (PRs #62-#67) |
+| 8 | Cost-based planner (M6): catalog, logical plan, cost model, join selection, EXPLAIN | Shipped (PRs #73-#77) |
+| 9 | Executor and CLI (M1): row codec, MVCC scan, engine, Volcano operators, joins, aggregates, CLI | Shipped (PRs #85-#97); real index scan and catalog persistence remain |
+| 10 | Torture-test extension and polish | Planned |
+| 11 | Demo, write-up, and presentation | Planned |
 
 ---
 
 ## High-level architecture
 
 ```
-        ┌──────────────────────────┐
-        │     rustdb-cli (REPL)    │
-        └────────────┬─────────────┘
-                     │ rustdb::Database::query()
-        ┌────────────▼─────────────┐
-        │     executor (Volcano)   │
-        └────────────┬─────────────┘
-                     │ physical plan
-        ┌────────────▼─────────────┐
-        │    planner (cost-based)  │
-        └────────────┬─────────────┘
-                     │ logical plan
-        ┌────────────▼─────────────┐
-        │       sql (parser)       │
-        └──────────────────────────┘
+    +--------------------------+
+    |    rustdb-cli (REPL)     |
+    +--------------------------+
+                 |  Database::execute(sql)
+                 v
+    +--------------------------+
+    |    executor (Volcano)    |
+    +--------------------------+
+                 |  physical plan
+                 v
+    +--------------------------+
+    |   planner (cost-based)   |
+    +--------------------------+
+                 |  logical plan
+                 v
+    +--------------------------+
+    |       sql (parser)       |
+    +--------------------------+
 
-           ───── all of the above flow through ─────
+    The query path above runs over the storage stack below.
 
-        ┌──────────────────────────┐
-        │   txn manager + MVCC     │
-        └────────────┬─────────────┘
-                     │ pin / read / write / log
-        ┌────────────▼─────────────┐
-        │       buffer pool        │
-        └────────────┬─────────────┘
-                     │
-        ┌────────────▼─────────────┐
-        │  page manager + B+ tree  │   ←── disk
-        └──────────────────────────┘
-        ┌──────────────────────────┐
-        │  WAL  +  recovery mgr    │   ←── disk (separate file)
-        └──────────────────────────┘
+    +--------------------------+
+    |    txn manager + MVCC    |
+    +--------------------------+
+                 |  pin / read / write / log
+                 v
+    +--------------------------+
+    |       buffer pool        |
+    +--------------------------+
+                 |
+                 v
+    +--------------------------+
+    |  page manager + B+ tree  |   (data file on disk)
+    +--------------------------+
+    +--------------------------+
+    |  WAL + recovery manager  |   (write-ahead log, separate file)
+    +--------------------------+
 ```
 
 ---
@@ -146,10 +151,11 @@ Every page starts with a 24-byte header, little-endian:
 ### Slotted-page heap layout (Sprint 1 - shipped)
 
 ```
- 0       24      ...                  free_space_ptr        PAGE_SIZE
- ┌───────┬─────────────────┬─────────┬──────────────────────────────┐
- │header │ slot directory →│  free   │ ← tuple data                 │
- └───────┴─────────────────┴─────────┴──────────────────────────────┘
+ 0       24                            free_space_ptr        PAGE_SIZE
+ +-------+-----------------+---------+------------------------------+
+ |header | slot directory  |  free   |          tuple data         |
+ |       | (grows right)   |  space  |        (grows left)         |
+ +-------+-----------------+---------+------------------------------+
 ```
 
 Slot directory entry (4 bytes, little-endian): `(offset: u16, length: u16)`. Length 0 = tombstoned.
@@ -165,13 +171,13 @@ Slot directory entry (4 bytes, little-endian): `(offset: u16, length: u16)`. Len
 - **`compact` allocates a small temp `Vec<(u16, Vec<u8>)>`.** Page-local, ~30 tuples max at typical sizes, not on the hot path. A zero-alloc in-place compaction is doable via overlapping copies but adds complexity unjustified for Sprint 1's budget.
 - **Rejected**: storing tuples in slot order. Insertion order makes `compact` a simple "walk live slots, copy to end" pass. Keeping tuples sorted by slot ID would force a re-sort after every `compact`.
 
-### B+ tree (Sprint 2 - planned)
+### B+ tree (Sprint 2 - shipped)
 
-Branching factor TBD (target ~128 for 8 KiB pages with `u64` keys). Internal node = sorted keys + child page IDs. Leaf node = sorted keys + tuple references `(PageId, SlotId)`. Sibling pointer in leaves for range scans.
+Fanout 509 keys per internal node and 453 entries per leaf, for 8 KiB pages with `u64` keys. An internal node holds sorted keys plus child page IDs; a leaf holds sorted keys plus tuple references `(PageId, SlotId)` and a sibling pointer for range scans. `BTree` exposes `insert`, `search`, `upsert`, `delete`, and `range_scan` over the buffer pool, splitting and propagating to a new root as needed.
 
-### Buffer pool (Sprint 2 - planned)
+### Buffer pool (Sprint 2 - shipped)
 
-LRU-K (K=2) replacement. Pin/unpin via RAII `PageGuard`. Pinned pages are evict-immune. Dirty bit set on first write through a guard.
+LRU-K (K=2) replacement. Pin and unpin are handled by RAII read and write guards; pinned pages are evict-immune, and the dirty bit is set on the first write through a write guard. The pool is interior-mutable (`&self`) so multiple guards can coexist, and it routes flushes through the WAL hook so write-ahead ordering is preserved.
 
 ---
 
@@ -222,23 +228,19 @@ Forward `Iterator<Item = Result<(RecordHeader, LogRecord)>>`. Clean `None` on EO
 - WAL segment rotation. Single-file fits demo scope.
 - `O_DIRECT` for the WAL. OS page cache hides write latency without changing semantics, since we explicitly `sync_all` for durability.
 
-## Recovery (Sprint 4 - planned)
+## Recovery (Sprint 4 - shipped)
 
-Original log record sketch (kept for reference):
+The log record layout:
 
-```
-┌────────────────────────────────────────────────┐
-│ length: u32                                    │
-│ type: u8         (BEGIN, UPDATE, COMMIT, ABORT,│
-│                   CHECKPOINT, CLR)             │
-│ lsn: u64                                       │
-│ txn_id: u64                                    │
-│ prev_lsn: u64    (txn's previous record, for   │
-│                   undo chain traversal)        │
-│ payload: [u8]    (per-type)                    │
-│ checksum: u32                                  │
-└────────────────────────────────────────────────┘
-```
+| Field | Type | Notes |
+|---|---|---|
+| `length` | `u32` | Total record length. |
+| `type` | `u8` | One of BEGIN, UPDATE, COMMIT, ABORT, CHECKPOINT, CLR. |
+| `lsn` | `u64` | Log sequence number. |
+| `txn_id` | `u64` | Owning transaction. |
+| `prev_lsn` | `u64` | This transaction's previous record, for undo-chain traversal. |
+| `payload` | `[u8]` | Per-type body. |
+| `checksum` | `u32` | Over the preceding fields. |
 
 ### Three-phase recovery (ARIES) - Sprint 4, shipped
 
@@ -512,7 +514,7 @@ table, `EXPLAIN <select>` prints the plan, and backslash meta-commands
 ## Testing strategy
 
 - **Unit tests** in each module. Fast (`cargo test --lib` runs in <50ms today).
-- **Property tests** via `proptest` in `crates/storage/tests/proptests.rs`. Covers header round-trip, full checksum bit-flip sweep (8 KiB × 8 bits = 65K flips per case), insert/delete/compact op-sequence invariants against an oracle, file manager durability across reopen.
+- **Property tests** via `proptest` in `crates/storage/tests/proptests.rs`. Covers header round-trip, a full checksum bit-flip sweep (8 KiB x 8 bits = 65K flips per case), insert/delete/compact op-sequence invariants against an oracle, and file-manager durability across reopen.
 - **Crash-recovery torture test** (Sprint 4, shipped): `crates/wal/tests/torture.rs` spawns the `crash_harness` binary, force-kills it mid-write, recovers, and asserts no committed row is lost. Runs several rounds. A polish pass in Sprint 10 will extend the run length and add a long-soak variant.
 - CI bumps `PROPTEST_CASES=512` (local default 256).
 
@@ -521,10 +523,10 @@ table, `EXPLAIN <select>` prints the plan, and backslash meta-commands
 ## Open questions
 
 Resolved during Sprint 1 (moved to the relevant sections above):
-- ~~Page size~~ → 8 KiB.
-- ~~Checksum algorithm~~ → CRC32 IEEE, scope `[12..PAGE_SIZE]`.
-- ~~Slot ID recycling policy~~ → no recycling, IDs stable for page lifetime.
-- ~~Tombstone encoding~~ → slot length 0.
+- ~~Page size~~ -> 8 KiB.
+- ~~Checksum algorithm~~ -> CRC32 IEEE, scope `[12..PAGE_SIZE]`.
+- ~~Slot ID recycling policy~~ -> no recycling, IDs stable for page lifetime.
+- ~~Tombstone encoding~~ -> slot length 0.
 
 Resolved during Sprint 2/3 (moved to relevant sections above):
 - ~~B+ tree fanout~~: 509 keys per internal node, 453 per leaf, locked.
