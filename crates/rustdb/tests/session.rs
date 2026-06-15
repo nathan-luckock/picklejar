@@ -81,6 +81,55 @@ fn order_by_a_non_projected_column() {
 }
 
 #[test]
+fn inner_and_left_joins() {
+    let dir = tempdir().expect("tempdir");
+    let mut db = Database::open(dir.path().join("join.db")).expect("open");
+    db.execute("CREATE TABLE customers (id INT, name TEXT)")
+        .unwrap();
+    db.execute("CREATE TABLE orders (id INT, cid INT)").unwrap();
+    db.execute("INSERT INTO customers (id, name) VALUES (1, 'alice'), (2, 'bob')")
+        .unwrap();
+    db.execute("INSERT INTO orders (id, cid) VALUES (10, 1), (11, 1)")
+        .unwrap();
+
+    // INNER JOIN: only customers with orders, one row per order.
+    match db
+        .execute("SELECT c.name, o.id FROM orders AS o INNER JOIN customers AS c ON o.cid = c.id")
+        .unwrap()
+    {
+        QueryOutcome::Rows { columns, rows } => {
+            assert_eq!(col_names(&columns), ["name", "id"]);
+            assert_eq!(
+                rows,
+                vec![
+                    vec![Value::Text("alice".into()), Value::Int(10)],
+                    vec![Value::Text("alice".into()), Value::Int(11)],
+                ]
+            );
+        }
+        other => panic!("expected rows, got {other:?}"),
+    }
+
+    // LEFT JOIN: bob has no orders, so o.id is NULL for bob.
+    match db
+        .execute("SELECT c.name, o.id FROM customers AS c LEFT JOIN orders AS o ON c.id = o.cid")
+        .unwrap()
+    {
+        QueryOutcome::Rows { rows, .. } => {
+            assert_eq!(
+                rows,
+                vec![
+                    vec![Value::Text("alice".into()), Value::Int(10)],
+                    vec![Value::Text("alice".into()), Value::Int(11)],
+                    vec![Value::Text("bob".into()), Value::Null],
+                ]
+            );
+        }
+        other => panic!("expected rows, got {other:?}"),
+    }
+}
+
+#[test]
 fn introspection_lists_and_describes_tables() {
     let dir = tempdir().expect("tempdir");
     let mut db = Database::open(dir.path().join("introspect.db")).expect("open");

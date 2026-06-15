@@ -116,9 +116,13 @@ fn scan_table<'c>(
         .alias
         .clone()
         .unwrap_or_else(|| table_ref.name.clone());
-    scope.push(ScopeEntry { qualifier, meta });
+    scope.push(ScopeEntry {
+        qualifier: qualifier.clone(),
+        meta,
+    });
     Ok(LogicalPlan::Scan {
         table: table_ref.name.clone(),
+        qualifier,
     })
 }
 
@@ -206,7 +210,7 @@ mod tests {
         let p = plan("SELECT * FROM orders");
         // Project { Scan }
         assert!(matches!(p, LogicalPlan::Project { input, .. }
-            if matches!(*input, LogicalPlan::Scan { ref table } if table == "orders")));
+            if matches!(*input, LogicalPlan::Scan { ref table, .. } if table == "orders")));
     }
 
     #[test]

@@ -23,6 +23,8 @@ pub enum PhysicalPlan {
     SeqScan {
         /// Table name.
         table: String,
+        /// Column qualifier (alias or table name) for this scan's output.
+        qualifier: String,
         /// Residual predicate applied per row, if any.
         predicate: Option<Expr>,
         /// Estimated output rows.
@@ -34,6 +36,8 @@ pub enum PhysicalPlan {
     IndexScan {
         /// Table name.
         table: String,
+        /// Column qualifier (alias or table name) for this scan's output.
+        qualifier: String,
         /// Index used.
         index: String,
         /// The predicate (the indexed part drives the scan; the rest is
@@ -172,14 +176,14 @@ impl PhysicalPlan {
 pub fn plan(logical: &LogicalPlan, catalog: &Catalog) -> Result<PhysicalPlan> {
     match logical {
         // A bare scan: full table scan, no predicate.
-        LogicalPlan::Scan { table } => Ok(scan_no_predicate(table, catalog)),
+        LogicalPlan::Scan { table, qualifier } => Ok(scan_no_predicate(table, qualifier, catalog)),
 
         // Filter directly over a scan: this is the cost-based scan choice.
         LogicalPlan::Filter { predicate, input } if matches!(**input, LogicalPlan::Scan { .. }) => {
-            let LogicalPlan::Scan { table } = &**input else {
+            let LogicalPlan::Scan { table, qualifier } = &**input else {
                 unreachable!("guarded by the match arm");
             };
-            Ok(choose_scan(table, predicate, catalog))
+            Ok(choose_scan(table, qualifier, predicate, catalog))
         }
 
         // Filter over a non-scan child: a standalone filter node.
@@ -325,10 +329,11 @@ fn is_equi_join(on: &Expr) -> bool {
 }
 
 /// A full scan with no predicate: every row, cost = row count.
-fn scan_no_predicate(table: &str, catalog: &Catalog) -> PhysicalPlan {
+fn scan_no_predicate(table: &str, qualifier: &str, catalog: &Catalog) -> PhysicalPlan {
     let rows = catalog.get_table(table).map_or(0, |t| t.stats.row_count);
     PhysicalPlan::SeqScan {
         table: table.to_string(),
+        qualifier: qualifier.to_string(),
         predicate: None,
         est_rows: rows,
         est_cost: seq_scan_cost(rows),
@@ -337,11 +342,12 @@ fn scan_no_predicate(table: &str, catalog: &Catalog) -> PhysicalPlan {
 
 /// Choose between a sequential scan and an index scan for `table` filtered by
 /// `predicate`, using the cost model. This is the M6 decision.
-fn choose_scan(table: &str, predicate: &Expr, catalog: &Catalog) -> PhysicalPlan {
+fn choose_scan(table: &str, qualifier: &str, predicate: &Expr, catalog: &Catalog) -> PhysicalPlan {
     let Some(meta) = catalog.get_table(table) else {
         // The binder validated the table exists; defensively fall back.
         return PhysicalPlan::SeqScan {
             table: table.to_string(),
+            qualifier: qualifier.to_string(),
             predicate: Some(predicate.clone()),
             est_rows: 0,
             est_cost: 0.0,
@@ -359,6 +365,7 @@ fn choose_scan(table: &str, predicate: &Expr, catalog: &Catalog) -> PhysicalPlan
         if idx_cost < seq_cost {
             return PhysicalPlan::IndexScan {
                 table: table.to_string(),
+                qualifier: qualifier.to_string(),
                 index: index_name.to_string(),
                 predicate: predicate.clone(),
                 est_rows: out_rows,
@@ -369,6 +376,7 @@ fn choose_scan(table: &str, predicate: &Expr, catalog: &Catalog) -> PhysicalPlan
 
     PhysicalPlan::SeqScan {
         table: table.to_string(),
+        qualifier: qualifier.to_string(),
         predicate: Some(predicate.clone()),
         est_rows: out_rows,
         est_cost: seq_cost,

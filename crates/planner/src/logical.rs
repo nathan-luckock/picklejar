@@ -20,6 +20,10 @@ pub enum LogicalPlan {
     Scan {
         /// Table name.
         table: String,
+        /// Column qualifier visible to the query: the alias if one was given,
+        /// otherwise the table name. Used to resolve `q.col` references and to
+        /// disambiguate columns across a join (including self-joins).
+        qualifier: String,
     },
     /// Keep only rows satisfying `predicate`.
     Filter {
@@ -73,7 +77,7 @@ impl LogicalPlan {
     fn fmt_indented(&self, f: &mut fmt::Formatter<'_>, depth: usize) -> fmt::Result {
         let pad = "  ".repeat(depth);
         match self {
-            Self::Scan { table } => writeln!(f, "{pad}Scan {table}"),
+            Self::Scan { table, .. } => writeln!(f, "{pad}Scan {table}"),
             Self::Filter { predicate, input } => {
                 writeln!(f, "{pad}Filter {predicate}")?;
                 input.fmt_indented(f, depth + 1)

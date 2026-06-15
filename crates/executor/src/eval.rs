@@ -17,7 +17,12 @@ use crate::error::{ExecError, Result};
 pub fn eval(expr: &Expr, row: &[Value], columns: &[String]) -> Result<Value> {
     match expr {
         Expr::Literal(v) => Ok(v.clone()),
-        Expr::Column(name) | Expr::QualifiedColumn(_, name) => resolve(name, row, columns),
+        Expr::Column(name) => resolve(name, row, columns),
+        // A qualified reference resolves the full `qualifier.column`, which
+        // disambiguates a column present in both sides of a join.
+        Expr::QualifiedColumn(qualifier, name) => {
+            resolve(&format!("{qualifier}.{name}"), row, columns)
+        }
         Expr::Star => Err(ExecError::Unsupported("`*` used as a value".into())),
         Expr::Unary { op, expr } => eval_unary(*op, expr, row, columns),
         Expr::Binary { op, left, right } => eval_binary(*op, left, right, row, columns),
@@ -25,12 +30,30 @@ pub fn eval(expr: &Expr, row: &[Value], columns: &[String]) -> Result<Value> {
 }
 
 /// Resolve a (possibly qualified) column name to its value in `row`.
+///
+/// Columns are stored qualified (`qualifier.col`). An exact match wins first
+/// (so a qualified reference like `o.cid` resolves directly); otherwise a bare
+/// name matches the column whose part after the last `.` equals it, erroring
+/// if that is ambiguous across a join.
 fn resolve(name: &str, row: &[Value], columns: &[String]) -> Result<Value> {
-    let idx = columns
-        .iter()
-        .position(|c| c == name)
-        .ok_or_else(|| ExecError::UnknownColumn(name.to_string()))?;
-    Ok(row[idx].clone())
+    if let Some(i) = columns.iter().position(|c| c == name) {
+        return Ok(row[i].clone());
+    }
+    if !name.contains('.') {
+        let mut found = None;
+        for (i, c) in columns.iter().enumerate() {
+            if c.rsplit('.').next() == Some(name) {
+                if found.is_some() {
+                    return Err(ExecError::UnknownColumn(format!("{name} is ambiguous")));
+                }
+                found = Some(i);
+            }
+        }
+        if let Some(i) = found {
+            return Ok(row[i].clone());
+        }
+    }
+    Err(ExecError::UnknownColumn(name.to_string()))
 }
 
 fn eval_unary(op: UnOp, expr: &Expr, row: &[Value], columns: &[String]) -> Result<Value> {
