@@ -44,6 +44,12 @@ fn create_insert_select_explain_session() {
         QueryOutcome::Explain(text) => {
             assert!(text.contains("SeqScan parts"), "plan:\n{text}");
             assert!(text.contains("predicate: (id = 2)"), "plan:\n{text}");
+            // Costs are real now: the engine fed the 3-row count to the
+            // planner, so the scan is not estimated at zero rows.
+            assert!(
+                text.contains("rows=3"),
+                "plan should reflect 3 rows:\n{text}"
+            );
         }
         other => panic!("expected explain, got {other:?}"),
     }

@@ -257,6 +257,11 @@ impl Database {
         // Persist the (possibly advanced) anchor pages.
         store.index_root = handle.index_root();
         store.version_page = handle.version_page();
+        // Feed the planner real statistics: with no deletes yet, the live row
+        // count equals the rowid high-water mark. This is what makes EXPLAIN
+        // show true costs instead of zero.
+        let row_count = store.next_rowid;
+        self.catalog.set_row_count(table, row_count)?;
         Ok(QueryOutcome::Mutation { affected })
     }
 
