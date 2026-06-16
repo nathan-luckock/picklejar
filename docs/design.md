@@ -488,6 +488,17 @@ MVCC machinery directly: an explicit transaction is the same `Transaction` the
 manager hands out, held open across statements instead of one per statement.
 DDL auto-commits regardless of an open transaction.
 
+### Constraints
+
+A column may declare `PRIMARY KEY`, `NOT NULL`, or `UNIQUE` (in any order); a
+primary key implies the other two. `INSERT` enforces them: a `NOT NULL` column
+rejects a NULL (including a column left unnamed in the insert), and a `UNIQUE`
+or primary-key column rejects a value already present (the engine scans the
+live rows once to gather existing values, and also catches duplicates within
+the same statement). `UPDATE` enforces `NOT NULL`. NULLs do not conflict under
+`UNIQUE`, matching SQL. Enforcement is by scan today; once the secondary-index
+runtime lands, a unique index can answer the check directly.
+
 After each statement that changes the schema or a table's data, the engine
 flushes every dirty page to the data file and rewrites a catalog sidecar
 (`<base>.meta`) recording, per table, the columns, indexes, the index B+ tree

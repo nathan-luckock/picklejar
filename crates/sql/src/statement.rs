@@ -193,8 +193,12 @@ pub struct ColumnDef {
     pub name: String,
     /// Declared type.
     pub ty: DataType,
-    /// Whether the column is the primary key.
+    /// Whether the column is the primary key (implies NOT NULL and UNIQUE).
     pub primary_key: bool,
+    /// Whether NULL is rejected for this column.
+    pub not_null: bool,
+    /// Whether values must be unique across rows.
+    pub unique: bool,
 }
 
 impl fmt::Display for ColumnDef {
@@ -202,6 +206,12 @@ impl fmt::Display for ColumnDef {
         write!(f, "{} {}", self.name, self.ty)?;
         if self.primary_key {
             f.write_str(" PRIMARY KEY")?;
+        }
+        if self.not_null {
+            f.write_str(" NOT NULL")?;
+        }
+        if self.unique {
+            f.write_str(" UNIQUE")?;
         }
         Ok(())
     }
@@ -599,17 +609,30 @@ impl Parser {
                 ));
             }
         };
-        // Optional PRIMARY KEY.
-        let primary_key = if self.eat_keyword(Keyword::Primary) {
-            self.expect_keyword(Keyword::Key)?;
-            true
-        } else {
-            false
-        };
+        // Optional column constraints, in any order: PRIMARY KEY, NOT NULL,
+        // UNIQUE.
+        let mut primary_key = false;
+        let mut not_null = false;
+        let mut unique = false;
+        loop {
+            if self.eat_keyword(Keyword::Primary) {
+                self.expect_keyword(Keyword::Key)?;
+                primary_key = true;
+            } else if self.eat_keyword(Keyword::Not) {
+                self.expect_keyword(Keyword::Null)?;
+                not_null = true;
+            } else if self.eat_keyword(Keyword::Unique) {
+                unique = true;
+            } else {
+                break;
+            }
+        }
         Ok(ColumnDef {
             name,
             ty,
             primary_key,
+            not_null,
+            unique,
         })
     }
 
@@ -756,6 +779,8 @@ mod tests {
                     name: "id".into(),
                     ty: DataType::Int,
                     primary_key: false,
+                    not_null: false,
+                    unique: false,
                 }],
             }
         );
@@ -1024,6 +1049,19 @@ mod tests {
             parse("explain select * from t").to_string(),
             "EXPLAIN SELECT * FROM t"
         );
+    }
+
+    #[test]
+    fn column_constraints_round_trip() {
+        assert_eq!(
+            parse("create table t (id int primary key, e text unique, n text not null)")
+                .to_string(),
+            "CREATE TABLE t (id INT PRIMARY KEY, e TEXT UNIQUE, n TEXT NOT NULL)"
+        );
+        assert!(matches!(
+            round_trip("CREATE TABLE t (id INT PRIMARY KEY, n TEXT NOT NULL)"),
+            Statement::CreateTable { .. }
+        ));
     }
 
     #[test]

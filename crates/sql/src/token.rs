@@ -58,6 +58,7 @@ pub enum Keyword {
     As,
     Primary,
     Key,
+    Unique,
     True,
     False,
     // Column types.
@@ -107,6 +108,7 @@ impl Keyword {
             "as" => Self::As,
             "primary" => Self::Primary,
             "key" => Self::Key,
+            "unique" => Self::Unique,
             "true" => Self::True,
             "false" => Self::False,
             "int" | "integer" => Self::Int,

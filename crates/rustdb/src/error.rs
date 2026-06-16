@@ -50,6 +50,9 @@ pub enum DbError {
     /// A statement or expression form the engine does not handle yet.
     #[error("{0} is not supported yet")]
     Unsupported(String),
+    /// A column constraint (NOT NULL, UNIQUE, or PRIMARY KEY) was violated.
+    #[error("constraint violation: {0}")]
+    Constraint(String),
 }
 
 /// Engine result alias.

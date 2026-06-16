@@ -1,7 +1,7 @@
 //! End-to-end engine session: drive the public `Database` API through a full
 //! CREATE -> INSERT -> SELECT -> EXPLAIN script, the way the CLI does.
 
-use rustdb::{Database, QueryOutcome, Value};
+use rustdb::{Database, DbError, QueryOutcome, Value};
 use tempfile::tempdir;
 
 fn col_names(columns: &[String]) -> Vec<&str> {
@@ -183,6 +183,46 @@ fn ids(db: &mut Database) -> Vec<i64> {
                 ref v => panic!("expected int, got {v:?}"),
             })
             .collect(),
+        other => panic!("expected rows, got {other:?}"),
+    }
+}
+
+#[test]
+fn constraints_primary_key_unique_not_null() {
+    let dir = tempdir().expect("tempdir");
+    let mut db = Database::open(dir.path().join("constraints.db")).expect("open");
+    db.execute("CREATE TABLE users (id INT PRIMARY KEY, email TEXT UNIQUE, name TEXT NOT NULL)")
+        .unwrap();
+    db.execute("INSERT INTO users VALUES (1, 'a@x.com', 'alice')")
+        .unwrap();
+
+    // A duplicate primary key is rejected.
+    assert!(matches!(
+        db.execute("INSERT INTO users VALUES (1, 'b@x.com', 'bob')"),
+        Err(DbError::Constraint(_))
+    ));
+    // A duplicate UNIQUE value is rejected.
+    assert!(matches!(
+        db.execute("INSERT INTO users VALUES (2, 'a@x.com', 'carol')"),
+        Err(DbError::Constraint(_))
+    ));
+    // NULL in a NOT NULL column is rejected, on INSERT and on UPDATE.
+    assert!(matches!(
+        db.execute("INSERT INTO users VALUES (3, 'c@x.com', NULL)"),
+        Err(DbError::Constraint(_))
+    ));
+    assert!(matches!(
+        db.execute("UPDATE users SET name = NULL WHERE id = 1"),
+        Err(DbError::Constraint(_))
+    ));
+
+    // A valid row still inserts, and the rejected rows are absent.
+    db.execute("INSERT INTO users VALUES (4, 'd@x.com', 'dave')")
+        .unwrap();
+    match db.execute("SELECT id FROM users ORDER BY id").unwrap() {
+        QueryOutcome::Rows { rows, .. } => {
+            assert_eq!(rows, vec![vec![Value::Int(1)], vec![Value::Int(4)]]);
+        }
         other => panic!("expected rows, got {other:?}"),
     }
 }

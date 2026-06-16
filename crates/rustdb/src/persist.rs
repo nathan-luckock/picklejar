@@ -23,8 +23,8 @@ use rustdb_sql::statement::DataType;
 pub struct TableRecord {
     /// Table name.
     pub name: String,
-    /// Columns as `(name, type, is_primary_key)`.
-    pub columns: Vec<(String, DataType, bool)>,
+    /// Columns as `(name, type, primary_key, not_null, unique)`.
+    pub columns: Vec<(String, DataType, bool, bool, bool)>,
     /// Indexes as `(index_name, column)`.
     pub indexes: Vec<(String, String)>,
     /// Index B+ tree root page.
@@ -68,8 +68,15 @@ pub fn save(path: &Path, records: &[TableRecord]) -> io::Result<()> {
             r.next_rowid,
             r.columns.len()
         );
-        for (name, ty, pk) in &r.columns {
-            let _ = write!(out, " {name} {} {}", type_tag(*ty), u8::from(*pk));
+        for (name, ty, pk, not_null, unique) in &r.columns {
+            let _ = write!(
+                out,
+                " {name} {} {} {} {}",
+                type_tag(*ty),
+                u8::from(*pk),
+                u8::from(*not_null),
+                u8::from(*unique),
+            );
         }
         let _ = write!(out, " {}", r.indexes.len());
         for (name, col) in &r.indexes {
@@ -114,7 +121,9 @@ pub fn load(path: &Path) -> io::Result<Vec<TableRecord>> {
             let cname = field(&toks, &mut i)?.to_string();
             let ty = parse_type(field(&toks, &mut i)?).ok_or_else(invalid)?;
             let pk = field(&toks, &mut i)? == "1";
-            columns.push((cname, ty, pk));
+            let not_null = field(&toks, &mut i)? == "1";
+            let unique = field(&toks, &mut i)? == "1";
+            columns.push((cname, ty, pk, not_null, unique));
         }
 
         let nidx = parse_usize(field(&toks, &mut i)?)?;

@@ -91,11 +91,20 @@ fn data_type() -> impl Strategy<Value = DataType> {
 }
 
 fn column_def() -> impl Strategy<Value = ColumnDef> {
-    (ident(), data_type(), any::<bool>()).prop_map(|(name, ty, primary_key)| ColumnDef {
-        name,
-        ty,
-        primary_key,
-    })
+    (
+        ident(),
+        data_type(),
+        any::<bool>(),
+        any::<bool>(),
+        any::<bool>(),
+    )
+        .prop_map(|(name, ty, primary_key, not_null, unique)| ColumnDef {
+            name,
+            ty,
+            primary_key,
+            not_null,
+            unique,
+        })
 }
 
 fn join() -> impl Strategy<Value = Join> {

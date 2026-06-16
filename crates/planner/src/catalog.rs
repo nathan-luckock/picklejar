@@ -23,8 +23,12 @@ pub struct Column {
     pub name: String,
     /// Declared type.
     pub ty: DataType,
-    /// Whether this is the table's primary key.
+    /// Whether this is the table's primary key (implies NOT NULL and UNIQUE).
     pub primary_key: bool,
+    /// Whether NULL is rejected for this column.
+    pub not_null: bool,
+    /// Whether values must be unique across rows.
+    pub unique: bool,
 }
 
 /// A single-column index.
@@ -132,6 +136,9 @@ impl Catalog {
                 name: c.name.clone(),
                 ty: c.ty,
                 primary_key: c.primary_key,
+                // A primary key implies NOT NULL and UNIQUE.
+                not_null: c.not_null || c.primary_key,
+                unique: c.unique || c.primary_key,
             })
             .collect();
         self.tables.insert(

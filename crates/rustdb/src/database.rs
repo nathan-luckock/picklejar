@@ -138,10 +138,12 @@ impl Database {
             let columns: Vec<ColumnDef> = r
                 .columns
                 .iter()
-                .map(|(name, ty, primary_key)| ColumnDef {
+                .map(|(name, ty, primary_key, not_null, unique)| ColumnDef {
                     name: name.clone(),
                     ty: *ty,
                     primary_key: *primary_key,
+                    not_null: *not_null,
+                    unique: *unique,
                 })
                 .collect();
             self.catalog.apply(&Statement::CreateTable {
@@ -183,7 +185,7 @@ impl Database {
                     columns: meta
                         .columns
                         .iter()
-                        .map(|c| (c.name.clone(), c.ty, c.primary_key))
+                        .map(|c| (c.name.clone(), c.ty, c.primary_key, c.not_null, c.unique))
                         .collect(),
                     indexes: meta
                         .indexes
@@ -367,9 +369,9 @@ impl Database {
         columns: &[String],
         rows: &[Vec<Expr>],
     ) -> Result<QueryOutcome> {
-        // Resolve the schema and the column-to-position mapping from the
-        // catalog, then drop that borrow before touching the storage fields.
-        let (schema, positions) = {
+        // Resolve the schema, the column-to-position mapping, and the column
+        // constraints from the catalog, then drop that borrow.
+        let (schema, positions, col_meta) = {
             let meta = self
                 .catalog
                 .get_table(table)
@@ -388,7 +390,13 @@ impl Database {
                     })
                     .collect::<Result<_>>()?
             };
-            (schema, positions)
+            // (name, not_null, unique) in column order.
+            let col_meta: Vec<(String, bool, bool)> = meta
+                .columns
+                .iter()
+                .map(|c| (c.name.clone(), c.not_null, c.unique))
+                .collect();
+            (schema, positions, col_meta)
         };
 
         let store = self
@@ -403,6 +411,25 @@ impl Database {
             store.version_page,
         );
 
+        // For each UNIQUE column, gather the values already present so
+        // duplicates (including duplicates within this statement) are caught.
+        let unique_cols: Vec<usize> = col_meta
+            .iter()
+            .enumerate()
+            .filter_map(|(i, (_, _, unique))| unique.then_some(i))
+            .collect();
+        let mut seen: Vec<Vec<Value>> = vec![Vec::new(); unique_cols.len()];
+        if !unique_cols.is_empty() {
+            for (_, bytes) in handle.scan(txn)? {
+                let row = decode_row(&bytes, &schema)?;
+                for (slot, &col) in unique_cols.iter().enumerate() {
+                    if !matches!(row[col], Value::Null) {
+                        seen[slot].push(row[col].clone());
+                    }
+                }
+            }
+        }
+
         let mut affected = 0;
         for row in rows {
             if row.len() != positions.len() {
@@ -415,6 +442,24 @@ impl Database {
             let mut values = vec![Value::Null; schema.len()];
             for (expr, &pos) in row.iter().zip(&positions) {
                 values[pos] = const_eval(expr)?;
+            }
+            // NOT NULL.
+            for (i, (name, not_null, _)) in col_meta.iter().enumerate() {
+                if *not_null && matches!(values[i], Value::Null) {
+                    return Err(DbError::Constraint(format!("column {name} cannot be NULL")));
+                }
+            }
+            // UNIQUE (NULLs do not conflict).
+            for (slot, &col) in unique_cols.iter().enumerate() {
+                if !matches!(values[col], Value::Null) {
+                    if seen[slot].contains(&values[col]) {
+                        return Err(DbError::Constraint(format!(
+                            "duplicate value in column {}",
+                            col_meta[col].0
+                        )));
+                    }
+                    seen[slot].push(values[col].clone());
+                }
             }
             let bytes = encode_row(&values, &schema)?;
             handle.insert(txn, store.next_rowid, &bytes)?;
@@ -458,7 +503,7 @@ impl Database {
         assignments: &[(String, Expr)],
         where_clause: Option<&Expr>,
     ) -> Result<QueryOutcome> {
-        let (schema, columns, targets) = {
+        let (schema, columns, targets, not_null) = {
             let meta = self
                 .catalog
                 .get_table(table)
@@ -475,7 +520,13 @@ impl Database {
                         })
                 })
                 .collect::<Result<Vec<usize>>>()?;
-            (schema, columns, targets)
+            let not_null: Vec<usize> = meta
+                .columns
+                .iter()
+                .enumerate()
+                .filter_map(|(i, c)| c.not_null.then_some(i))
+                .collect();
+            (schema, columns, targets, not_null)
         };
 
         let store = self
@@ -502,6 +553,14 @@ impl Database {
             let mut new_row = row.clone();
             for ((_, expr), &pos) in assignments.iter().zip(&targets) {
                 new_row[pos] = eval(expr, &row, &columns)?;
+            }
+            for &col in &not_null {
+                if matches!(new_row[col], Value::Null) {
+                    return Err(DbError::Constraint(format!(
+                        "column {} cannot be NULL",
+                        columns[col]
+                    )));
+                }
             }
             handle.update(txn, key, &encode_row(&new_row, &schema)?)?;
             affected += 1;
