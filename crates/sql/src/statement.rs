@@ -287,14 +287,18 @@ impl fmt::Display for Statement {
                 columns,
                 rows,
             } => {
-                write!(f, "INSERT INTO {table} (")?;
-                for (i, c) in columns.iter().enumerate() {
-                    if i > 0 {
-                        f.write_str(", ")?;
+                write!(f, "INSERT INTO {table}")?;
+                if !columns.is_empty() {
+                    f.write_str(" (")?;
+                    for (i, c) in columns.iter().enumerate() {
+                        if i > 0 {
+                            f.write_str(", ")?;
+                        }
+                        f.write_str(c)?;
                     }
-                    f.write_str(c)?;
+                    f.write_str(")")?;
                 }
-                f.write_str(") VALUES ")?;
+                f.write_str(" VALUES ")?;
                 for (ri, row) in rows.iter().enumerate() {
                     if ri > 0 {
                         f.write_str(", ")?;
@@ -613,9 +617,15 @@ impl Parser {
         self.expect_keyword(Keyword::Insert)?;
         self.expect_keyword(Keyword::Into)?;
         let table = self.parse_ident()?;
-        self.expect(&TokenKind::LParen)?;
-        let columns = self.parse_ident_list()?;
-        self.expect(&TokenKind::RParen)?;
+        // The column list is optional: `INSERT INTO t VALUES (...)` inserts
+        // into all columns in declaration order.
+        let columns = if self.eat(&TokenKind::LParen) {
+            let cols = self.parse_ident_list()?;
+            self.expect(&TokenKind::RParen)?;
+            cols
+        } else {
+            Vec::new()
+        };
         self.expect_keyword(Keyword::Values)?;
         let mut rows = Vec::new();
         loop {
@@ -992,6 +1002,17 @@ mod tests {
         assert_eq!(
             parse("explain select * from t").to_string(),
             "EXPLAIN SELECT * FROM t"
+        );
+    }
+
+    #[test]
+    fn insert_without_column_list() {
+        let s = round_trip("INSERT INTO t VALUES (1, 'x')");
+        assert!(matches!(s, Statement::Insert { ref columns, .. } if columns.is_empty()));
+        // No empty `()` is printed when the column list is omitted.
+        assert_eq!(
+            parse("insert into t values (1, 2)").to_string(),
+            "INSERT INTO t VALUES (1, 2)"
         );
     }
 
