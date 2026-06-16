@@ -174,6 +174,25 @@ fn group_by_and_whole_table_aggregates() {
 }
 
 #[test]
+fn insert_without_column_list_fills_all_columns() {
+    let dir = tempdir().expect("tempdir");
+    let mut db = Database::open(dir.path().join("ins.db")).expect("open");
+    db.execute("CREATE TABLE t (id INT, name TEXT)").unwrap();
+    db.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b')")
+        .unwrap();
+    match db.execute("SELECT id, name FROM t ORDER BY id").unwrap() {
+        QueryOutcome::Rows { rows, .. } => assert_eq!(
+            rows,
+            vec![
+                vec![Value::Int(1), Value::Text("a".into())],
+                vec![Value::Int(2), Value::Text("b".into())],
+            ]
+        ),
+        other => panic!("expected rows, got {other:?}"),
+    }
+}
+
+#[test]
 fn update_and_delete() {
     let dir = tempdir().expect("tempdir");
     let mut db = Database::open(dir.path().join("upd.db")).expect("open");
