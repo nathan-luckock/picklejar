@@ -1126,19 +1126,6 @@ mod tests {
         }
     }
 
-    /// Same shape as [`seed_indexed`], but inserts all `n` rows in one
-    /// statement (a single transaction). Tests that update or reopen use this
-    /// to stay clear of two pre-existing limits unrelated to indexing: a
-    /// version-heap-page edge under many single-row updates, and transaction
-    /// ids resetting on reopen (which only surfaces across many transactions).
-    fn seed_indexed_one_txn(db: &mut Database, n: i64) {
-        db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")
-            .unwrap();
-        let vals: Vec<String> = (0..n).map(|i| format!("({i}, 'n{i}')")).collect();
-        db.execute(&format!("INSERT INTO t VALUES {}", vals.join(", ")))
-            .unwrap();
-    }
-
     fn explain(db: &mut Database, select_sql: &str) -> String {
         match db.execute(&format!("EXPLAIN {select_sql}")).unwrap() {
             QueryOutcome::Explain(p) => p,
@@ -1179,7 +1166,9 @@ mod tests {
     #[test]
     fn index_reflects_updates_via_upsert() {
         let (_dir, mut db) = db();
-        seed_indexed_one_txn(&mut db, 80);
+        // 300 separate inserts: many transactions and a version page that rolls
+        // over, exercising both the durability and same-length-update fixes.
+        seed_indexed(&mut db, 300);
         // The post-update reads go through the index (confirm the plan).
         assert!(explain(&mut db, "SELECT id FROM t WHERE id = 1000").contains("IndexScan"));
         // Move row 5 to a new key.
@@ -1199,7 +1188,7 @@ mod tests {
         let path = dir.path().join("idx.db");
         {
             let mut db = Database::open(&path).expect("open");
-            seed_indexed_one_txn(&mut db, 80);
+            seed_indexed(&mut db, 300);
         }
         // Reopen: the persisted index roots are reloaded.
         let mut db = Database::open(&path).expect("reopen");

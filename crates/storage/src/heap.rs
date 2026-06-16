@@ -294,6 +294,19 @@ impl<'a> HeapPage<'a> {
         }
 
         let img_len = u16::try_from(image.len()).expect("checked against MAX_TUPLE_SIZE");
+
+        // Same-length overwrite of an existing live slot: write the bytes back
+        // into the slot's current location, consuming no free space. This is
+        // the common case (stamping a version's xmax, an equal-size update),
+        // and rewriting it into the free region instead would wrongly fail on
+        // a full page even though the page is not growing. The slot pointer and
+        // length are unchanged, so recovery reproduces the same layout.
+        if !appending && self.slot_length_at(idx) == img_len {
+            let off = self.slot_offset_at(idx) as usize;
+            self.buf[off..off + image.len()].copy_from_slice(image);
+            return Ok(());
+        }
+
         let needed = if appending {
             img_len.saturating_add(SLOT_SIZE_U16)
         } else {
@@ -566,6 +579,35 @@ mod tests {
         let mut page = HeapPage::init(&mut buf);
         page.insert(b"x").expect("insert");
         assert_eq!(page.get(SlotId::new(42)), None);
+    }
+
+    #[test]
+    fn recover_slot_same_length_overwrite_on_full_page() {
+        let mut buf = fresh_page();
+        let mut page = HeapPage::init(&mut buf);
+        // Fill the page with fixed-size tuples until it is essentially full.
+        let payload = [0xABu8; 64];
+        let mut ids = Vec::new();
+        loop {
+            match page.insert(&payload) {
+                Ok(id) => ids.push(id),
+                Err(StorageError::PageFull { .. }) => break,
+                Err(e) => panic!("unexpected: {e:?}"),
+            }
+        }
+        assert!(page.free_space() < 64, "page should be nearly full");
+        // A same-length overwrite of an existing slot must succeed in place,
+        // consuming no free space, even though a fresh insert would not fit.
+        let mut changed = payload;
+        changed[0] = 0xFF;
+        let mid = ids[ids.len() / 2];
+        page.recover_slot(mid, &changed)
+            .expect("in-place overwrite");
+        assert_eq!(page.get(mid), Some(&changed[..]));
+        // A different (smaller still nonzero) length on a full page falls back
+        // to the free region and correctly reports the page is full.
+        let err = page.recover_slot(mid, &[0x11u8; 32]).expect_err("no room");
+        assert!(matches!(err, StorageError::PageFull { .. }));
     }
 
     #[test]
