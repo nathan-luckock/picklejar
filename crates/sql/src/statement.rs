@@ -801,6 +801,16 @@ mod tests {
     }
 
     #[test]
+    fn case_expression_round_trips() {
+        // Searched CASE.
+        round_trip("SELECT CASE WHEN n > 0 THEN 'p' WHEN n < 0 THEN 'm' ELSE 'z' END FROM t");
+        // Simple CASE without ELSE.
+        round_trip("SELECT CASE g WHEN 'a' THEN 1 WHEN 'b' THEN 2 END FROM t");
+        // CASE in a WHERE predicate.
+        round_trip("SELECT id FROM t WHERE CASE WHEN flag THEN n ELSE 0 END > 5");
+    }
+
+    #[test]
     fn create_table_single_column() {
         let s = round_trip("CREATE TABLE t (id INT)");
         assert_eq!(

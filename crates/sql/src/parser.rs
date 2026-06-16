@@ -282,6 +282,42 @@ impl Parser {
         Ok(args)
     }
 
+    /// Parse a `CASE` expression (the `CASE` keyword is already consumed).
+    /// Supports both the searched form (`CASE WHEN cond THEN r ... END`) and
+    /// the simple form (`CASE x WHEN v THEN r ... END`).
+    fn parse_case(&mut self) -> Result<Expr> {
+        // A simple-CASE operand is present when a value, not `WHEN`, follows.
+        let operand = if matches!(self.peek(), TokenKind::Keyword(Keyword::When)) {
+            None
+        } else {
+            Some(Box::new(self.parse_expr()?))
+        };
+        let mut whens = Vec::new();
+        while self.eat_keyword(Keyword::When) {
+            let when = self.parse_expr()?;
+            self.expect_keyword(Keyword::Then)?;
+            let then = self.parse_expr()?;
+            whens.push((when, then));
+        }
+        if whens.is_empty() {
+            return Err(SqlError::parse(
+                "CASE requires at least one WHEN branch".to_string(),
+                self.span(),
+            ));
+        }
+        let else_result = if self.eat_keyword(Keyword::Else) {
+            Some(Box::new(self.parse_expr()?))
+        } else {
+            None
+        };
+        self.expect_keyword(Keyword::End)?;
+        Ok(Expr::Case {
+            operand,
+            whens,
+            else_result,
+        })
+    }
+
     /// Parse a prefix position: literals, columns, parens, and the prefix
     /// operators `NOT` and unary `-`.
     fn parse_prefix(&mut self) -> Result<Expr> {
@@ -332,6 +368,10 @@ impl Parser {
             TokenKind::Star => {
                 self.advance();
                 Ok(Expr::Star)
+            }
+            TokenKind::Keyword(Keyword::Case) => {
+                self.advance();
+                self.parse_case()
             }
             TokenKind::Ident(name) => {
                 self.advance();

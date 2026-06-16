@@ -1664,4 +1664,64 @@ mod tests {
         let (_c, present) = query(&mut db, "SELECT id FROM t WHERE LENGTH(name) IS NULL");
         assert_eq!(id_set(&present), vec![4]);
     }
+
+    // --- CASE expressions ---
+
+    #[test]
+    fn searched_case_in_projection() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE t (id INT, n INT)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 5), (2, -3), (3, 0)")
+            .unwrap();
+        let (cols, rows) = query(
+            &mut db,
+            "SELECT id, CASE WHEN n > 0 THEN 'pos' WHEN n < 0 THEN 'neg' ELSE 'zero' END FROM t ORDER BY id",
+        );
+        assert_eq!(names(&cols)[0], "id");
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Int(1), Value::Text("pos".into())],
+                vec![Value::Int(2), Value::Text("neg".into())],
+                vec![Value::Int(3), Value::Text("zero".into())],
+            ]
+        );
+    }
+
+    #[test]
+    fn simple_case_and_missing_else_is_null() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE t (g TEXT)").unwrap();
+        db.execute("INSERT INTO t VALUES ('a'), ('b'), ('c')")
+            .unwrap();
+        // Simple CASE with no ELSE: unmatched 'c' yields NULL.
+        let (_c, rows) = query(
+            &mut db,
+            "SELECT CASE g WHEN 'a' THEN 1 WHEN 'b' THEN 2 END FROM t ORDER BY g",
+        );
+        assert_eq!(
+            rows,
+            vec![vec![Value::Int(1)], vec![Value::Int(2)], vec![Value::Null],]
+        );
+    }
+
+    #[test]
+    fn case_in_where_and_inside_aggregate() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE t (id INT, n INT)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 10), (2, -1), (3, 20), (4, -5)")
+            .unwrap();
+        // CASE in WHERE: keep rows the CASE maps to a positive number.
+        let (_c, rows) = query(
+            &mut db,
+            "SELECT id FROM t WHERE CASE WHEN n > 0 THEN n ELSE 0 END > 0 ORDER BY id",
+        );
+        assert_eq!(id_set(&rows), vec![1, 3]);
+        // Aggregate over a CASE: sum only the positive values.
+        let (_c, agg) = query(
+            &mut db,
+            "SELECT SUM(CASE WHEN n > 0 THEN n ELSE 0 END) FROM t",
+        );
+        assert_eq!(agg, vec![vec![Value::Int(30)]]);
+    }
 }

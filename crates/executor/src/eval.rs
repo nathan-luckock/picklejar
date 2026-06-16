@@ -31,7 +31,51 @@ pub fn eval(expr: &Expr, row: &[Value], columns: &[String]) -> Result<Value> {
         // output column by its rendered name.
         Expr::Func { name, args } => eval_scalar_func(name, args, row, columns)?
             .map_or_else(|| resolve(&expr.to_string(), row, columns), Ok),
+        Expr::Case {
+            operand,
+            whens,
+            else_result,
+        } => eval_case(
+            operand.as_deref(),
+            whens,
+            else_result.as_deref(),
+            row,
+            columns,
+        ),
     }
+}
+
+/// Evaluate a `CASE` expression. The simple form compares `operand` to each
+/// `WHEN` value for equality; the searched form treats each `WHEN` as a
+/// predicate. The first match's `THEN` is returned, else the `ELSE` (or NULL).
+fn eval_case(
+    operand: Option<&Expr>,
+    whens: &[(Expr, Expr)],
+    else_result: Option<&Expr>,
+    row: &[Value],
+    columns: &[String],
+) -> Result<Value> {
+    let target = match operand {
+        Some(op) => Some(eval(op, row, columns)?),
+        None => None,
+    };
+    for (when, then) in whens {
+        let when_val = eval(when, row, columns)?;
+        let matched = match &target {
+            // Simple form: equal, with NULL never matching (SQL semantics).
+            Some(t) => {
+                !matches!(t, Value::Null)
+                    && !matches!(when_val, Value::Null)
+                    && compare(t, &when_val)? == Ordering::Equal
+            }
+            // Searched form: the WHEN is a predicate.
+            None => is_truthy(&when_val),
+        };
+        if matched {
+            return eval(then, row, columns);
+        }
+    }
+    else_result.map_or(Ok(Value::Null), |e| eval(e, row, columns))
 }
 
 /// Evaluate a scalar (non-aggregate) function call, or `Ok(None)` if `name` is

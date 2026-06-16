@@ -175,6 +175,23 @@ fn resolve_expr(expr: &Expr, scope: &[ScopeEntry<'_>]) -> Result<()> {
             }
             Ok(())
         }
+        Expr::Case {
+            operand,
+            whens,
+            else_result,
+        } => {
+            if let Some(op) = operand {
+                resolve_expr(op, scope)?;
+            }
+            for (when, then) in whens {
+                resolve_expr(when, scope)?;
+                resolve_expr(then, scope)?;
+            }
+            if let Some(e) = else_result {
+                resolve_expr(e, scope)?;
+            }
+            Ok(())
+        }
     }
 }
 
@@ -218,6 +235,22 @@ fn collect_aggs_in(expr: &Expr, out: &mut Vec<Expr>) {
             collect_aggs_in(right, out);
         }
         Expr::Unary { expr, .. } => collect_aggs_in(expr, out),
+        Expr::Case {
+            operand,
+            whens,
+            else_result,
+        } => {
+            if let Some(op) = operand {
+                collect_aggs_in(op, out);
+            }
+            for (when, then) in whens {
+                collect_aggs_in(when, out);
+                collect_aggs_in(then, out);
+            }
+            if let Some(e) = else_result {
+                collect_aggs_in(e, out);
+            }
+        }
         _ => {}
     }
 }

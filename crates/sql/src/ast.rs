@@ -189,6 +189,17 @@ pub enum Expr {
         /// Argument expressions (`COUNT(*)` carries a single [`Self::Star`]).
         args: Vec<Self>,
     },
+    /// A `CASE` expression. `operand` is set for the simple form
+    /// (`CASE x WHEN v THEN ...`) and `None` for the searched form
+    /// (`CASE WHEN cond THEN ...`).
+    Case {
+        /// The value compared against each `WHEN` (simple form), or `None`.
+        operand: Option<Box<Self>>,
+        /// `(when, then)` branches, tried in order.
+        whens: Vec<(Self, Self)>,
+        /// The `ELSE` result, or `None` (which yields `NULL`).
+        else_result: Option<Box<Self>>,
+    },
 }
 
 impl Expr {
@@ -240,6 +251,23 @@ impl fmt::Display for Expr {
                     write!(f, "{a}")?;
                 }
                 f.write_str(")")
+            }
+            Self::Case {
+                operand,
+                whens,
+                else_result,
+            } => {
+                f.write_str("CASE")?;
+                if let Some(op) = operand {
+                    write!(f, " {op}")?;
+                }
+                for (w, t) in whens {
+                    write!(f, " WHEN {w} THEN {t}")?;
+                }
+                if let Some(e) = else_result {
+                    write!(f, " ELSE {e}")?;
+                }
+                f.write_str(" END")
             }
         }
     }
