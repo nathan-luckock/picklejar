@@ -155,6 +155,7 @@ fn run_and_print(db: &mut Database, sql: &str) {
         }
         Ok(QueryOutcome::Rows { columns, rows }) => print_table(&columns, &rows),
         Ok(QueryOutcome::Explain(text)) => println!("{text}"),
+        Ok(QueryOutcome::Message(m)) => println!("{m}"),
         Err(e) => println!("Error: {e}"),
     }
 }

@@ -260,6 +260,12 @@ pub enum Statement {
     },
     /// `EXPLAIN <statement>`: plan the inner statement instead of running it.
     Explain(Box<Self>),
+    /// `BEGIN`: start an explicit transaction.
+    Begin,
+    /// `COMMIT`: commit the current transaction.
+    Commit,
+    /// `ROLLBACK`: abort the current transaction.
+    Rollback,
 }
 
 impl fmt::Display for Statement {
@@ -342,6 +348,9 @@ impl fmt::Display for Statement {
                 Ok(())
             }
             Self::Explain(inner) => write!(f, "EXPLAIN {inner}"),
+            Self::Begin => f.write_str("BEGIN"),
+            Self::Commit => f.write_str("COMMIT"),
+            Self::Rollback => f.write_str("ROLLBACK"),
         }
     }
 }
@@ -361,6 +370,18 @@ impl Parser {
             TokenKind::Keyword(Keyword::Explain) => {
                 self.advance();
                 Statement::Explain(Box::new(self.parse_statement()?))
+            }
+            TokenKind::Keyword(Keyword::Begin) => {
+                self.advance();
+                Statement::Begin
+            }
+            TokenKind::Keyword(Keyword::Commit) => {
+                self.advance();
+                Statement::Commit
+            }
+            TokenKind::Keyword(Keyword::Rollback) => {
+                self.advance();
+                Statement::Rollback
             }
             other => {
                 return Err(SqlError::parse(
@@ -1003,6 +1024,13 @@ mod tests {
             parse("explain select * from t").to_string(),
             "EXPLAIN SELECT * FROM t"
         );
+    }
+
+    #[test]
+    fn transaction_control_round_trips() {
+        assert!(matches!(round_trip("BEGIN"), Statement::Begin));
+        assert!(matches!(round_trip("commit"), Statement::Commit));
+        assert!(matches!(round_trip("ROLLBACK"), Statement::Rollback));
     }
 
     #[test]

@@ -75,6 +75,8 @@ pub enum QueryOutcome {
     },
     /// An `EXPLAIN`: the cost-annotated plan tree, ready to print.
     Explain(String),
+    /// A transaction-control statement (`BEGIN` / `COMMIT` / `ROLLBACK`).
+    Message(&'static str),
 }
 
 /// An embedded rustdb instance.
@@ -84,6 +86,10 @@ pub struct Database {
     mgr: TransactionManager,
     catalog: Catalog,
     tables: HashMap<String, TableStore>,
+    /// The open explicit transaction, if the session ran `BEGIN`. In
+    /// auto-commit mode (no explicit transaction) this is `None` and each
+    /// statement runs in its own transaction.
+    current_txn: Option<Transaction>,
     /// Sidecar file recording the catalog and per-table anchor pages.
     meta_path: PathBuf,
 }
@@ -118,6 +124,7 @@ impl Database {
             mgr: TransactionManager::new(),
             catalog: Catalog::new(),
             tables: HashMap::new(),
+            current_txn: None,
             meta_path,
         };
         db.load_catalog()?;
@@ -203,6 +210,12 @@ impl Database {
     pub fn execute(&mut self, sql: &str) -> Result<QueryOutcome> {
         let stmt = Parser::from_sql(sql)?.parse_statement()?;
         match stmt {
+            // Transaction control.
+            Statement::Begin => self.begin_txn(),
+            Statement::Commit => self.commit_txn(),
+            Statement::Rollback => self.rollback_txn(),
+            // DDL auto-commits: it persists immediately regardless of any open
+            // transaction.
             Statement::CreateTable { .. } => self.create_table(&stmt),
             Statement::CreateIndex { .. } => {
                 self.catalog.apply(&stmt)?;
@@ -210,22 +223,91 @@ impl Database {
                 Ok(QueryOutcome::Ddl)
             }
             Statement::DropTable { ref name } => self.drop_table(&stmt, name),
+            // EXPLAIN only plans; it touches no data.
+            Statement::Explain(_) => self.run_explain(&stmt),
+            // DML and SELECT run inside the open transaction, or a fresh
+            // auto-commit one.
+            Statement::Insert { .. }
+            | Statement::Update { .. }
+            | Statement::Delete { .. }
+            | Statement::Select(_) => self.run_in_txn(&stmt),
+        }
+    }
+
+    /// Start an explicit transaction.
+    fn begin_txn(&mut self) -> Result<QueryOutcome> {
+        if self.current_txn.is_some() {
+            return Err(DbError::Unsupported("a transaction is already open".into()));
+        }
+        self.current_txn = Some(self.mgr.begin());
+        Ok(QueryOutcome::Message("BEGIN"))
+    }
+
+    /// Commit the open transaction and make its writes durable.
+    fn commit_txn(&mut self) -> Result<QueryOutcome> {
+        let txn = self
+            .current_txn
+            .take()
+            .ok_or_else(|| DbError::Unsupported("COMMIT without an open transaction".into()))?;
+        self.mgr.commit(&txn);
+        self.persist()?;
+        Ok(QueryOutcome::Message("COMMIT"))
+    }
+
+    /// Abort the open transaction; its writes become invisible.
+    fn rollback_txn(&mut self) -> Result<QueryOutcome> {
+        let txn = self
+            .current_txn
+            .take()
+            .ok_or_else(|| DbError::Unsupported("ROLLBACK without an open transaction".into()))?;
+        self.mgr.abort(&txn);
+        Ok(QueryOutcome::Message("ROLLBACK"))
+    }
+
+    /// Run a DML or SELECT statement inside the open transaction, or, in
+    /// auto-commit mode, inside a fresh transaction that is committed and
+    /// persisted (or aborted on error) immediately.
+    fn run_in_txn(&mut self, stmt: &Statement) -> Result<QueryOutcome> {
+        let explicit = self.current_txn.is_some();
+        let txn = self.current_txn.take().unwrap_or_else(|| self.mgr.begin());
+        let result = self.dispatch(stmt, &txn);
+        if explicit {
+            // Keep the transaction open; COMMIT/ROLLBACK decide its fate.
+            self.current_txn = Some(txn);
+            return result;
+        }
+        match result {
+            Ok(outcome) => {
+                self.mgr.commit(&txn);
+                self.persist()?;
+                Ok(outcome)
+            }
+            Err(e) => {
+                self.mgr.abort(&txn);
+                Err(e)
+            }
+        }
+    }
+
+    /// Dispatch a DML or SELECT statement against `txn`.
+    fn dispatch(&mut self, stmt: &Statement, txn: &Transaction) -> Result<QueryOutcome> {
+        match stmt {
             Statement::Insert {
                 table,
                 columns,
                 rows,
-            } => self.insert(&table, &columns, &rows),
-            Statement::Select(_) => self.run_select(&stmt),
+            } => self.insert(txn, table, columns, rows),
             Statement::Update {
                 table,
                 assignments,
                 where_clause,
-            } => self.run_update(&table, &assignments, where_clause.as_ref()),
+            } => self.run_update(txn, table, assignments, where_clause.as_ref()),
             Statement::Delete {
                 table,
                 where_clause,
-            } => self.run_delete(&table, where_clause.as_ref()),
-            Statement::Explain(_) => self.run_explain(&stmt),
+            } => self.run_delete(txn, table, where_clause.as_ref()),
+            Statement::Select(_) => self.run_select(txn, stmt),
+            other => Err(DbError::Unsupported(format!("cannot run: {other}"))),
         }
     }
 
@@ -280,6 +362,7 @@ impl Database {
 
     fn insert(
         &mut self,
+        txn: &Transaction,
         table: &str,
         columns: &[String],
         rows: &[Vec<Expr>],
@@ -320,8 +403,6 @@ impl Database {
             store.version_page,
         );
 
-        // One transaction for the whole statement: all rows commit together.
-        let txn = self.mgr.begin();
         let mut affected = 0;
         for row in rows {
             if row.len() != positions.len() {
@@ -336,11 +417,10 @@ impl Database {
                 values[pos] = const_eval(expr)?;
             }
             let bytes = encode_row(&values, &schema)?;
-            handle.insert(&txn, store.next_rowid, &bytes)?;
+            handle.insert(txn, store.next_rowid, &bytes)?;
             store.next_rowid += 1;
             affected += 1;
         }
-        self.mgr.commit(&txn);
 
         // Persist the (possibly advanced) anchor pages.
         store.index_root = handle.index_root();
@@ -350,31 +430,30 @@ impl Database {
         // show true costs instead of zero.
         let row_count = store.next_rowid;
         self.catalog.set_row_count(table, row_count)?;
-        self.persist()?;
         Ok(QueryOutcome::Mutation { affected })
     }
 
-    fn run_select(&self, stmt: &Statement) -> Result<QueryOutcome> {
+    fn run_select(&self, txn: &Transaction, stmt: &Statement) -> Result<QueryOutcome> {
         // Bind and plan against the catalog, then run the physical plan over
-        // a reader snapshot. Base tables are read through `EngineSource`.
+        // the transaction's snapshot. Base tables are read through
+        // `EngineSource`.
         let logical = bind(&self.catalog, stmt)?;
         let physical = plan(&logical, &self.catalog)?;
-        let txn = self.mgr.begin();
         let source = EngineSource {
             pool: &self.pool,
             wal: self.wal.clone(),
             mgr: &self.mgr,
             catalog: &self.catalog,
             tables: &self.tables,
-            txn: &txn,
+            txn,
         };
         let (columns, rows) = run(&physical, &source)?;
-        self.mgr.commit(&txn);
         Ok(QueryOutcome::Rows { columns, rows })
     }
 
     fn run_update(
         &mut self,
+        txn: &Transaction,
         table: &str,
         assignments: &[(String, Expr)],
         where_clause: Option<&Expr>,
@@ -410,9 +489,8 @@ impl Database {
             store.index_root,
             store.version_page,
         );
-        let txn = self.mgr.begin();
         let mut affected = 0;
-        for (key, bytes) in handle.scan(&txn)? {
+        for (key, bytes) in handle.scan(txn)? {
             let row = decode_row(&bytes, &schema)?;
             if let Some(pred) = where_clause {
                 if !is_truthy(&eval(pred, &row, &columns)?) {
@@ -425,17 +503,20 @@ impl Database {
             for ((_, expr), &pos) in assignments.iter().zip(&targets) {
                 new_row[pos] = eval(expr, &row, &columns)?;
             }
-            handle.update(&txn, key, &encode_row(&new_row, &schema)?)?;
+            handle.update(txn, key, &encode_row(&new_row, &schema)?)?;
             affected += 1;
         }
-        self.mgr.commit(&txn);
         store.index_root = handle.index_root();
         store.version_page = handle.version_page();
-        self.persist()?;
         Ok(QueryOutcome::Mutation { affected })
     }
 
-    fn run_delete(&mut self, table: &str, where_clause: Option<&Expr>) -> Result<QueryOutcome> {
+    fn run_delete(
+        &mut self,
+        txn: &Transaction,
+        table: &str,
+        where_clause: Option<&Expr>,
+    ) -> Result<QueryOutcome> {
         let (schema, columns) = {
             let meta = self
                 .catalog
@@ -457,22 +538,19 @@ impl Database {
             store.index_root,
             store.version_page,
         );
-        let txn = self.mgr.begin();
         let mut affected = 0;
-        for (key, bytes) in handle.scan(&txn)? {
+        for (key, bytes) in handle.scan(txn)? {
             if let Some(pred) = where_clause {
                 let row = decode_row(&bytes, &schema)?;
                 if !is_truthy(&eval(pred, &row, &columns)?) {
                     continue;
                 }
             }
-            handle.delete(&txn, key)?;
+            handle.delete(txn, key)?;
             affected += 1;
         }
-        self.mgr.commit(&txn);
         store.index_root = handle.index_root();
         store.version_page = handle.version_page();
-        self.persist()?;
         Ok(QueryOutcome::Mutation { affected })
     }
 

@@ -173,6 +173,54 @@ fn group_by_and_whole_table_aggregates() {
     }
 }
 
+/// Run `SELECT id FROM t ORDER BY id` and return the ids.
+fn ids(db: &mut Database) -> Vec<i64> {
+    match db.execute("SELECT id FROM t ORDER BY id").unwrap() {
+        QueryOutcome::Rows { rows, .. } => rows
+            .into_iter()
+            .map(|r| match r[0] {
+                Value::Int(n) => n,
+                ref v => panic!("expected int, got {v:?}"),
+            })
+            .collect(),
+        other => panic!("expected rows, got {other:?}"),
+    }
+}
+
+#[test]
+fn explicit_transactions_commit_and_rollback() {
+    let dir = tempdir().expect("tempdir");
+    let mut db = Database::open(dir.path().join("txn.db")).expect("open");
+    db.execute("CREATE TABLE t (id INT)").unwrap();
+    db.execute("INSERT INTO t VALUES (1)").unwrap();
+
+    // BEGIN ... ROLLBACK discards the write, though it is visible inside the
+    // transaction.
+    assert_eq!(db.execute("BEGIN").unwrap(), QueryOutcome::Message("BEGIN"));
+    db.execute("INSERT INTO t VALUES (2)").unwrap();
+    assert_eq!(ids(&mut db), vec![1, 2]);
+    assert_eq!(
+        db.execute("ROLLBACK").unwrap(),
+        QueryOutcome::Message("ROLLBACK")
+    );
+    assert_eq!(ids(&mut db), vec![1]);
+
+    // BEGIN ... COMMIT keeps the write.
+    db.execute("BEGIN").unwrap();
+    db.execute("INSERT INTO t VALUES (3)").unwrap();
+    assert_eq!(
+        db.execute("COMMIT").unwrap(),
+        QueryOutcome::Message("COMMIT")
+    );
+    assert_eq!(ids(&mut db), vec![1, 3]);
+
+    // COMMIT/ROLLBACK with no open transaction, and a nested BEGIN, error.
+    assert!(db.execute("COMMIT").is_err());
+    assert!(db.execute("ROLLBACK").is_err());
+    db.execute("BEGIN").unwrap();
+    assert!(db.execute("BEGIN").is_err());
+}
+
 #[test]
 fn insert_without_column_list_fills_all_columns() {
     let dir = tempdir().expect("tempdir");

@@ -472,8 +472,21 @@ columns under their bare names.
 transaction manager), an in-memory catalog, and a descriptor per table.
 `execute` parses and routes: DDL updates the catalog and creates or drops the
 backing `MvccTable`; `INSERT` encodes each row and stores it under an
-auto-increment rowid in one auto-commit transaction; `SELECT` binds, plans,
-and runs over a reader snapshot; `EXPLAIN` prints the cost-annotated plan.
+auto-increment rowid; `UPDATE` and `DELETE` scan and rewrite or tombstone the
+matching rows; `SELECT` binds, plans, and runs over the transaction's
+snapshot; `EXPLAIN` prints the cost-annotated plan.
+
+### Transactions
+
+By default each statement runs in its own transaction, committed and persisted
+on success or aborted on error (auto-commit). `BEGIN` opens an explicit
+transaction: subsequent DML and SELECT run inside it and see its own writes,
+and the changes become durable only on `COMMIT`. `ROLLBACK` aborts it, after
+which the rows it wrote are invisible (their version's `xmin` belongs to an
+aborted transaction, so the visibility rule walks past them). This exposes the
+MVCC machinery directly: an explicit transaction is the same `Transaction` the
+manager hands out, held open across statements instead of one per statement.
+DDL auto-commits regardless of an open transaction.
 
 After each statement that changes the schema or a table's data, the engine
 flushes every dirty page to the data file and rewrites a catalog sidecar
