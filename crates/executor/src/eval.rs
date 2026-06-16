@@ -26,10 +26,88 @@ pub fn eval(expr: &Expr, row: &[Value], columns: &[String]) -> Result<Value> {
         Expr::Star => Err(ExecError::Unsupported("`*` used as a value".into())),
         Expr::Unary { op, expr } => eval_unary(*op, expr, row, columns),
         Expr::Binary { op, left, right } => eval_binary(*op, left, right, row, columns),
-        // An aggregate is computed by the Aggregate operator below; above it,
-        // the call resolves to that operator's output column by its name.
-        Expr::Func { .. } => resolve(&expr.to_string(), row, columns),
+        // A scalar function is computed here; anything else (an aggregate call,
+        // computed by the Aggregate operator below) resolves to that operator's
+        // output column by its rendered name.
+        Expr::Func { name, args } => eval_scalar_func(name, args, row, columns)?
+            .map_or_else(|| resolve(&expr.to_string(), row, columns), Ok),
     }
+}
+
+/// Evaluate a scalar (non-aggregate) function call, or `Ok(None)` if `name` is
+/// not a known scalar function (e.g. an aggregate), so the caller can fall back
+/// to resolving it as a column.
+fn eval_scalar_func(
+    name: &str,
+    args: &[Expr],
+    row: &[Value],
+    columns: &[String],
+) -> Result<Option<Value>> {
+    match name {
+        // COALESCE returns the first non-NULL argument; it evaluates lazily.
+        "COALESCE" => {
+            for a in args {
+                let v = eval(a, row, columns)?;
+                if !matches!(v, Value::Null) {
+                    return Ok(Some(v));
+                }
+            }
+            Ok(Some(Value::Null))
+        }
+        "LENGTH" | "UPPER" | "LOWER" | "ABS" | "ROUND" | "CONCAT" | "NULLIF" => {
+            let vals = args
+                .iter()
+                .map(|a| eval(a, row, columns))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Some(apply_scalar(name, &vals)?))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Apply a fixed-arity scalar function to already-evaluated arguments.
+#[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+fn apply_scalar(name: &str, vals: &[Value]) -> Result<Value> {
+    let bad = || ExecError::Type(format!("{name} applied to wrong argument types"));
+    let v = match (name, vals) {
+        ("LENGTH", [Value::Text(s)]) => {
+            Value::Int(i64::try_from(s.chars().count()).unwrap_or(i64::MAX))
+        }
+        ("UPPER", [Value::Text(s)]) => Value::Text(s.to_uppercase()),
+        ("LOWER", [Value::Text(s)]) => Value::Text(s.to_lowercase()),
+        ("ABS", [Value::Int(n)]) => Value::Int(n.wrapping_abs()),
+        ("ABS", [Value::Float(x)]) => Value::Float(x.abs()),
+        ("ROUND", [Value::Int(n)]) => Value::Int(*n),
+        ("ROUND", [Value::Float(x)]) => Value::Float(x.round()),
+        ("ROUND", [Value::Float(x), Value::Int(d)]) => {
+            let f = 10f64.powi(i32::try_from(*d).unwrap_or(0));
+            Value::Float((x * f).round() / f)
+        }
+        ("NULLIF", [a, b]) => {
+            if a == b {
+                Value::Null
+            } else {
+                a.clone()
+            }
+        }
+        ("CONCAT", parts) => {
+            let mut s = String::new();
+            for p in parts {
+                match p {
+                    Value::Null => {} // NULL contributes nothing
+                    Value::Text(t) => s.push_str(t),
+                    Value::Int(n) => s.push_str(&n.to_string()),
+                    Value::Float(x) => s.push_str(&x.to_string()),
+                    Value::Bool(b) => s.push_str(&b.to_string()),
+                }
+            }
+            Value::Text(s)
+        }
+        // A NULL argument to a one-argument function yields NULL.
+        ("LENGTH" | "UPPER" | "LOWER" | "ABS" | "ROUND", [Value::Null, ..]) => Value::Null,
+        _ => return Err(bad()),
+    };
+    Ok(v)
 }
 
 /// Resolve a (possibly qualified) column name to its value in `row`.
