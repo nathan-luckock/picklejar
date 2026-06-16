@@ -105,6 +105,9 @@ pub struct Database {
     current_txn: Option<Transaction>,
     /// Sidecar file recording the catalog and per-table anchor pages.
     meta_path: PathBuf,
+    /// Sidecar file recording the transaction watermark and aborted xids, so
+    /// committed data stays visible across a reopen.
+    txn_path: PathBuf,
 }
 
 impl std::fmt::Debug for Database {
@@ -127,6 +130,7 @@ impl Database {
         let base = base.as_ref();
         let wal_path = base.with_extension("wal");
         let meta_path = base.with_extension("meta");
+        let txn_path = base.with_extension("txn");
         let writer = WalWriter::open(&wal_path)?;
         let wal = WalSyncHandle::new(writer);
         let file = FileManager::open(base)?;
@@ -139,8 +143,13 @@ impl Database {
             tables: HashMap::new(),
             current_txn: None,
             meta_path,
+            txn_path,
         };
         db.load_catalog()?;
+        // Restore the transaction watermark so data committed in a previous
+        // session stays visible (its xids would otherwise read as aborted).
+        let (next_xid, aborted) = persist::load_txn(&db.txn_path)?;
+        db.mgr.recover(next_xid, &aborted);
         Ok(db)
     }
 
@@ -246,6 +255,13 @@ impl Database {
             })
             .collect();
         persist::save(&self.meta_path, &records)?;
+        // Save the transaction watermark (the next xid) and the aborted set, so
+        // a reopen knows which past transactions committed.
+        persist::save_txn(
+            &self.txn_path,
+            self.mgr.next_xid(),
+            &self.mgr.aborted_xids(),
+        )?;
         Ok(())
     }
 
@@ -1191,5 +1207,53 @@ mod tests {
         assert!(plan.contains("IndexScan"), "plan was:\n{plan}");
         let (_c, rows) = query(&mut db, "SELECT name FROM t WHERE id = 42");
         assert_eq!(rows, vec![vec![Value::Text("n42".into())]]);
+    }
+
+    // --- transaction durability across reopen ---
+
+    #[test]
+    fn data_from_many_transactions_survives_reopen() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("d.db");
+        {
+            let mut db = Database::open(&path).expect("open");
+            db.execute("CREATE TABLE t (id INT, name TEXT)").unwrap();
+            // Each insert is its own auto-commit transaction, so the rows span
+            // 50 distinct xids. Before the watermark fix, reopening made all of
+            // them invisible (their xids read as aborted).
+            for i in 0..50i64 {
+                db.execute(&format!("INSERT INTO t VALUES ({i}, 'n{i}')"))
+                    .unwrap();
+            }
+        }
+        let mut db = Database::open(&path).expect("reopen");
+        let (_c, rows) = query(&mut db, "SELECT id FROM t");
+        assert_eq!(rows.len(), 50, "rows from every transaction should survive");
+        let (_c, one) = query(&mut db, "SELECT name FROM t WHERE id = 30");
+        assert_eq!(one, vec![vec![Value::Text("n30".into())]]);
+    }
+
+    #[test]
+    fn rolled_back_data_does_not_reappear_after_reopen() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("r.db");
+        {
+            let mut db = Database::open(&path).expect("open");
+            db.execute("CREATE TABLE t (id INT)").unwrap();
+            db.execute("INSERT INTO t VALUES (1)").unwrap(); // committed
+            db.execute("BEGIN").unwrap();
+            db.execute("INSERT INTO t VALUES (999)").unwrap(); // to be rolled back
+            db.execute("ROLLBACK").unwrap();
+            // This commit's flush writes the rolled-back version's page to disk
+            // and persists the aborted xid, so the reopen must hide it by xid.
+            db.execute("INSERT INTO t VALUES (2)").unwrap(); // committed
+        }
+        let mut db = Database::open(&path).expect("reopen");
+        let (_c, rows) = query(&mut db, "SELECT id FROM t ORDER BY id");
+        assert_eq!(
+            rows,
+            vec![vec![Value::Int(1)], vec![Value::Int(2)]],
+            "the rolled-back row 999 must not reappear"
+        );
     }
 }

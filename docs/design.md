@@ -565,12 +565,18 @@ the planner can cost an `IndexScan`, and persists its root page in the sidecar.
 - Both join algorithms run through the nested-loop executor. The result is
   correct and the planner's hash-vs-loop choice is shown by EXPLAIN; the hash
   build/probe is a deferred runtime optimization, exactly like the index scan.
-- Schema and data survive a clean restart (flush plus catalog sidecar). Full
-  crash-consistency at the SQL level, where the index pages are rebuilt from
-  the WAL after a mid-statement kill, is the remaining durability step: the
-  WAL currently logs heap version writes but not B+ tree index pages, so the
-  raw forced-kill recovery (proven in Sprint 4) covers the heap, while the
-  index relies on the per-statement flush.
+- Schema and data survive a clean restart (flush plus catalog sidecar). A
+  reopen also restores MVCC visibility: the transaction watermark (the next
+  xid) and the aborted-xid set are persisted, so on reopen every xid below the
+  watermark reads as committed except the recorded aborts. Without this the
+  manager's xid counter resets and previously committed rows read as aborted,
+  losing all data committed across more than one transaction; with it, data
+  committed across many transactions survives and rolled-back data stays
+  hidden. Full crash-consistency at the SQL level (rebuilding index pages from
+  the WAL after a mid-statement kill) is the remaining durability step: the WAL
+  logs heap version writes but not B+ tree index pages, so the raw forced-kill
+  recovery (proven in Sprint 4) covers the heap, while the index relies on the
+  per-statement flush.
 
 ### CLI
 

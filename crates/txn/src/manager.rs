@@ -91,6 +91,10 @@ struct Inner {
     next_xid: Xid,
     status: HashMap<Xid, TxnState>,
     active: BTreeSet<Xid>,
+    /// On reopen, every xid below this watermark is treated as committed
+    /// unless `status` records otherwise (see [`TransactionManager::recover`]).
+    /// Zero for a fresh manager, so unknown xids stay aborted.
+    committed_floor: Xid,
 }
 
 /// Allocates xids, tracks transaction state, and hands out snapshots.
@@ -126,8 +130,44 @@ impl TransactionManager {
                 next_xid: 1,
                 status: HashMap::new(),
                 active: BTreeSet::new(),
+                committed_floor: 0,
             }),
         }
+    }
+
+    /// Restore committed state after reopening a database.
+    ///
+    /// `next_xid` is the watermark saved at the last commit: every xid below it
+    /// had finished (committed or aborted) at that point, so it is safe to
+    /// treat them all as committed except the `aborted` ones recorded here.
+    /// New transactions continue from `next_xid`, so their ids never collide
+    /// with the previous session's. Any xid at or above the watermark (for
+    /// example a transaction that was still open, or whose pages leaked to disk
+    /// via eviction, when the process ended) stays aborted and invisible.
+    pub fn recover(&self, next_xid: Xid, aborted: &[Xid]) {
+        let mut inner = self.inner.borrow_mut();
+        inner.next_xid = next_xid;
+        inner.committed_floor = next_xid;
+        for &x in aborted {
+            inner.status.insert(x, TxnState::Aborted);
+        }
+    }
+
+    /// The next xid to be assigned: the watermark to persist at a commit.
+    #[must_use]
+    pub fn next_xid(&self) -> Xid {
+        self.inner.borrow().next_xid
+    }
+
+    /// The xids known to have aborted, for persisting alongside the watermark.
+    #[must_use]
+    pub fn aborted_xids(&self) -> Vec<Xid> {
+        self.inner
+            .borrow()
+            .status
+            .iter()
+            .filter_map(|(&xid, &state)| (state == TxnState::Aborted).then_some(xid))
+            .collect()
     }
 
     /// Begin a transaction with the default isolation level
@@ -188,16 +228,21 @@ impl TransactionManager {
         inner.active.remove(&txn.xid);
     }
 
-    /// The recorded state of `xid`. An xid that never existed reads as
-    /// [`TxnState::Aborted`] (the safe default: its writes are invisible).
+    /// The recorded state of `xid`. An xid not in the status table reads as
+    /// [`TxnState::Committed`] when it is below the recovered watermark (it was
+    /// a durably committed transaction from a previous session), otherwise as
+    /// [`TxnState::Aborted`] (the safe default: its writes are invisible). For
+    /// a fresh manager the watermark is zero, so unknown xids read as aborted.
     #[must_use]
     pub fn state(&self, xid: Xid) -> TxnState {
-        self.inner
-            .borrow()
-            .status
-            .get(&xid)
-            .copied()
-            .unwrap_or(TxnState::Aborted)
+        let inner = self.inner.borrow();
+        inner.status.get(&xid).copied().unwrap_or({
+            if xid < inner.committed_floor {
+                TxnState::Committed
+            } else {
+                TxnState::Aborted
+            }
+        })
     }
 
     /// Number of currently-active transactions. Handy for tests and stats.
@@ -274,6 +319,40 @@ mod tests {
         let mgr = TransactionManager::new();
         assert_eq!(mgr.state(999), TxnState::Aborted);
         assert_eq!(mgr.state(0), TxnState::Aborted);
+    }
+
+    #[test]
+    fn recover_treats_old_xids_as_committed_except_aborts() {
+        let mgr = TransactionManager::new();
+        mgr.recover(100, &[42, 43]);
+        // Below the watermark and not in the aborted set: committed.
+        assert_eq!(mgr.state(10), TxnState::Committed);
+        assert_eq!(mgr.state(99), TxnState::Committed);
+        // Explicitly aborted in the previous session.
+        assert_eq!(mgr.state(42), TxnState::Aborted);
+        assert_eq!(mgr.state(43), TxnState::Aborted);
+        // At or above the watermark: still aborted (never committed).
+        assert_eq!(mgr.state(100), TxnState::Aborted);
+        assert_eq!(mgr.state(200), TxnState::Aborted);
+        // New transactions continue from the watermark.
+        assert_eq!(mgr.next_xid(), 100);
+        assert_eq!(mgr.begin().xid(), 100);
+    }
+
+    #[test]
+    fn aborted_xids_round_trips_through_recover() {
+        let mgr = TransactionManager::new();
+        let a = mgr.begin();
+        let b = mgr.begin();
+        mgr.commit(&a);
+        mgr.abort(&b);
+        let aborted = mgr.aborted_xids();
+        assert_eq!(aborted, vec![b.xid()]);
+        // A fresh manager restored from those facts agrees.
+        let restored = TransactionManager::new();
+        restored.recover(mgr.next_xid(), &aborted);
+        assert_eq!(restored.state(a.xid()), TxnState::Committed);
+        assert_eq!(restored.state(b.xid()), TxnState::Aborted);
     }
 
     #[test]

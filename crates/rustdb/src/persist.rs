@@ -170,6 +170,47 @@ pub fn load(path: &Path) -> io::Result<Vec<TableRecord>> {
     Ok(records)
 }
 
+/// Persist the transaction watermark and the aborted-xid set to `path`,
+/// atomically (temp file then rename). The single line is `next_xid` followed
+/// by the aborted xids, all space-separated.
+///
+/// # Errors
+///
+/// Returns an I/O error if the file cannot be written or renamed.
+pub fn save_txn(path: &Path, next_xid: u64, aborted: &[u64]) -> io::Result<()> {
+    let mut out = String::new();
+    let _ = write!(out, "{next_xid}");
+    for x in aborted {
+        let _ = write!(out, " {x}");
+    }
+    out.push('\n');
+    let tmp = path.with_extension("txn.tmp");
+    fs::write(&tmp, out.as_bytes())?;
+    fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// Read the transaction watermark and aborted xids. An absent file yields the
+/// fresh-database default `(1, [])`.
+///
+/// # Errors
+///
+/// Returns an I/O error if the file exists but cannot be read or parsed.
+pub fn load_txn(path: &Path) -> io::Result<(u64, Vec<u64>)> {
+    let text = match fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((1, Vec::new())),
+        Err(e) => return Err(e),
+    };
+    let mut nums = text.split_whitespace().map(parse_u64);
+    let next_xid = match nums.next() {
+        Some(n) => n?,
+        None => return Ok((1, Vec::new())),
+    };
+    let aborted = nums.collect::<io::Result<Vec<u64>>>()?;
+    Ok((next_xid, aborted))
+}
+
 fn invalid() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, "malformed catalog metadata")
 }
