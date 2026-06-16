@@ -1590,4 +1590,78 @@ mod tests {
         };
         assert!(plan.contains("Distinct"), "plan was:\n{plan}");
     }
+
+    // --- scalar functions ---
+
+    #[test]
+    fn string_and_numeric_scalar_functions() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE t (name TEXT, n INT, x FLOAT)")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES ('Alice', -7, 2.34567)")
+            .unwrap();
+        let (_c, rows) = query(
+            &mut db,
+            "SELECT LENGTH(name), UPPER(name), LOWER(name), ABS(n), ROUND(x), ROUND(x, 2) FROM t",
+        );
+        assert_eq!(
+            rows[0],
+            vec![
+                Value::Int(5),
+                Value::Text("ALICE".into()),
+                Value::Text("alice".into()),
+                Value::Int(7),
+                Value::Float(2.0),
+                Value::Float(2.35),
+            ]
+        );
+    }
+
+    #[test]
+    fn coalesce_nullif_and_concat() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE t (a TEXT, b TEXT)").unwrap();
+        db.execute("INSERT INTO t (a, b) VALUES ('x', 'y')")
+            .unwrap();
+        db.execute("INSERT INTO t (b) VALUES ('z')").unwrap(); // a is NULL
+        let (_c, rows) = query(
+            &mut db,
+            "SELECT COALESCE(a, b), NULLIF(a, 'x'), CONCAT(a, '-', b) FROM t ORDER BY b",
+        );
+        // row1: a='x',b='y' -> COALESCE 'x', NULLIF 'x'='x' -> NULL, CONCAT 'x-y'
+        assert_eq!(
+            rows[0],
+            vec![
+                Value::Text("x".into()),
+                Value::Null,
+                Value::Text("x-y".into())
+            ]
+        );
+        // row2: a=NULL,b='z' -> COALESCE 'z', NULLIF NULL, CONCAT '-z' (NULL skipped)
+        assert_eq!(
+            rows[1],
+            vec![
+                Value::Text("z".into()),
+                Value::Null,
+                Value::Text("-z".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn scalar_function_in_where_and_null_propagation() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE t (id INT, name TEXT)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'banana'), (2, 'fig'), (3, 'cherry')")
+            .unwrap();
+        let (_c, rows) = query(
+            &mut db,
+            "SELECT id FROM t WHERE LENGTH(name) > 4 ORDER BY id",
+        );
+        assert_eq!(id_set(&rows), vec![1, 3]);
+        // LENGTH(NULL) is NULL, which excludes the row from a WHERE.
+        db.execute("INSERT INTO t (id) VALUES (4)").unwrap();
+        let (_c, present) = query(&mut db, "SELECT id FROM t WHERE LENGTH(name) IS NULL");
+        assert_eq!(id_set(&present), vec![4]);
+    }
 }
