@@ -85,6 +85,8 @@ pub enum PhysicalPlan {
     Limit {
         /// Row cap.
         n: u64,
+        /// Rows to skip first.
+        offset: u64,
         /// Child plan.
         input: Box<Self>,
         /// Estimated output rows.
@@ -269,12 +271,14 @@ pub fn plan(logical: &LogicalPlan, catalog: &Catalog) -> Result<PhysicalPlan> {
             })
         }
 
-        LogicalPlan::Limit { n, input } => {
+        LogicalPlan::Limit { n, offset, input } => {
             let child = plan(input, catalog)?;
-            let est_rows = child.est_rows().min(*n);
+            // After skipping `offset`, at most `n` rows remain.
+            let est_rows = child.est_rows().saturating_sub(*offset).min(*n);
             let est_cost = child.est_cost();
             Ok(PhysicalPlan::Limit {
                 n: *n,
+                offset: *offset,
                 input: Box::new(child),
                 est_rows,
                 est_cost,

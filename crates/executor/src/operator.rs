@@ -257,9 +257,10 @@ fn sort_cmp(a: &Value, b: &Value) -> Ordering {
     }
 }
 
-/// Emit at most `remaining` rows, then stop.
+/// Skip `to_skip` rows, then emit at most `remaining` more.
 struct Limit {
     input: Box<dyn Executor>,
+    to_skip: u64,
     remaining: u64,
 }
 
@@ -268,6 +269,13 @@ impl Executor for Limit {
         self.input.columns()
     }
     fn next(&mut self) -> Result<Option<Row>> {
+        // Drain the OFFSET first.
+        while self.to_skip > 0 {
+            match self.input.next()? {
+                Some(_) => self.to_skip -= 1,
+                None => return Ok(None),
+            }
+        }
         if self.remaining == 0 {
             return Ok(None);
         }
@@ -709,8 +717,11 @@ pub fn build(plan: &PhysicalPlan, source: &dyn TableSource) -> Result<Box<dyn Ex
             keys: keys.clone(),
             buffered: None,
         })),
-        PhysicalPlan::Limit { n, input, .. } => Ok(Box::new(Limit {
+        PhysicalPlan::Limit {
+            n, offset, input, ..
+        } => Ok(Box::new(Limit {
             input: build(input, source)?,
+            to_skip: *offset,
             remaining: *n,
         })),
         PhysicalPlan::Distinct { input, .. } => Ok(Box::new(Distinct {

@@ -86,8 +86,14 @@ fn render(plan: &PhysicalPlan, depth: usize, out: &mut String) {
             let _ = writeln!(out, "{pad}Sort {ks}  {stats}");
             render(input, depth + 1, out);
         }
-        PhysicalPlan::Limit { n, input, .. } => {
-            let _ = writeln!(out, "{pad}Limit {n}  {stats}");
+        PhysicalPlan::Limit {
+            n, offset, input, ..
+        } => {
+            if *offset > 0 {
+                let _ = writeln!(out, "{pad}Limit {n} OFFSET {offset}  {stats}");
+            } else {
+                let _ = writeln!(out, "{pad}Limit {n}  {stats}");
+            }
             render(input, depth + 1, out);
         }
         PhysicalPlan::Distinct { input, .. } => {

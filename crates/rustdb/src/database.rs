@@ -1724,4 +1724,42 @@ mod tests {
         );
         assert_eq!(agg, vec![vec![Value::Int(30)]]);
     }
+
+    // --- string concat (||) and LIMIT OFFSET ---
+
+    #[test]
+    fn string_concatenation() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE t (a TEXT, b TEXT, n INT)")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES ('foo', 'bar', 7)")
+            .unwrap();
+        db.execute("INSERT INTO t (b, n) VALUES ('x', 1)").unwrap(); // a is NULL
+        let (_c, rows) = query(&mut db, "SELECT a || '-' || b FROM t ORDER BY b");
+        // row b='bar': 'foo-bar'; row b='x': a is NULL, so the whole || is NULL
+        assert_eq!(
+            rows,
+            vec![vec![Value::Text("foo-bar".into())], vec![Value::Null]]
+        );
+        // Concatenating a number coerces it to text.
+        let (_c, mixed) = query(&mut db, "SELECT b || n FROM t WHERE n = 7");
+        assert_eq!(mixed, vec![vec![Value::Text("bar7".into())]]);
+    }
+
+    #[test]
+    fn limit_offset() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE t (id INT)").unwrap();
+        db.execute("INSERT INTO t VALUES (1), (2), (3), (4), (5)")
+            .unwrap();
+        // Skip 1, take 2.
+        let (_c, page) = query(&mut db, "SELECT id FROM t ORDER BY id LIMIT 2 OFFSET 1");
+        assert_eq!(id_set(&page), vec![2, 3]);
+        // OFFSET past the end yields nothing.
+        let (_c, none) = query(&mut db, "SELECT id FROM t ORDER BY id LIMIT 2 OFFSET 10");
+        assert!(none.is_empty());
+        // OFFSET with no LIMIT skips and returns the rest.
+        let (_c, rest) = query(&mut db, "SELECT id FROM t ORDER BY id OFFSET 3");
+        assert_eq!(id_set(&rest), vec![4, 5]);
+    }
 }

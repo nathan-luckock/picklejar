@@ -226,7 +226,19 @@ fn eval_binary(
         BinOp::Ge => Ok(Value::Bool(compare(&l, &r)? != Ordering::Less)),
         BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => arithmetic(op, &l, &r),
         BinOp::Like => like(&l, &r),
+        BinOp::Concat => Ok(Value::Text(value_text(&l) + &value_text(&r))),
         BinOp::And | BinOp::Or => unreachable!("handled above"),
+    }
+}
+
+/// Render a non-NULL value as the text `||` and `CONCAT` use.
+fn value_text(v: &Value) -> String {
+    match v {
+        Value::Text(t) => t.clone(),
+        Value::Int(n) => n.to_string(),
+        Value::Float(x) => x.to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::Null => String::new(),
     }
 }
 

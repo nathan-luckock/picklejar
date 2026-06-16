@@ -127,6 +127,7 @@ fn select() -> impl Strategy<Value = Select> {
         proptest::option::of(expr()),
         prop::collection::vec(order_item(), 0..2),
         proptest::option::of(0u64..1000),
+        proptest::option::of(0u64..1000),
     )
         .prop_map(
             |(
@@ -139,6 +140,7 @@ fn select() -> impl Strategy<Value = Select> {
                 having,
                 order_by,
                 limit,
+                offset,
             )| Select {
                 distinct,
                 projections,
@@ -149,6 +151,7 @@ fn select() -> impl Strategy<Value = Select> {
                 having,
                 order_by,
                 limit,
+                offset,
             },
         )
 }

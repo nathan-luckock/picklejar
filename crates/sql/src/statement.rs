@@ -129,6 +129,8 @@ pub struct Select {
     pub order_by: Vec<OrderItem>,
     /// LIMIT (None if none).
     pub limit: Option<u64>,
+    /// OFFSET: rows to skip before LIMIT (None if none).
+    pub offset: Option<u64>,
 }
 
 impl fmt::Display for Select {
@@ -173,6 +175,9 @@ impl fmt::Display for Select {
         }
         if let Some(n) = self.limit {
             write!(f, " LIMIT {n}")?;
+        }
+        if let Some(n) = self.offset {
+            write!(f, " OFFSET {n}")?;
         }
         Ok(())
     }
@@ -442,6 +447,7 @@ impl Parser {
         };
         let order_by = self.parse_order_by()?;
         let limit = self.parse_limit()?;
+        let offset = self.parse_offset()?;
         Ok(Select {
             distinct,
             projections,
@@ -452,6 +458,7 @@ impl Parser {
             having,
             order_by,
             limit,
+            offset,
         })
     }
 
@@ -520,6 +527,18 @@ impl Parser {
         if !self.eat_keyword(Keyword::Limit) {
             return Ok(None);
         }
+        self.parse_row_count("LIMIT")
+    }
+
+    fn parse_offset(&mut self) -> Result<Option<u64>> {
+        if !self.eat_keyword(Keyword::Offset) {
+            return Ok(None);
+        }
+        self.parse_row_count("OFFSET")
+    }
+
+    /// Parse the non-negative integer following `LIMIT` / `OFFSET`.
+    fn parse_row_count(&mut self, clause: &str) -> Result<Option<u64>> {
         match self.peek().clone() {
             TokenKind::Int(n) if n >= 0 => {
                 self.advance();
@@ -528,7 +547,7 @@ impl Parser {
                 Ok(Some(n as u64))
             }
             other => Err(SqlError::parse(
-                format!("expected a non-negative integer after LIMIT, found {other:?}"),
+                format!("expected a non-negative integer after {clause}, found {other:?}"),
                 self.span(),
             )),
         }
@@ -798,6 +817,13 @@ mod tests {
         let second = parse(&printed);
         assert_eq!(first, second, "round-trip mismatch: {src:?} -> {printed:?}");
         first
+    }
+
+    #[test]
+    fn concat_and_offset_round_trip() {
+        round_trip("SELECT a || '-' || b FROM t");
+        round_trip("SELECT id FROM t ORDER BY id LIMIT 5 OFFSET 10");
+        round_trip("SELECT id FROM t OFFSET 3");
     }
 
     #[test]

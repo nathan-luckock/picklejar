@@ -121,10 +121,12 @@ fn bind_select(catalog: &Catalog, select: &Select) -> Result<LogicalPlan> {
         };
     }
 
-    // 6. LIMIT.
-    if let Some(n) = select.limit {
+    // 6. LIMIT / OFFSET. A single node skips `offset` rows then caps at `n`;
+    //    OFFSET with no LIMIT leaves the cap unbounded.
+    if select.limit.is_some() || select.offset.is_some() {
         plan = LogicalPlan::Limit {
-            n,
+            n: select.limit.unwrap_or(u64::MAX),
+            offset: select.offset.unwrap_or(0),
             input: Box::new(plan),
         };
     }

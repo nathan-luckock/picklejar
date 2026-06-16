@@ -101,6 +101,8 @@ pub enum BinOp {
     Div,
     /// `LIKE` (SQL pattern match: `%` any run, `_` any one character)
     Like,
+    /// `||` string concatenation
+    Concat,
 }
 
 impl fmt::Display for BinOp {
@@ -119,6 +121,7 @@ impl fmt::Display for BinOp {
             Self::Mul => "*",
             Self::Div => "/",
             Self::Like => "LIKE",
+            Self::Concat => "||",
         };
         f.write_str(s)
     }

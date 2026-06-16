@@ -414,6 +414,7 @@ const fn infix_binding_power(kind: &TokenKind) -> Option<(BinOp, u8, u8)> {
     let (op, l_bp) = match kind {
         TokenKind::Keyword(Keyword::Or) => (BinOp::Or, 1),
         TokenKind::Keyword(Keyword::And) => (BinOp::And, 3),
+        TokenKind::Concat => (BinOp::Concat, 6),
         TokenKind::Eq => (BinOp::Eq, 5),
         TokenKind::NotEq => (BinOp::Ne, 5),
         TokenKind::Lt => (BinOp::Lt, 5),

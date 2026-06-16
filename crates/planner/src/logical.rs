@@ -66,10 +66,13 @@ pub enum LogicalPlan {
         /// Child plan.
         input: Box<Self>,
     },
-    /// Keep at most `n` rows.
+    /// Skip `offset` rows then keep at most `n` (`u64::MAX` for OFFSET with no
+    /// LIMIT).
     Limit {
         /// Row cap.
         n: u64,
+        /// Rows to skip first.
+        offset: u64,
         /// Child plan.
         input: Box<Self>,
     },
@@ -141,8 +144,12 @@ impl LogicalPlan {
                 writeln!(f, "{pad}Sort {ks}")?;
                 input.fmt_indented(f, depth + 1)
             }
-            Self::Limit { n, input } => {
-                writeln!(f, "{pad}Limit {n}")?;
+            Self::Limit { n, offset, input } => {
+                if *offset > 0 {
+                    writeln!(f, "{pad}Limit {n} OFFSET {offset}")?;
+                } else {
+                    writeln!(f, "{pad}Limit {n}")?;
+                }
                 input.fmt_indented(f, depth + 1)
             }
             Self::Distinct { input } => {

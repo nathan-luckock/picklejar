@@ -54,6 +54,7 @@ impl<'a> Lexer<'a> {
                 b'<' => self.less(),
                 b'>' => self.greater(),
                 b'!' => self.bang()?,
+                b'|' => self.pipe()?,
                 b'\'' => self.string()?,
                 b'0'..=b'9' => self.number()?,
                 c if is_ident_start(c) => self.word(),
@@ -140,6 +141,18 @@ impl<'a> Lexer<'a> {
             Ok(TokenKind::NotEq)
         } else {
             Err(SqlError::UnexpectedChar { ch: '!', pos })
+        }
+    }
+
+    fn pipe(&mut self) -> Result<TokenKind> {
+        let pos = self.pos;
+        self.bump();
+        if self.peek() == Some(b'|') {
+            self.bump();
+            Ok(TokenKind::Concat)
+        } else {
+            // A single `|` is not an operator in this dialect.
+            Err(SqlError::UnexpectedChar { ch: '|', pos })
         }
     }
 

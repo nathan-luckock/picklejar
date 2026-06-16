@@ -49,6 +49,7 @@ pub enum Keyword {
     Asc,
     Desc,
     Limit,
+    Offset,
     Explain,
     Begin,
     Commit,
@@ -113,6 +114,7 @@ impl Keyword {
             "asc" => Self::Asc,
             "desc" => Self::Desc,
             "limit" => Self::Limit,
+            "offset" => Self::Offset,
             "explain" => Self::Explain,
             "begin" => Self::Begin,
             "commit" => Self::Commit,
@@ -183,6 +185,8 @@ pub enum TokenKind {
     Star,
     /// `/`
     Slash,
+    /// `||` (string concatenation)
+    Concat,
     /// `(`
     LParen,
     /// `)`
