@@ -33,9 +33,10 @@ Non-goals: distributed replication, network protocol compatibility with Postgres
 | 6 | MVCC polish: write-write conflict detection, version garbage collection | Deferred |
 | 7 | SQL parser: lexer, Pratt expressions, DDL, DML, SELECT with JOIN/GROUP/ORDER/LIMIT | Shipped (PRs #62-#67) |
 | 8 | Cost-based planner (M6): catalog, logical plan, cost model, join selection, EXPLAIN | Shipped (PRs #73-#77) |
-| 9 | Executor and CLI (M1): row codec, MVCC scan, engine, Volcano operators, joins, aggregates, catalog persistence, CLI | Shipped (PRs #85-#99); a true index-scan runtime path remains |
-| 10 | Torture-test extension and polish | Planned |
-| 11 | Demo, write-up, and presentation | Planned |
+| 9 | Executor and CLI (M1): row codec, MVCC scan, engine, Volcano operators, joins, aggregates, catalog persistence, CLI | Shipped (PRs #85-#99) |
+| 10 | Deepen the engine: full DML, explicit transactions, constraints, types, real indexes | In progress (DML, BEGIN/COMMIT/ROLLBACK, PRIMARY KEY/UNIQUE/NOT NULL shipped; more types, real index-scan runtime, and concurrency remain) |
+| 11 | Studio: HTTP API and web UI | Planned |
+| 12 | Demo, write-up, and presentation | Planned |
 
 ---
 
