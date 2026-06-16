@@ -547,6 +547,25 @@ and reopening the database.
 table, `EXPLAIN <select>` prints the plan, and backslash meta-commands
 (`\dt`, `\d <table>`, `\q`) introspect and exit. This is the M1 demo surface.
 
+### HTTP API server
+
+`rustdb-server` exposes the engine over HTTP/JSON so a browser studio can use
+it. Because the engine is `!Send` (the buffer pool holds `Rc`), the server is
+single-threaded: one accept loop owns one `Database` and processes requests in
+order. The HTTP layer and the JSON writer are hand-written, so the database and
+its API have no external dependencies beyond CLI and logging plumbing.
+
+- `POST /api/query` runs the request body as SQL and returns the outcome as
+  JSON, tagged by `type`: `rows` (with `columns` and `rows`), `mutation` (with
+  `affected`), `ok`, `explain` (with `plan`), `message` (transaction control),
+  or `error`.
+- `GET /api/tables` returns the schema.
+- Responses carry permissive CORS headers so a frontend on a different origin
+  (a Vite dev server) can call the API.
+
+This is the boundary the studio UI is built on: a SQL editor posts to
+`/api/query` and renders the tagged result.
+
 ---
 
 ## Testing strategy

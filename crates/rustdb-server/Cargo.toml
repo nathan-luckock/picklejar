@@ -1,0 +1,22 @@
+[package]
+name = "rustdb-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "HTTP/JSON API server for the rustdb engine, the backend for the studio UI."
+
+[[bin]]
+name = "rustdb-server"
+path = "src/main.rs"
+
+[dependencies]
+rustdb.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

@@ -9,6 +9,7 @@ members = [
     "crates/executor",
     "crates/rustdb",
     "crates/rustdb-cli",
+    "crates/rustdb-server",
 ]
 
 [workspace.package]
@@ -16,7 +17,7 @@ version = "0.0.1"
 edition = "2021"
 rust-version = "1.80"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/Nathan7108/capstone"
+repository = "https://github.com/nathan-luckock/capstone"
 authors = ["Nathan Luckock <nathanluckock@gmail.com>"]
 
 [workspace.dependencies]
