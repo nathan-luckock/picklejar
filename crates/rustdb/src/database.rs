@@ -893,7 +893,8 @@ fn const_eval(expr: &Expr) -> Result<Value> {
             expr,
         } => match const_eval(expr)? {
             Value::Int(n) => Ok(Value::Int(n.wrapping_neg())),
-            _ => Err(DbError::Unsupported("unary minus on a non-integer".into())),
+            Value::Float(x) => Ok(Value::Float(-x)),
+            _ => Err(DbError::Unsupported("unary minus on a non-number".into())),
         },
         Expr::Unary {
             op: UnOp::Not,
@@ -1243,6 +1244,148 @@ mod tests {
             rows,
             vec![vec![Value::Int(1)], vec![Value::Int(2)]],
             "the rolled-back row 999 must not reappear"
+        );
+    }
+
+    // --- FLOAT and BOOL column types ---
+
+    fn approx(rows: &[Vec<Value>], col: usize) -> Vec<f64> {
+        rows.iter()
+            .map(|r| match r[col] {
+                Value::Float(x) => x,
+                ref other => panic!("expected float, got {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn float_and_bool_round_trip_through_sql() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE p (name TEXT, price FLOAT, active BOOL)")
+            .unwrap();
+        db.execute("INSERT INTO p VALUES ('a', 9.99, TRUE), ('b', 14.5, FALSE), ('c', -2.0, TRUE)")
+            .unwrap();
+        let (cols, rows) = query(&mut db, "SELECT name, price, active FROM p ORDER BY name");
+        assert_eq!(names(&cols), ["name", "price", "active"]);
+        assert_eq!(
+            rows,
+            vec![
+                vec![
+                    Value::Text("a".into()),
+                    Value::Float(9.99),
+                    Value::Bool(true)
+                ],
+                vec![
+                    Value::Text("b".into()),
+                    Value::Float(14.5),
+                    Value::Bool(false)
+                ],
+                vec![
+                    Value::Text("c".into()),
+                    Value::Float(-2.0),
+                    Value::Bool(true)
+                ],
+            ]
+        );
+    }
+
+    #[test]
+    fn float_predicate_and_order_by() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE p (name TEXT, price FLOAT)")
+            .unwrap();
+        db.execute("INSERT INTO p VALUES ('a', 9.99), ('b', 14.5), ('c', 3.25)")
+            .unwrap();
+        // A float comparison, and a mixed float-vs-int comparison.
+        let (_c, rows) = query(
+            &mut db,
+            "SELECT name FROM p WHERE price > 5.0 ORDER BY price",
+        );
+        assert_eq!(
+            rows,
+            vec![vec![Value::Text("a".into())], vec![Value::Text("b".into())]]
+        );
+        let (_c, rows2) = query(
+            &mut db,
+            "SELECT name FROM p WHERE price < 10 ORDER BY price DESC",
+        );
+        assert_eq!(
+            rows2,
+            vec![vec![Value::Text("a".into())], vec![Value::Text("c".into())]]
+        );
+    }
+
+    #[test]
+    fn bool_predicate_filters() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE u (name TEXT, active BOOL)")
+            .unwrap();
+        db.execute("INSERT INTO u VALUES ('a', TRUE), ('b', FALSE), ('c', TRUE)")
+            .unwrap();
+        let (_c, rows) = query(&mut db, "SELECT name FROM u WHERE active ORDER BY name");
+        assert_eq!(
+            rows,
+            vec![vec![Value::Text("a".into())], vec![Value::Text("c".into())]]
+        );
+        let (_c, rows2) = query(&mut db, "SELECT name FROM u WHERE NOT active");
+        assert_eq!(rows2, vec![vec![Value::Text("b".into())]]);
+    }
+
+    #[test]
+    fn float_arithmetic_and_int_promotion() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE p (price FLOAT, qty INT)").unwrap();
+        db.execute("INSERT INTO p VALUES (2.5, 4)").unwrap();
+        // float * int -> float; int / int -> int stays int.
+        let (_c, rows) = query(&mut db, "SELECT price * qty FROM p");
+        assert_eq!(approx(&rows, 0), vec![10.0]);
+        let (_c, rows2) = query(&mut db, "SELECT price + 1 FROM p");
+        assert_eq!(approx(&rows2, 0), vec![3.5]);
+    }
+
+    #[test]
+    fn float_aggregates() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE p (g TEXT, price FLOAT)").unwrap();
+        db.execute("INSERT INTO p VALUES ('x', 1.0), ('x', 2.0), ('y', 10.5)")
+            .unwrap();
+        let (cols, rows) = query(
+            &mut db,
+            "SELECT g, SUM(price), AVG(price), MIN(price), MAX(price) FROM p GROUP BY g ORDER BY g",
+        );
+        assert_eq!(
+            names(&cols),
+            ["g", "SUM(price)", "AVG(price)", "MIN(price)", "MAX(price)"]
+        );
+        // group x: sum 3.0, avg 1.5, min 1.0, max 2.0
+        assert_eq!(rows[0][0], Value::Text("x".into()));
+        assert_eq!(rows[0][1], Value::Float(3.0));
+        assert_eq!(rows[0][2], Value::Float(1.5));
+        assert_eq!(rows[0][3], Value::Float(1.0));
+        assert_eq!(rows[0][4], Value::Float(2.0));
+        // group y: single row
+        assert_eq!(rows[1][1], Value::Float(10.5));
+    }
+
+    #[test]
+    fn float_and_bool_survive_reopen() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("ty.db");
+        {
+            let mut db = Database::open(&path).expect("open");
+            db.execute("CREATE TABLE p (price FLOAT, active BOOL)")
+                .unwrap();
+            db.execute("INSERT INTO p VALUES (1.5, TRUE), (0.25, FALSE)")
+                .unwrap();
+        }
+        let mut db = Database::open(&path).expect("reopen");
+        let (_c, rows) = query(&mut db, "SELECT price, active FROM p ORDER BY price DESC");
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Float(1.5), Value::Bool(true)],
+                vec![Value::Float(0.25), Value::Bool(false)],
+            ]
         );
     }
 }

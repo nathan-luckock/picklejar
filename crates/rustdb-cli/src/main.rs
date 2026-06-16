@@ -132,6 +132,8 @@ fn describe(db: &Database, table: &str) {
 const fn type_name(ty: DataType) -> &'static str {
     match ty {
         DataType::Int => "INT",
+        DataType::Float => "FLOAT",
+        DataType::Bool => "BOOL",
         DataType::Text => "TEXT",
     }
 }
@@ -198,6 +200,7 @@ fn join_padded<'a>(cells: impl Iterator<Item = &'a str>, widths: &[usize]) -> St
 fn fmt_value(v: &Value) -> String {
     match v {
         Value::Int(n) => n.to_string(),
+        Value::Float(x) => x.to_string(),
         Value::Text(s) => s.clone(),
         Value::Bool(b) => b.to_string(),
         Value::Null => "NULL".to_string(),

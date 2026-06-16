@@ -246,6 +246,11 @@ fn sort_cmp(a: &Value, b: &Value) -> Ordering {
         (Value::Null, _) => Ordering::Greater,
         (_, Value::Null) => Ordering::Less,
         (Value::Int(x), Value::Int(y)) => x.cmp(y),
+        (Value::Float(x), Value::Float(y)) => x.total_cmp(y),
+        #[allow(clippy::cast_precision_loss)]
+        (Value::Int(x), Value::Float(y)) => (*x as f64).total_cmp(y),
+        #[allow(clippy::cast_precision_loss)]
+        (Value::Float(x), Value::Int(y)) => x.total_cmp(&(*y as f64)),
         (Value::Text(x), Value::Text(y)) => x.cmp(y),
         (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
         _ => Ordering::Equal,
@@ -390,8 +395,12 @@ struct AggSpec {
 struct Acc {
     /// Rows counted (all rows for `COUNT(*)`, non-null for `COUNT(expr)`).
     count: u64,
-    /// Running sum and the count of summed integers (for SUM / AVG).
+    /// Running integer sum and the count of summed numbers (for SUM / AVG).
     sum: i64,
+    /// Running float sum, used when the summed column is FLOAT.
+    fsum: f64,
+    /// Whether any summed value was a float (selects the SUM/AVG result type).
+    saw_float: bool,
     num: u64,
     /// Running min / max of non-null values.
     min: Option<Value>,
@@ -437,9 +446,17 @@ fn update_acc(acc: &mut Acc, spec: &AggSpec, row: &[Value], cols: &[String]) -> 
         return Ok(());
     }
     acc.count += 1;
-    if let Value::Int(n) = &v {
-        acc.sum += *n;
-        acc.num += 1;
+    match &v {
+        Value::Int(n) => {
+            acc.sum += *n;
+            acc.num += 1;
+        }
+        Value::Float(x) => {
+            acc.fsum += *x;
+            acc.saw_float = true;
+            acc.num += 1;
+        }
+        _ => {}
     }
     acc.min = Some(match acc.min.take() {
         Some(m) if sort_cmp(&m, &v) == Ordering::Less => m,
@@ -460,6 +477,8 @@ fn finalize_acc(acc: &Acc, spec: &AggSpec) -> Value {
         AggFunc::Sum => {
             if acc.num == 0 {
                 Value::Null
+            } else if acc.saw_float {
+                Value::Float(acc.fsum)
             } else {
                 Value::Int(acc.sum)
             }
@@ -467,6 +486,9 @@ fn finalize_acc(acc: &Acc, spec: &AggSpec) -> Value {
         AggFunc::Avg => {
             if acc.num == 0 {
                 Value::Null
+            } else if acc.saw_float {
+                #[allow(clippy::cast_precision_loss)]
+                Value::Float(acc.fsum / acc.num as f64)
             } else {
                 Value::Int(acc.sum / i64::try_from(acc.num).unwrap_or(1).max(1))
             }
@@ -494,6 +516,12 @@ fn group_key_bytes(values: &[Value]) -> Vec<u8> {
             Value::Bool(x) => {
                 b.push(3);
                 b.push(u8::from(*x));
+            }
+            Value::Float(x) => {
+                // Group by bit pattern so equal floats (and identical NaNs)
+                // land in the same group.
+                b.push(4);
+                b.extend_from_slice(&x.to_bits().to_le_bytes());
             }
         }
     }

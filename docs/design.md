@@ -441,10 +441,17 @@ requirement M1 (CREATE / INSERT / SELECT with WHERE).
 
 A stored row is the bytes the engine writes as an `MvccTable` value. The
 format is schema-driven (`crates/executor/src/row.rs`): a null bitmap
-(`ceil(n/8)` bytes, LSB first) followed by each non-null column, `INT` as 8
-little-endian bytes and `TEXT` as a 4-byte length prefix then UTF-8. The
-catalog supplies the types, so the bytes carry only data. A 500-case property
-test pins `decode(encode(row)) == row`.
+(`ceil(n/8)` bytes, LSB first) followed by each non-null column. The four
+column types encode as: `INT` 8 little-endian bytes (`i64`), `FLOAT` 8
+little-endian bytes (IEEE-754 `f64`), `BOOL` one byte (`0`/`1`), `TEXT` a
+4-byte length prefix then UTF-8. The catalog supplies the types, so the bytes
+carry only data. A 500-case property test pins `decode(encode(row)) == row`.
+
+`Value` hand-writes `Eq`/`Hash`-style equality (floats compare by bit pattern)
+because `f64` is not `Eq`; that keeps grouping and storage keys total while the
+SQL `=` operator's three-valued, type-promoting semantics (an `INT` compares
+with a `FLOAT`; either float operand promotes arithmetic to float) live in the
+executor's evaluator.
 
 ### Operator model
 

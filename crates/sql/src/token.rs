@@ -64,6 +64,8 @@ pub enum Keyword {
     // Column types.
     Int,
     Text,
+    Float,
+    Bool,
 }
 
 impl Keyword {
@@ -113,13 +115,18 @@ impl Keyword {
             "false" => Self::False,
             "int" | "integer" => Self::Int,
             "text" | "varchar" => Self::Text,
+            "float" | "real" | "double" => Self::Float,
+            "bool" | "boolean" => Self::Bool,
             _ => return None,
         })
     }
 }
 
 /// The lexical category of a token.
-#[derive(Clone, Debug, Eq, PartialEq)]
+///
+/// `Eq` is not derived because the `Float` literal carries an `f64`. Token
+/// equality (used in tests) is `PartialEq`, which is all that `==` needs.
+#[derive(Clone, Debug, PartialEq)]
 pub enum TokenKind {
     /// A reserved keyword.
     Keyword(Keyword),
@@ -127,6 +134,8 @@ pub enum TokenKind {
     Ident(String),
     /// An integer literal.
     Int(i64),
+    /// A floating-point literal.
+    Float(f64),
     /// A single-quoted string literal (contents, unescaped).
     Str(String),
 
@@ -166,7 +175,7 @@ pub enum TokenKind {
 }
 
 /// A token: its kind and where it came from.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Token {
     /// What kind of token this is.
     pub kind: TokenKind,

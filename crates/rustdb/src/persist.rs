@@ -42,6 +42,8 @@ pub struct TableRecord {
 const fn type_tag(t: DataType) -> &'static str {
     match t {
         DataType::Int => "INT",
+        DataType::Float => "FLOAT",
+        DataType::Bool => "BOOL",
         DataType::Text => "TEXT",
     }
 }
@@ -49,6 +51,8 @@ const fn type_tag(t: DataType) -> &'static str {
 fn parse_type(s: &str) -> Option<DataType> {
     match s {
         "INT" => Some(DataType::Int),
+        "FLOAT" => Some(DataType::Float),
+        "BOOL" => Some(DataType::Bool),
         "TEXT" => Some(DataType::Text),
         _ => None,
     }
