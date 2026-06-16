@@ -52,6 +52,23 @@ pub trait TableSource {
     ///
     /// Returns an error if the table cannot be read.
     fn scan(&self, table: &str) -> Result<Relation>;
+
+    /// Return candidate rows of `table` resolved through `index` to satisfy the
+    /// equality in `predicate` on the indexed column. The rows are already
+    /// visibility-filtered; the caller still applies `predicate` as a residual
+    /// filter, so returning a superset (or falling back to a full scan) is
+    /// always correct.
+    ///
+    /// The default implementation falls back to [`scan`](Self::scan), so a
+    /// source with no physical index is still correct, just not faster.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the table cannot be read.
+    fn index_scan(&self, table: &str, index: &str, predicate: &Expr) -> Result<Relation> {
+        let _ = (index, predicate);
+        self.scan(table)
+    }
 }
 
 /// A pull-based query operator.
@@ -611,13 +628,20 @@ pub fn build(plan: &PhysicalPlan, source: &dyn TableSource) -> Result<Box<dyn Ex
         PhysicalPlan::IndexScan {
             table,
             qualifier,
+            index,
             predicate,
             ..
         } => {
-            // No physical index lookup yet: a full scan with the predicate as
-            // a residual filter is correct, just not faster than a seq scan.
+            // Resolve candidate rows through the index, then apply the full
+            // predicate as a residual filter. The residual is what verifies a
+            // candidate against the visible row, so a stale or over-broad
+            // index result can never produce a wrong row.
+            let rel = source.index_scan(table, index, predicate)?;
             Ok(Box::new(Filter {
-                input: scan(table, qualifier, source)?,
+                input: Box::new(Values {
+                    columns: qualify(qualifier, &rel.columns),
+                    rows: rel.rows.into_iter(),
+                }),
                 predicate: predicate.clone(),
             }))
         }

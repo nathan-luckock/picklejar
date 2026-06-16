@@ -7,6 +7,7 @@
 
 pub mod database;
 pub mod error;
+pub mod index;
 pub mod persist;
 
 pub use database::{Database, QueryOutcome};

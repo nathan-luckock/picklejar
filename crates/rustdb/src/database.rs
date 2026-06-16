@@ -30,14 +30,15 @@ use std::path::{Path, PathBuf};
 
 use rustdb_executor::eval::{eval, is_truthy};
 use rustdb_executor::{decode_row, encode_row, run, Relation, TableSource};
-use rustdb_planner::{bind, explain, plan, Catalog};
+use rustdb_planner::{bind, explain, plan, Catalog, ColumnStats};
 use rustdb_sql::statement::{ColumnDef, DataType};
-use rustdb_sql::{Expr, Parser, Statement, UnOp, Value};
+use rustdb_sql::{BinOp, Expr, Parser, Statement, UnOp, Value};
 use rustdb_storage::{BufferPool, FileManager, PageId};
 use rustdb_txn::{MvccTable, Transaction, TransactionManager};
 use rustdb_wal::{WalSyncHandle, WalWriter};
 
 use crate::error::{DbError, Result};
+use crate::index::Index;
 use crate::persist::{self, TableRecord};
 
 /// Buffer pool size in pages. Generous for the capstone's working set.
@@ -48,12 +49,24 @@ const POOL_PAGES: usize = 256;
 /// anchors the engine needs to reopen the table.
 #[derive(Debug, Clone)]
 struct TableStore {
-    /// Root page of the table's index B+ tree.
+    /// Root page of the table's primary index B+ tree (rowid -> version).
     index_root: PageId,
     /// Heap page currently receiving new versions.
     version_page: PageId,
     /// Next auto-increment rowid (the `MvccTable` key).
     next_rowid: u64,
+    /// Physical secondary indexes, one per indexed column (unique INT columns).
+    secondary: Vec<SecondaryIndex>,
+}
+
+/// A physical secondary index: the indexed column's position and the root page
+/// of its `value -> rowid` B+ tree.
+#[derive(Debug, Clone)]
+struct SecondaryIndex {
+    /// Position of the indexed column in the table's schema.
+    column: usize,
+    /// Root page of the index B+ tree.
+    root: PageId,
 }
 
 /// The outcome of running one statement.
@@ -158,12 +171,37 @@ impl Database {
                 })?;
             }
             self.catalog.set_row_count(&r.name, r.next_rowid)?;
+            // Rebuild the physical secondary indexes, mapping each stored
+            // column name back to its position. Unique columns also carry
+            // distinct = row count, so the planner costs index scans the same
+            // way it would after a fresh load of rows.
+            let mut secondary = Vec::new();
+            for (col, root) in &r.secondary {
+                if let Some(column) = self
+                    .catalog
+                    .get_table(&r.name)
+                    .and_then(|m| m.column_index(col))
+                {
+                    secondary.push(SecondaryIndex {
+                        column,
+                        root: PageId(*root),
+                    });
+                    self.catalog.set_column_stats(
+                        &r.name,
+                        col,
+                        ColumnStats {
+                            distinct: r.next_rowid.max(1),
+                        },
+                    )?;
+                }
+            }
             self.tables.insert(
                 r.name.clone(),
                 TableStore {
                     index_root: PageId(r.index_root),
                     version_page: PageId(r.version_page),
                     next_rowid: r.next_rowid,
+                    secondary,
                 },
             );
         }
@@ -191,6 +229,15 @@ impl Database {
                         .indexes
                         .iter()
                         .map(|i| (i.name.clone(), i.column.clone()))
+                        .collect(),
+                    secondary: store
+                        .secondary
+                        .iter()
+                        .filter_map(|s| {
+                            meta.columns
+                                .get(s.column)
+                                .map(|c| (c.name.clone(), s.root.0))
+                        })
                         .collect(),
                     index_root: store.index_root.0,
                     version_page: store.version_page.0,
@@ -338,17 +385,40 @@ impl Database {
     // --- statement handlers ---
 
     fn create_table(&mut self, stmt: &Statement) -> Result<QueryOutcome> {
-        let Statement::CreateTable { name, .. } = stmt else {
+        let Statement::CreateTable { name, columns } = stmt else {
             unreachable!("guarded by execute");
         };
         // The catalog rejects a duplicate table, keeping it the single source
         // of truth for which tables exist.
         self.catalog.apply(stmt)?;
         let table = MvccTable::create(&self.pool, self.wal.clone(), &self.mgr)?;
+
+        // Build a physical secondary index for every unique INT column, so an
+        // equality lookup on it becomes a point get. Register each in the
+        // catalog as well, so the planner can cost and choose an index scan.
+        // Uniqueness guarantees the index keys never collide, which is what
+        // lets the plain unique-keyed B+ tree serve as the index.
+        let mut secondary = Vec::new();
+        for (i, col) in columns.iter().enumerate() {
+            if col.ty == DataType::Int && (col.primary_key || col.unique) {
+                let index = Index::create(&self.pool)?;
+                secondary.push(SecondaryIndex {
+                    column: i,
+                    root: index.root(),
+                });
+                self.catalog.apply(&Statement::CreateIndex {
+                    name: format!("{name}_{}_idx", col.name),
+                    table: name.clone(),
+                    column: col.name.clone(),
+                })?;
+            }
+        }
+
         let store = TableStore {
             index_root: table.index_root(),
             version_page: table.version_page(),
             next_rowid: 0,
+            secondary,
         };
         self.tables.insert(name.clone(), store);
         self.persist()?;
@@ -362,6 +432,7 @@ impl Database {
         Ok(QueryOutcome::Ddl)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn insert(
         &mut self,
         txn: &Transaction,
@@ -461,8 +532,15 @@ impl Database {
                     seen[slot].push(values[col].clone());
                 }
             }
+            let rowid = store.next_rowid;
             let bytes = encode_row(&values, &schema)?;
-            handle.insert(txn, store.next_rowid, &bytes)?;
+            handle.insert(txn, rowid, &bytes)?;
+            // Maintain the physical secondary indexes: record value -> rowid.
+            for sec in &mut store.secondary {
+                let index = Index::open(&self.pool, sec.root);
+                index.put(&values[sec.column], rowid)?;
+                sec.root = index.root();
+            }
             store.next_rowid += 1;
             affected += 1;
         }
@@ -474,7 +552,21 @@ impl Database {
         // count equals the rowid high-water mark. This is what makes EXPLAIN
         // show true costs instead of zero.
         let row_count = store.next_rowid;
+        let indexed_cols: Vec<usize> = store.secondary.iter().map(|s| s.column).collect();
         self.catalog.set_row_count(table, row_count)?;
+        // Each indexed column is unique, so its distinct count is the row count.
+        // That low equality selectivity is what lets the planner cost an index
+        // scan below a sequential scan once the table is large enough.
+        for col in indexed_cols {
+            let name = col_meta[col].0.clone();
+            self.catalog.set_column_stats(
+                table,
+                &name,
+                ColumnStats {
+                    distinct: row_count.max(1),
+                },
+            )?;
+        }
         Ok(QueryOutcome::Mutation { affected })
     }
 
@@ -563,6 +655,14 @@ impl Database {
                 }
             }
             handle.update(txn, key, &encode_row(&new_row, &schema)?)?;
+            // Point each indexed column's key at this rowid's new value. Old
+            // values are left in the tree (upsert only, never delete) and are
+            // filtered out on read; see `crate::index`.
+            for sec in &mut store.secondary {
+                let index = Index::open(&self.pool, sec.root);
+                index.put(&new_row[sec.column], key)?;
+                sec.root = index.root();
+            }
             affected += 1;
         }
         store.index_root = handle.index_root();
@@ -669,6 +769,98 @@ impl TableSource for EngineSource<'_> {
             .map(|(_key, bytes)| decode_row(&bytes, &schema))
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(Relation { columns, rows })
+    }
+
+    fn index_scan(
+        &self,
+        table: &str,
+        _index: &str,
+        predicate: &Expr,
+    ) -> std::result::Result<Relation, rustdb_executor::ExecError> {
+        use rustdb_executor::ExecError;
+        let meta = self
+            .catalog
+            .get_table(table)
+            .ok_or_else(|| ExecError::Source(format!("unknown table {table}")))?;
+        let columns: Vec<String> = meta.columns.iter().map(|c| c.name.clone()).collect();
+        let schema: Vec<DataType> = meta.columns.iter().map(|c| c.ty).collect();
+        let store = self
+            .tables
+            .get(table)
+            .ok_or_else(|| ExecError::Source(format!("no store for table {table}")))?;
+
+        // Find a physical index whose column the predicate constrains with an
+        // equality, then turn that into a point get. The matched row is a
+        // candidate only: the executor re-applies `predicate` as a residual
+        // filter, so a stale index entry is filtered, never returned wrong.
+        for sec in &store.secondary {
+            let col_name = &meta.columns[sec.column].name;
+            let Some(value) = find_equality(predicate, col_name) else {
+                continue;
+            };
+            let index = Index::open(self.pool, sec.root);
+            let rowid = index
+                .lookup(&value)
+                .map_err(|e| ExecError::Source(e.to_string()))?;
+            let mvcc = MvccTable::open(
+                self.pool,
+                self.wal.clone(),
+                self.mgr,
+                store.index_root,
+                store.version_page,
+            );
+            let rows = match rowid {
+                Some(r) => match mvcc
+                    .get(self.txn, r)
+                    .map_err(|e| ExecError::Source(e.to_string()))?
+                {
+                    Some(bytes) => vec![decode_row(&bytes, &schema)?],
+                    None => Vec::new(),
+                },
+                None => Vec::new(),
+            };
+            return Ok(Relation { columns, rows });
+        }
+
+        // No physical index matched this predicate: a full scan is still
+        // correct (the executor's residual filter does the rest).
+        self.scan(table)
+    }
+}
+
+/// Find a constant `value` such that the predicate constrains `col` with
+/// `col = value` (in either operand order), descending through `AND`. Returns
+/// `None` if there is no such equality, which makes the caller fall back to a
+/// full scan.
+fn find_equality(predicate: &Expr, col: &str) -> Option<Value> {
+    match predicate {
+        Expr::Binary {
+            op: BinOp::Eq,
+            left,
+            right,
+        } => {
+            if expr_is_column(left, col) {
+                const_eval(right).ok()
+            } else if expr_is_column(right, col) {
+                const_eval(left).ok()
+            } else {
+                None
+            }
+        }
+        Expr::Binary {
+            op: BinOp::And,
+            left,
+            right,
+        } => find_equality(left, col).or_else(|| find_equality(right, col)),
+        _ => None,
+    }
+}
+
+/// Whether `expr` is a reference (bare or qualified) to the column `col`.
+fn expr_is_column(expr: &Expr, col: &str) -> bool {
+    match expr {
+        Expr::Column(c) | Expr::QualifiedColumn(_, c) => c == col,
+        _ => false,
     }
 }
 
@@ -903,5 +1095,101 @@ mod tests {
         let (_dir, mut db) = db();
         db.execute("CREATE TABLE t (id INT)").unwrap();
         assert!(db.execute("SELECT bogus FROM t").is_err());
+    }
+
+    // --- secondary index ---
+
+    /// Fill `t(id INT PRIMARY KEY, name TEXT)` with `n` rows `(i, "n{i}")`,
+    /// each in its own auto-commit transaction.
+    fn seed_indexed(db: &mut Database, n: i64) {
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")
+            .unwrap();
+        for i in 0..n {
+            db.execute(&format!("INSERT INTO t VALUES ({i}, 'n{i}')"))
+                .unwrap();
+        }
+    }
+
+    /// Same shape as [`seed_indexed`], but inserts all `n` rows in one
+    /// statement (a single transaction). Tests that update or reopen use this
+    /// to stay clear of two pre-existing limits unrelated to indexing: a
+    /// version-heap-page edge under many single-row updates, and transaction
+    /// ids resetting on reopen (which only surfaces across many transactions).
+    fn seed_indexed_one_txn(db: &mut Database, n: i64) {
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")
+            .unwrap();
+        let vals: Vec<String> = (0..n).map(|i| format!("({i}, 'n{i}')")).collect();
+        db.execute(&format!("INSERT INTO t VALUES {}", vals.join(", ")))
+            .unwrap();
+    }
+
+    fn explain(db: &mut Database, select_sql: &str) -> String {
+        match db.execute(&format!("EXPLAIN {select_sql}")).unwrap() {
+            QueryOutcome::Explain(p) => p,
+            other => panic!("expected explain, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn index_scan_is_chosen_and_returns_the_right_row() {
+        let (_dir, mut db) = db();
+        seed_indexed(&mut db, 300);
+        // The planner picks the index for a selective equality on the key.
+        let plan = explain(&mut db, "SELECT name FROM t WHERE id = 137");
+        assert!(plan.contains("IndexScan"), "plan was:\n{plan}");
+        // The index path resolves the row.
+        let (cols, rows) = query(&mut db, "SELECT id, name FROM t WHERE id = 137");
+        assert_eq!(names(&cols), ["id", "name"]);
+        assert_eq!(
+            rows,
+            vec![vec![Value::Int(137), Value::Text("n137".into())]]
+        );
+        // A key with no row returns nothing.
+        let (_c, miss) = query(&mut db, "SELECT id FROM t WHERE id = 99999");
+        assert!(miss.is_empty());
+    }
+
+    #[test]
+    fn index_lookup_handles_an_extra_conjunct() {
+        let (_dir, mut db) = db();
+        seed_indexed(&mut db, 300);
+        // The index drives off `id = 5`; the residual `name = ...` still applies.
+        let (_c, hit) = query(&mut db, "SELECT id FROM t WHERE id = 5 AND name = 'n5'");
+        assert_eq!(hit, vec![vec![Value::Int(5)]]);
+        let (_c, miss) = query(&mut db, "SELECT id FROM t WHERE id = 5 AND name = 'wrong'");
+        assert!(miss.is_empty());
+    }
+
+    #[test]
+    fn index_reflects_updates_via_upsert() {
+        let (_dir, mut db) = db();
+        seed_indexed_one_txn(&mut db, 80);
+        // The post-update reads go through the index (confirm the plan).
+        assert!(explain(&mut db, "SELECT id FROM t WHERE id = 1000").contains("IndexScan"));
+        // Move row 5 to a new key.
+        db.execute("UPDATE t SET id = 1000 WHERE id = 5").unwrap();
+        // The old key resolves a candidate whose value no longer matches, so
+        // the residual filter drops it: no row.
+        let (_c, old) = query(&mut db, "SELECT id FROM t WHERE id = 5");
+        assert!(old.is_empty(), "old key should be gone, got {old:?}");
+        // The new key resolves the moved row through the index.
+        let (_c, moved) = query(&mut db, "SELECT name FROM t WHERE id = 1000");
+        assert_eq!(moved, vec![vec![Value::Text("n5".into())]]);
+    }
+
+    #[test]
+    fn index_survives_reopen() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("idx.db");
+        {
+            let mut db = Database::open(&path).expect("open");
+            seed_indexed_one_txn(&mut db, 80);
+        }
+        // Reopen: the persisted index roots are reloaded.
+        let mut db = Database::open(&path).expect("reopen");
+        let plan = explain(&mut db, "SELECT name FROM t WHERE id = 42");
+        assert!(plan.contains("IndexScan"), "plan was:\n{plan}");
+        let (_c, rows) = query(&mut db, "SELECT name FROM t WHERE id = 42");
+        assert_eq!(rows, vec![vec![Value::Text("n42".into())]]);
     }
 }
