@@ -510,6 +510,34 @@ atomically (temp file, then rename), so an interrupted write never leaves a
 half-written catalog. This is what makes a table and its rows survive closing
 and reopening the database.
 
+### Secondary indexes
+
+A secondary index is a B+ tree, one per indexed column, mapping the column
+value to the rowid that holds it, so an equality lookup becomes a point get
+instead of a full scan. The engine builds one automatically for every unique
+INT column (a `PRIMARY KEY` or `UNIQUE` column), registers it in the catalog so
+the planner can cost an `IndexScan`, and persists its root page in the sidecar.
+
+- **Read path.** `IndexScan` resolves the predicate's equality to a candidate
+  rowid through the index, fetches that rowid through the MVCC primary index
+  (`MvccTable::get`, which enforces the snapshot), and the executor re-applies
+  the full predicate as a residual filter. The residual is what verifies a
+  candidate, so an over-broad or stale index result can never return a wrong
+  row, only an extra candidate that is filtered.
+- **Maintenance is upsert only, never delete.** On an insert, or an update that
+  changes the value, the engine upserts `key(value) -> rowid`. Deletes and the
+  old values left by updates are not removed. This keeps the index correct
+  under MVCC with no rollback logic: a lookup is always verified against the
+  visible row, so a leftover entry from an aborted or superseded write is
+  filtered, and because nothing is removed, no entry a concurrent reader still
+  needs is ever deleted. The cost is index bloat that a periodic rebuild would
+  reclaim.
+- **Why unique INT only.** Uniqueness guarantees the index keys never collide,
+  so the existing unique-keyed B+ tree serves directly with no duplicate-key
+  support. INT maps to an order-preserving `u64` key with no hashing. Non-unique
+  columns and TEXT (which would need duplicate keys and a hash with collision
+  handling) fall back to a sequential scan, which is still correct.
+
 ### Design decisions
 
 - **Tables are reopened per operation, not stored.** An `MvccTable` borrows
@@ -521,7 +549,8 @@ and reopening the database.
   split the root or advance the version page).
 - **Hidden rowid keying.** Every table uses an auto-increment rowid as its
   storage key; user columns live entirely in the encoded row. Uniform storage,
-  and it defers secondary-index keying to the index-scan work.
+  and secondary indexes map a column value to that rowid (see Secondary
+  indexes), with the MVCC primary index resolving rowid to the visible version.
 - **Materialized scans.** The engine reads a table's visible rows into a `Vec`
   via the snapshot scan and hands them to the executor, keeping the executor
   free of storage lifetimes and pin bookkeeping. Streaming is a later
@@ -529,8 +558,10 @@ and reopening the database.
 
 ### Known limitations (tracked, not gaps in M1)
 
-- `IndexScan` executes as a full scan with a residual filter (correct, not yet
-  faster); the physical index lookup lands with the index-scan work.
+- `IndexScan` uses a real index lookup for unique INT columns (`PRIMARY KEY` /
+  `UNIQUE`); see Secondary indexes above. Non-unique and TEXT predicates fall
+  back to a sequential scan with a residual filter (correct, not yet faster),
+  pending duplicate-key support and a TEXT hash.
 - Both join algorithms run through the nested-loop executor. The result is
   correct and the planner's hash-vs-loop choice is shown by EXPLAIN; the hash
   build/probe is a deferred runtime optimization, exactly like the index scan.

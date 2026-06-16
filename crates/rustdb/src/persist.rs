@@ -27,6 +27,10 @@ pub struct TableRecord {
     pub columns: Vec<(String, DataType, bool, bool, bool)>,
     /// Indexes as `(index_name, column)`.
     pub indexes: Vec<(String, String)>,
+    /// Physical secondary indexes as `(column, root_page)`: the B+ tree root
+    /// for each indexed column. A subset of `indexes` (only columns with a
+    /// real index structure: unique INT columns).
+    pub secondary: Vec<(String, u64)>,
     /// Index B+ tree root page.
     pub index_root: u64,
     /// Current version heap page.
@@ -82,6 +86,10 @@ pub fn save(path: &Path, records: &[TableRecord]) -> io::Result<()> {
         for (name, col) in &r.indexes {
             let _ = write!(out, " {name} {col}");
         }
+        let _ = write!(out, " {}", r.secondary.len());
+        for (col, root) in &r.secondary {
+            let _ = write!(out, " {col} {root}");
+        }
         out.push('\n');
     }
     let tmp = path.with_extension("meta.tmp");
@@ -134,10 +142,26 @@ pub fn load(path: &Path) -> io::Result<Vec<TableRecord>> {
             indexes.push((iname, icol));
         }
 
+        // The secondary-index section is optional, so a catalog written before
+        // physical indexes existed still loads (as having none).
+        let secondary = if i < toks.len() {
+            let nsec = parse_usize(field(&toks, &mut i)?)?;
+            let mut v = Vec::with_capacity(nsec);
+            for _ in 0..nsec {
+                let col = field(&toks, &mut i)?.to_string();
+                let root = parse_u64(field(&toks, &mut i)?)?;
+                v.push((col, root));
+            }
+            v
+        } else {
+            Vec::new()
+        };
+
         records.push(TableRecord {
             name,
             columns,
             indexes,
+            secondary,
             index_root,
             version_page,
             next_rowid,
