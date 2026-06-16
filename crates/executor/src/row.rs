@@ -15,11 +15,10 @@
 //! null column contributes no bytes after the bitmap. Each non-null column is
 //! encoded by its declared type:
 //!
-//! - `INT`  -> 8 bytes, little-endian `i64`.
-//! - `TEXT` -> 4-byte little-endian length prefix, then that many UTF-8 bytes.
-//!
-//! `BOOL` is not a column type (the catalog only has `INT` and `TEXT`), so a
-//! boolean value in a row is a type error.
+//! - `INT`   -> 8 bytes, little-endian `i64`.
+//! - `FLOAT` -> 8 bytes, little-endian IEEE-754 `f64`.
+//! - `BOOL`  -> 1 byte, `0` or `1`.
+//! - `TEXT`  -> 4-byte little-endian length prefix, then that many UTF-8 bytes.
 
 use rustdb_sql::statement::DataType;
 use rustdb_sql::Value;
@@ -30,6 +29,7 @@ use crate::error::{ExecError, Result};
 const fn value_type_name(v: &Value) -> &'static str {
     match v {
         Value::Int(_) => "INT",
+        Value::Float(_) => "FLOAT",
         Value::Text(_) => "TEXT",
         Value::Bool(_) => "BOOL",
         Value::Null => "NULL",
@@ -40,6 +40,8 @@ const fn value_type_name(v: &Value) -> &'static str {
 const fn data_type_name(t: DataType) -> &'static str {
     match t {
         DataType::Int => "INT",
+        DataType::Float => "FLOAT",
+        DataType::Bool => "BOOL",
         DataType::Text => "TEXT",
     }
 }
@@ -64,6 +66,8 @@ pub fn encode_row(values: &[Value], schema: &[DataType]) -> Result<Vec<u8>> {
         match value {
             Value::Null => bytes[i / 8] |= 1 << (i % 8),
             Value::Int(n) if ty == DataType::Int => bytes.extend_from_slice(&n.to_le_bytes()),
+            Value::Float(x) if ty == DataType::Float => bytes.extend_from_slice(&x.to_le_bytes()),
+            Value::Bool(b) if ty == DataType::Bool => bytes.push(u8::from(*b)),
             Value::Text(s) if ty == DataType::Text => {
                 let len = u32::try_from(s.len()).map_err(|_| ExecError::RowType {
                     column: i,
@@ -106,6 +110,17 @@ pub fn decode_row(bytes: &[u8], schema: &[DataType]) -> Result<Vec<Value>> {
                 let n = i64::from_le_bytes(raw.try_into().expect("checked 8 bytes"));
                 out.push(Value::Int(n));
                 rest = &rest[8..];
+            }
+            DataType::Float => {
+                let raw = rest.get(..8).ok_or(ExecError::RowTruncated { column: i })?;
+                let x = f64::from_le_bytes(raw.try_into().expect("checked 8 bytes"));
+                out.push(Value::Float(x));
+                rest = &rest[8..];
+            }
+            DataType::Bool => {
+                let raw = rest.first().ok_or(ExecError::RowTruncated { column: i })?;
+                out.push(Value::Bool(*raw != 0));
+                rest = &rest[1..];
             }
             DataType::Text => {
                 let len_bytes = rest.get(..4).ok_or(ExecError::RowTruncated { column: i })?;
@@ -174,12 +189,33 @@ mod tests {
     }
 
     #[test]
+    fn round_trips_floats_and_bools() {
+        let schema = [DataType::Float, DataType::Bool, DataType::Float];
+        rt(
+            &[Value::Float(3.5), Value::Bool(true), Value::Float(-0.25)],
+            &schema,
+        );
+        rt(
+            &[
+                Value::Float(f64::MIN),
+                Value::Bool(false),
+                Value::Float(f64::MAX),
+            ],
+            &schema,
+        );
+        rt(&[Value::Null, Value::Null, Value::Null], &schema);
+    }
+
+    #[test]
     fn type_mismatch_errors() {
         let err = encode_row(&[Value::Text("no".into())], &[DataType::Int]).unwrap_err();
         assert!(matches!(err, ExecError::RowType { column: 0, .. }));
-        // BOOL is never a column type.
+        // A bool does not fit an INT column.
         let err = encode_row(&[Value::Bool(true)], &[DataType::Int]).unwrap_err();
         assert!(matches!(err, ExecError::RowType { found: "BOOL", .. }));
+        // Nor an int a FLOAT column (no implicit widening in storage).
+        let err = encode_row(&[Value::Int(1)], &[DataType::Float]).unwrap_err();
+        assert!(matches!(err, ExecError::RowType { found: "INT", .. }));
     }
 
     #[test]

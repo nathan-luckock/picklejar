@@ -12,10 +12,18 @@
 use std::fmt;
 
 /// A literal value.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// `PartialEq`/`Eq` are hand-written rather than derived because `f64` is not
+/// `Eq`. Floats compare by bit pattern, a total reflexive equality (an
+/// identical `NaN` equals itself, `+0.0` differs from `-0.0`). That is the
+/// structural equality storage and grouping need; the SQL `=` operator's
+/// three-valued semantics live in the executor's evaluator.
+#[derive(Clone, Debug)]
 pub enum Value {
     /// Integer literal.
     Int(i64),
+    /// Floating-point literal.
+    Float(f64),
     /// String literal.
     Text(String),
     /// Boolean literal.
@@ -24,10 +32,35 @@ pub enum Value {
     Null,
 }
 
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Int(a), Self::Int(b)) => a == b,
+            (Self::Float(a), Self::Float(b)) => a.to_bits() == b.to_bits(),
+            (Self::Text(a), Self::Text(b)) => a == b,
+            (Self::Bool(a), Self::Bool(b)) => a == b,
+            (Self::Null, Self::Null) => true,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for Value {}
+
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Int(n) => write!(f, "{n}"),
+            Self::Float(x) => {
+                // Always render a decimal point (or exponent) so re-parsing
+                // yields a float, not an integer: `3.0`, not `3`.
+                let s = format!("{x}");
+                if !x.is_finite() || s.contains(['.', 'e', 'E']) {
+                    f.write_str(&s)
+                } else {
+                    write!(f, "{s}.0")
+                }
+            }
             Self::Text(s) => {
                 // Single-quote, escaping embedded quotes as ''.
                 write!(f, "'{}'", s.replace('\'', "''"))

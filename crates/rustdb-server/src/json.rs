@@ -13,8 +13,10 @@ pub enum Json {
     Null,
     /// A boolean.
     Bool(bool),
-    /// A number (integers only, which is all the engine produces).
+    /// An integer number.
     Int(i64),
+    /// A floating-point number.
+    Float(f64),
     /// A string.
     Str(String),
     /// An array.
@@ -38,6 +40,14 @@ impl Json {
             Self::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
             Self::Int(n) => {
                 let _ = write!(out, "{n}");
+            }
+            Self::Float(x) => {
+                // JSON has no NaN/Infinity, so emit null for those.
+                if x.is_finite() {
+                    let _ = write!(out, "{x}");
+                } else {
+                    out.push_str("null");
+                }
             }
             Self::Str(s) => write_escaped(s, out),
             Self::Array(items) => {

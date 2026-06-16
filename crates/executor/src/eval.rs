@@ -65,6 +65,7 @@ fn eval_unary(op: UnOp, expr: &Expr, row: &[Value], columns: &[String]) -> Resul
         (_, Value::Null) => Ok(Value::Null),
         (UnOp::Not, Value::Bool(b)) => Ok(Value::Bool(!b)),
         (UnOp::Neg, Value::Int(n)) => Ok(Value::Int(n.wrapping_neg())),
+        (UnOp::Neg, Value::Float(x)) => Ok(Value::Float(-x)),
         (op, v) => Err(ExecError::Type(format!("cannot apply {op:?} to {v:?}"))),
     }
 }
@@ -146,36 +147,67 @@ fn truth(v: &Value) -> Result<Option<bool>> {
     }
 }
 
-/// Total order between two same-typed, non-NULL values.
+/// Total order between two non-NULL values. Ints and floats are comparable to
+/// each other (the int is promoted to a float); floats use a total order, so
+/// `NaN` sorts consistently rather than erroring.
+#[allow(clippy::cast_precision_loss)]
 fn compare(l: &Value, r: &Value) -> Result<Ordering> {
     match (l, r) {
         (Value::Int(a), Value::Int(b)) => Ok(a.cmp(b)),
+        (Value::Float(a), Value::Float(b)) => Ok(a.total_cmp(b)),
+        (Value::Int(a), Value::Float(b)) => Ok((*a as f64).total_cmp(b)),
+        (Value::Float(a), Value::Int(b)) => Ok(a.total_cmp(&(*b as f64))),
         (Value::Text(a), Value::Text(b)) => Ok(a.cmp(b)),
         (Value::Bool(a), Value::Bool(b)) => Ok(a.cmp(b)),
         _ => Err(ExecError::Type(format!("cannot compare {l:?} with {r:?}"))),
     }
 }
 
-/// Integer arithmetic. Operands are already known non-NULL.
+/// The numeric value of an int or float operand, for arithmetic promotion.
+#[allow(clippy::cast_precision_loss)]
+fn numeric(v: &Value) -> Result<f64> {
+    match v {
+        Value::Int(n) => Ok(*n as f64),
+        Value::Float(x) => Ok(*x),
+        _ => Err(ExecError::Type(format!(
+            "arithmetic needs a number, found {v:?}"
+        ))),
+    }
+}
+
+/// Arithmetic over numbers (already known non-NULL). Two ints stay integer
+/// (wrapping); any float operand promotes the whole expression to float.
 fn arithmetic(op: BinOp, l: &Value, r: &Value) -> Result<Value> {
-    let (Value::Int(a), Value::Int(b)) = (l, r) else {
-        return Err(ExecError::Type(format!(
-            "arithmetic needs integers, found {l:?} and {r:?}"
-        )));
-    };
+    if let (Value::Int(a), Value::Int(b)) = (l, r) {
+        let out = match op {
+            BinOp::Add => a.wrapping_add(*b),
+            BinOp::Sub => a.wrapping_sub(*b),
+            BinOp::Mul => a.wrapping_mul(*b),
+            BinOp::Div => {
+                if *b == 0 {
+                    return Err(ExecError::Type("division by zero".into()));
+                }
+                a.wrapping_div(*b)
+            }
+            _ => unreachable!("only arithmetic ops reach here"),
+        };
+        return Ok(Value::Int(out));
+    }
+    let a = numeric(l)?;
+    let b = numeric(r)?;
     let out = match op {
-        BinOp::Add => a.wrapping_add(*b),
-        BinOp::Sub => a.wrapping_sub(*b),
-        BinOp::Mul => a.wrapping_mul(*b),
+        BinOp::Add => a + b,
+        BinOp::Sub => a - b,
+        BinOp::Mul => a * b,
         BinOp::Div => {
-            if *b == 0 {
+            if b == 0.0 {
                 return Err(ExecError::Type("division by zero".into()));
             }
-            a.wrapping_div(*b)
+            a / b
         }
         _ => unreachable!("only arithmetic ops reach here"),
     };
-    Ok(Value::Int(out))
+    Ok(Value::Float(out))
 }
 
 /// Whether a predicate value passes a WHERE filter: only literal `true` does.

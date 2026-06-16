@@ -173,6 +173,10 @@ impl fmt::Display for Select {
 pub enum DataType {
     /// 64-bit signed integer.
     Int,
+    /// 64-bit IEEE-754 floating point.
+    Float,
+    /// Boolean.
+    Bool,
     /// Variable-length text.
     Text,
 }
@@ -181,6 +185,8 @@ impl fmt::Display for DataType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::Int => "INT",
+            Self::Float => "FLOAT",
+            Self::Bool => "BOOL",
             Self::Text => "TEXT",
         })
     }
@@ -598,13 +604,21 @@ impl Parser {
                 self.advance();
                 DataType::Int
             }
+            TokenKind::Keyword(Keyword::Float) => {
+                self.advance();
+                DataType::Float
+            }
+            TokenKind::Keyword(Keyword::Bool) => {
+                self.advance();
+                DataType::Bool
+            }
             TokenKind::Keyword(Keyword::Text) => {
                 self.advance();
                 DataType::Text
             }
             other => {
                 return Err(SqlError::parse(
-                    format!("expected a column type (INT or TEXT), found {other:?}"),
+                    format!("expected a column type (INT, FLOAT, BOOL, or TEXT), found {other:?}"),
                     self.span(),
                 ));
             }
@@ -842,8 +856,19 @@ mod tests {
 
     #[test]
     fn unknown_type_errors() {
-        let mut p = Parser::from_sql("CREATE TABLE t (a FLOAT)").expect("lex");
+        let mut p = Parser::from_sql("CREATE TABLE t (a BLOB)").expect("lex");
         assert!(p.parse_statement().is_err());
+    }
+
+    #[test]
+    fn float_and_bool_column_types_parse() {
+        for ty in ["FLOAT", "REAL", "DOUBLE", "BOOL", "BOOLEAN"] {
+            let mut p = Parser::from_sql(&format!("CREATE TABLE t (a {ty})")).expect("lex");
+            assert!(
+                p.parse_statement().is_ok(),
+                "type {ty} should parse as a column type"
+            );
+        }
     }
 
     #[test]

@@ -155,6 +155,7 @@ fn outcome_json(outcome: QueryOutcome) -> Json {
 fn value_json(v: &Value) -> Json {
     match v {
         Value::Int(n) => Json::Int(*n),
+        Value::Float(x) => Json::Float(*x),
         Value::Text(s) => Json::Str(s.clone()),
         Value::Bool(b) => Json::Bool(*b),
         Value::Null => Json::Null,
@@ -190,6 +191,8 @@ fn tables_json(db: &Database) -> Json {
 const fn type_name(ty: DataType) -> &'static str {
     match ty {
         DataType::Int => "INT",
+        DataType::Float => "FLOAT",
+        DataType::Bool => "BOOL",
         DataType::Text => "TEXT",
     }
 }

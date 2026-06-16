@@ -194,6 +194,10 @@ impl Parser {
                 self.advance();
                 Ok(Expr::Literal(Value::Int(n)))
             }
+            TokenKind::Float(x) => {
+                self.advance();
+                Ok(Expr::Literal(Value::Float(x)))
+            }
             TokenKind::Str(s) => {
                 self.advance();
                 Ok(Expr::Literal(Value::Text(s)))

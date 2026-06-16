@@ -175,11 +175,29 @@ impl<'a> Lexer<'a> {
         while matches!(self.peek(), Some(b'0'..=b'9')) {
             self.bump();
         }
+        // A fractional part (a `.` followed by at least one digit) makes this a
+        // float. A bare trailing `.` is left for the `Dot` token, so `t.col`
+        // still lexes as ident-dot-ident.
+        let mut is_float = false;
+        if self.peek() == Some(b'.') && matches!(self.peek2(), Some(b'0'..=b'9')) {
+            is_float = true;
+            self.bump(); // consume '.'
+            while matches!(self.peek(), Some(b'0'..=b'9')) {
+                self.bump();
+            }
+        }
         let text = &self.src[start..self.pos];
-        let value = text
-            .parse::<i64>()
-            .map_err(|_| SqlError::IntOverflow { pos: start })?;
-        Ok(TokenKind::Int(value))
+        if is_float {
+            let value = text
+                .parse::<f64>()
+                .map_err(|_| SqlError::IntOverflow { pos: start })?;
+            Ok(TokenKind::Float(value))
+        } else {
+            let value = text
+                .parse::<i64>()
+                .map_err(|_| SqlError::IntOverflow { pos: start })?;
+            Ok(TokenKind::Int(value))
+        }
     }
 
     fn word(&mut self) -> TokenKind {
