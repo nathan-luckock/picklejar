@@ -28,6 +28,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use rustdb_executor::eval::{eval, is_truthy};
 use rustdb_executor::{decode_row, encode_row, run, Relation, TableSource};
 use rustdb_planner::{bind, explain, plan, Catalog};
 use rustdb_sql::statement::{ColumnDef, DataType};
@@ -215,8 +216,15 @@ impl Database {
                 rows,
             } => self.insert(&table, &columns, &rows),
             Statement::Select(_) => self.run_select(&stmt),
-            Statement::Update { .. } => Err(DbError::Unsupported("UPDATE".into())),
-            Statement::Delete { .. } => Err(DbError::Unsupported("DELETE".into())),
+            Statement::Update {
+                table,
+                assignments,
+                where_clause,
+            } => self.run_update(&table, &assignments, where_clause.as_ref()),
+            Statement::Delete {
+                table,
+                where_clause,
+            } => self.run_delete(&table, where_clause.as_ref()),
             Statement::Explain(_) => self.run_explain(&stmt),
         }
     }
@@ -363,6 +371,109 @@ impl Database {
         let (columns, rows) = run(&physical, &source)?;
         self.mgr.commit(&txn);
         Ok(QueryOutcome::Rows { columns, rows })
+    }
+
+    fn run_update(
+        &mut self,
+        table: &str,
+        assignments: &[(String, Expr)],
+        where_clause: Option<&Expr>,
+    ) -> Result<QueryOutcome> {
+        let (schema, columns, targets) = {
+            let meta = self
+                .catalog
+                .get_table(table)
+                .ok_or_else(|| DbError::UnknownTable(table.to_string()))?;
+            let schema: Vec<DataType> = meta.columns.iter().map(|c| c.ty).collect();
+            let columns: Vec<String> = meta.columns.iter().map(|c| c.name.clone()).collect();
+            let targets = assignments
+                .iter()
+                .map(|(col, _)| {
+                    meta.column_index(col)
+                        .ok_or_else(|| DbError::UnknownColumn {
+                            table: table.to_string(),
+                            column: col.clone(),
+                        })
+                })
+                .collect::<Result<Vec<usize>>>()?;
+            (schema, columns, targets)
+        };
+
+        let store = self
+            .tables
+            .get_mut(table)
+            .ok_or_else(|| DbError::UnknownTable(table.to_string()))?;
+        let handle = MvccTable::open(
+            &self.pool,
+            self.wal.clone(),
+            &self.mgr,
+            store.index_root,
+            store.version_page,
+        );
+        let txn = self.mgr.begin();
+        let mut affected = 0;
+        for (key, bytes) in handle.scan(&txn)? {
+            let row = decode_row(&bytes, &schema)?;
+            if let Some(pred) = where_clause {
+                if !is_truthy(&eval(pred, &row, &columns)?) {
+                    continue;
+                }
+            }
+            // Each SET expression is evaluated against the existing row, so
+            // `SET n = n + 1` sees the old value.
+            let mut new_row = row.clone();
+            for ((_, expr), &pos) in assignments.iter().zip(&targets) {
+                new_row[pos] = eval(expr, &row, &columns)?;
+            }
+            handle.update(&txn, key, &encode_row(&new_row, &schema)?)?;
+            affected += 1;
+        }
+        self.mgr.commit(&txn);
+        store.index_root = handle.index_root();
+        store.version_page = handle.version_page();
+        self.persist()?;
+        Ok(QueryOutcome::Mutation { affected })
+    }
+
+    fn run_delete(&mut self, table: &str, where_clause: Option<&Expr>) -> Result<QueryOutcome> {
+        let (schema, columns) = {
+            let meta = self
+                .catalog
+                .get_table(table)
+                .ok_or_else(|| DbError::UnknownTable(table.to_string()))?;
+            let schema: Vec<DataType> = meta.columns.iter().map(|c| c.ty).collect();
+            let columns: Vec<String> = meta.columns.iter().map(|c| c.name.clone()).collect();
+            (schema, columns)
+        };
+
+        let store = self
+            .tables
+            .get_mut(table)
+            .ok_or_else(|| DbError::UnknownTable(table.to_string()))?;
+        let handle = MvccTable::open(
+            &self.pool,
+            self.wal.clone(),
+            &self.mgr,
+            store.index_root,
+            store.version_page,
+        );
+        let txn = self.mgr.begin();
+        let mut affected = 0;
+        for (key, bytes) in handle.scan(&txn)? {
+            if let Some(pred) = where_clause {
+                let row = decode_row(&bytes, &schema)?;
+                if !is_truthy(&eval(pred, &row, &columns)?) {
+                    continue;
+                }
+            }
+            handle.delete(&txn, key)?;
+            affected += 1;
+        }
+        self.mgr.commit(&txn);
+        store.index_root = handle.index_root();
+        store.version_page = handle.version_page();
+        self.persist()?;
+        Ok(QueryOutcome::Mutation { affected })
     }
 
     fn run_explain(&self, stmt: &Statement) -> Result<QueryOutcome> {

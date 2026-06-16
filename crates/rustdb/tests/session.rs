@@ -174,6 +174,59 @@ fn group_by_and_whole_table_aggregates() {
 }
 
 #[test]
+fn update_and_delete() {
+    let dir = tempdir().expect("tempdir");
+    let mut db = Database::open(dir.path().join("upd.db")).expect("open");
+    db.execute("CREATE TABLE t (id INT, qty INT)").unwrap();
+    db.execute("INSERT INTO t (id, qty) VALUES (1, 10), (2, 20), (3, 30)")
+        .unwrap();
+
+    // UPDATE: the SET expression sees the existing value.
+    assert_eq!(
+        db.execute("UPDATE t SET qty = qty + 5 WHERE id = 2")
+            .unwrap(),
+        QueryOutcome::Mutation { affected: 1 }
+    );
+    match db.execute("SELECT id, qty FROM t ORDER BY id").unwrap() {
+        QueryOutcome::Rows { rows, .. } => assert_eq!(
+            rows,
+            vec![
+                vec![Value::Int(1), Value::Int(10)],
+                vec![Value::Int(2), Value::Int(25)],
+                vec![Value::Int(3), Value::Int(30)],
+            ]
+        ),
+        other => panic!("expected rows, got {other:?}"),
+    }
+
+    // DELETE the rows matching a predicate.
+    assert_eq!(
+        db.execute("DELETE FROM t WHERE qty > 25").unwrap(),
+        QueryOutcome::Mutation { affected: 1 }
+    );
+    match db.execute("SELECT id FROM t ORDER BY id").unwrap() {
+        QueryOutcome::Rows { rows, .. } => {
+            assert_eq!(rows, vec![vec![Value::Int(1)], vec![Value::Int(2)]]);
+        }
+        other => panic!("expected rows, got {other:?}"),
+    }
+
+    // No WHERE: UPDATE touches every row, DELETE clears the table.
+    assert_eq!(
+        db.execute("UPDATE t SET qty = 0").unwrap(),
+        QueryOutcome::Mutation { affected: 2 }
+    );
+    assert_eq!(
+        db.execute("DELETE FROM t").unwrap(),
+        QueryOutcome::Mutation { affected: 2 }
+    );
+    match db.execute("SELECT COUNT(*) FROM t").unwrap() {
+        QueryOutcome::Rows { rows, .. } => assert_eq!(rows, vec![vec![Value::Int(0)]]),
+        other => panic!("expected rows, got {other:?}"),
+    }
+}
+
+#[test]
 fn data_and_schema_survive_a_reopen() {
     let dir = tempdir().expect("tempdir");
     let path = dir.path().join("persist.db");
