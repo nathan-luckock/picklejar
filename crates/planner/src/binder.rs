@@ -56,7 +56,12 @@ fn bind_select(catalog: &Catalog, select: &Select) -> Result<LogicalPlan> {
     // 3. Aggregation. Trigger on an explicit GROUP BY or on aggregate
     //    functions in the projection (a bare `SELECT COUNT(*)` groups the
     //    whole table into one row).
-    let aggregates = collect_aggregates(&select.projections);
+    let mut aggregates = collect_aggregates(&select.projections);
+    // HAVING may reference aggregates the projection does not, so they must be
+    // computed too.
+    if let Some(having) = &select.having {
+        collect_aggs_in(having, &mut aggregates);
+    }
     if !select.group_by.is_empty() || !aggregates.is_empty() {
         for key in &select.group_by {
             resolve_expr(key, &scope)?;
@@ -67,6 +72,17 @@ fn bind_select(catalog: &Catalog, select: &Select) -> Result<LogicalPlan> {
         plan = LogicalPlan::Aggregate {
             group_by: select.group_by.clone(),
             aggregates,
+            input: Box::new(plan),
+        };
+    }
+
+    // 3b. HAVING: a filter over the aggregated rows. Its column and aggregate
+    //     references resolve against the same scope (an aggregate reference
+    //     reads back the column the aggregate operator emits).
+    if let Some(having) = &select.having {
+        resolve_expr(having, &scope)?;
+        plan = LogicalPlan::Filter {
+            predicate: having.clone(),
             input: Box::new(plan),
         };
     }
@@ -97,6 +113,13 @@ fn bind_select(catalog: &Catalog, select: &Select) -> Result<LogicalPlan> {
         items: select.projections.clone(),
         input: Box::new(plan),
     };
+
+    // 5b. DISTINCT: dedup the projected rows (so it sees the output columns).
+    if select.distinct {
+        plan = LogicalPlan::Distinct {
+            input: Box::new(plan),
+        };
+    }
 
     // 6. LIMIT.
     if let Some(n) = select.limit {

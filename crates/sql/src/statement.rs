@@ -111,6 +111,8 @@ impl fmt::Display for OrderItem {
 /// A SELECT query.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Select {
+    /// `SELECT DISTINCT`: dedup the output rows.
+    pub distinct: bool,
     /// Projection list.
     pub projections: Vec<SelectItem>,
     /// The driving table.
@@ -121,6 +123,8 @@ pub struct Select {
     pub where_clause: Option<Expr>,
     /// GROUP BY keys (empty if none).
     pub group_by: Vec<Expr>,
+    /// HAVING predicate, applied after grouping (None if none).
+    pub having: Option<Expr>,
     /// ORDER BY items (empty if none).
     pub order_by: Vec<OrderItem>,
     /// LIMIT (None if none).
@@ -130,6 +134,9 @@ pub struct Select {
 impl fmt::Display for Select {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("SELECT ")?;
+        if self.distinct {
+            f.write_str("DISTINCT ")?;
+        }
         for (i, p) in self.projections.iter().enumerate() {
             if i > 0 {
                 f.write_str(", ")?;
@@ -151,6 +158,9 @@ impl fmt::Display for Select {
                 }
                 write!(f, "{g}")?;
             }
+        }
+        if let Some(h) = &self.having {
+            write!(f, " HAVING {h}")?;
         }
         if !self.order_by.is_empty() {
             f.write_str(" ORDER BY ")?;
@@ -414,6 +424,7 @@ impl Parser {
     /// LIMIT.
     fn parse_select(&mut self) -> Result<Select> {
         self.expect_keyword(Keyword::Select)?;
+        let distinct = self.eat_keyword(Keyword::Distinct);
         let projections = self.parse_projections()?;
         self.expect_keyword(Keyword::From)?;
         let from = self.parse_table_ref()?;
@@ -424,14 +435,21 @@ impl Parser {
             None
         };
         let group_by = self.parse_group_by()?;
+        let having = if self.eat_keyword(Keyword::Having) {
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
         let order_by = self.parse_order_by()?;
         let limit = self.parse_limit()?;
         Ok(Select {
+            distinct,
             projections,
             from,
             joins,
             where_clause,
             group_by,
+            having,
             order_by,
             limit,
         })

@@ -11,7 +11,7 @@
 //! operators above the scan are pure in-memory transforms.
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use rustdb_planner::PhysicalPlan;
 use rustdb_sql::statement::SelectItem;
@@ -278,6 +278,28 @@ impl Executor for Limit {
             }
             None => Ok(None),
         }
+    }
+}
+
+/// Remove duplicate rows, preserving first-occurrence order (`SELECT
+/// DISTINCT`). Uniqueness is keyed by the same canonical byte encoding the
+/// group-by operator uses, so equal value lists (floats by bit pattern) dedup.
+struct Distinct {
+    input: Box<dyn Executor>,
+    seen: HashSet<Vec<u8>>,
+}
+
+impl Executor for Distinct {
+    fn columns(&self) -> &[String] {
+        self.input.columns()
+    }
+    fn next(&mut self) -> Result<Option<Row>> {
+        while let Some(row) = self.input.next()? {
+            if self.seen.insert(group_key_bytes(&row)) {
+                return Ok(Some(row));
+            }
+        }
+        Ok(None)
     }
 }
 
@@ -690,6 +712,10 @@ pub fn build(plan: &PhysicalPlan, source: &dyn TableSource) -> Result<Box<dyn Ex
         PhysicalPlan::Limit { n, input, .. } => Ok(Box::new(Limit {
             input: build(input, source)?,
             remaining: *n,
+        })),
+        PhysicalPlan::Distinct { input, .. } => Ok(Box::new(Distinct {
+            input: build(input, source)?,
+            seen: HashSet::new(),
         })),
         // Both join algorithms run through the nested-loop executor; the hash
         // build/probe is a deferred runtime optimization (the planner's choice

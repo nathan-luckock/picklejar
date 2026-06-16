@@ -118,21 +118,35 @@ fn order_item() -> impl Strategy<Value = OrderItem> {
 
 fn select() -> impl Strategy<Value = Select> {
     (
+        prop::bool::ANY,
         prop::collection::vec(select_item(), 1..3),
         table_ref(),
         prop::collection::vec(join(), 0..2),
         proptest::option::of(expr()),
         prop::collection::vec(expr(), 0..2),
+        proptest::option::of(expr()),
         prop::collection::vec(order_item(), 0..2),
         proptest::option::of(0u64..1000),
     )
         .prop_map(
-            |(projections, from, joins, where_clause, group_by, order_by, limit)| Select {
+            |(
+                distinct,
                 projections,
                 from,
                 joins,
                 where_clause,
                 group_by,
+                having,
+                order_by,
+                limit,
+            )| Select {
+                distinct,
+                projections,
+                from,
+                joins,
+                where_clause,
+                group_by,
+                having,
                 order_by,
                 limit,
             },

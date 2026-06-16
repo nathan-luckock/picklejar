@@ -73,6 +73,11 @@ pub enum LogicalPlan {
         /// Child plan.
         input: Box<Self>,
     },
+    /// Remove duplicate rows (`SELECT DISTINCT`).
+    Distinct {
+        /// Child plan.
+        input: Box<Self>,
+    },
 }
 
 impl LogicalPlan {
@@ -138,6 +143,10 @@ impl LogicalPlan {
             }
             Self::Limit { n, input } => {
                 writeln!(f, "{pad}Limit {n}")?;
+                input.fmt_indented(f, depth + 1)
+            }
+            Self::Distinct { input } => {
+                writeln!(f, "{pad}Distinct")?;
                 input.fmt_indented(f, depth + 1)
             }
         }

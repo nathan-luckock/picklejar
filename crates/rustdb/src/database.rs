@@ -1493,4 +1493,101 @@ mod tests {
         );
         assert_eq!(id_set(&rows2), vec![1, 2, 4]);
     }
+
+    // --- SELECT DISTINCT and HAVING ---
+
+    fn seed_groups(db: &mut Database) {
+        db.execute("CREATE TABLE t (g TEXT, n INT)").unwrap();
+        db.execute(
+            "INSERT INTO t VALUES ('a', 1), ('a', 2), ('b', 3), ('b', 4), ('b', 5), ('c', 6)",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn distinct_single_and_multi_column() {
+        let (_d, mut db) = db();
+        seed_groups(&mut db);
+        let (_c, rows) = query(&mut db, "SELECT DISTINCT g FROM t ORDER BY g");
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Text("a".into())],
+                vec![Value::Text("b".into())],
+                vec![Value::Text("c".into())],
+            ]
+        );
+        // Distinct over a derived column.
+        db.execute("INSERT INTO t VALUES ('a', 1)").unwrap(); // (a,1) duplicates an existing row
+        let (_c, pairs) = query(
+            &mut db,
+            "SELECT DISTINCT g, n FROM t WHERE g = 'a' ORDER BY n",
+        );
+        assert_eq!(
+            pairs,
+            vec![
+                vec![Value::Text("a".into()), Value::Int(1)],
+                vec![Value::Text("a".into()), Value::Int(2)],
+            ]
+        );
+    }
+
+    #[test]
+    fn distinct_preserves_sorted_order() {
+        let (_d, mut db) = db();
+        seed_groups(&mut db);
+        let (_c, rows) = query(&mut db, "SELECT DISTINCT g FROM t ORDER BY g DESC");
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Text("c".into())],
+                vec![Value::Text("b".into())],
+                vec![Value::Text("a".into())],
+            ]
+        );
+    }
+
+    #[test]
+    fn having_filters_groups() {
+        let (_d, mut db) = db();
+        seed_groups(&mut db);
+        // Groups with more than one row: a (2), b (3).
+        let (cols, rows) = query(
+            &mut db,
+            "SELECT g, COUNT(*) FROM t GROUP BY g HAVING COUNT(*) > 1 ORDER BY g",
+        );
+        assert_eq!(names(&cols), ["g", "COUNT(*)"]);
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Text("a".into()), Value::Int(2)],
+                vec![Value::Text("b".into()), Value::Int(3)],
+            ]
+        );
+    }
+
+    #[test]
+    fn having_on_aggregate_not_in_projection() {
+        let (_d, mut db) = db();
+        seed_groups(&mut db);
+        // HAVING references SUM(n), which is not selected.
+        let (cols, rows) = query(
+            &mut db,
+            "SELECT g FROM t GROUP BY g HAVING SUM(n) >= 9 ORDER BY g",
+        );
+        assert_eq!(names(&cols), ["g"]);
+        // sums: a=3, b=12, c=6 -> only b qualifies.
+        assert_eq!(rows, vec![vec![Value::Text("b".into())]]);
+    }
+
+    #[test]
+    fn explain_shows_distinct_node() {
+        let (_d, mut db) = db();
+        seed_groups(&mut db);
+        let plan = match db.execute("EXPLAIN SELECT DISTINCT g FROM t").unwrap() {
+            QueryOutcome::Explain(p) => p,
+            other => panic!("expected explain, got {other:?}"),
+        };
+        assert!(plan.contains("Distinct"), "plan was:\n{plan}");
+    }
 }

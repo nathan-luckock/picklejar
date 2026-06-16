@@ -92,6 +92,15 @@ pub enum PhysicalPlan {
         /// Estimated cost.
         est_cost: f64,
     },
+    /// Remove duplicate rows (`SELECT DISTINCT`).
+    Distinct {
+        /// Child plan.
+        input: Box<Self>,
+        /// Estimated output rows.
+        est_rows: u64,
+        /// Estimated cost.
+        est_cost: f64,
+    },
     /// Group-by aggregate.
     Aggregate {
         /// Grouping keys.
@@ -151,6 +160,7 @@ impl PhysicalPlan {
             | Self::Project { est_rows, .. }
             | Self::Sort { est_rows, .. }
             | Self::Limit { est_rows, .. }
+            | Self::Distinct { est_rows, .. }
             | Self::Aggregate { est_rows, .. }
             | Self::NestedLoopJoin { est_rows, .. }
             | Self::HashJoin { est_rows, .. } => *est_rows,
@@ -167,6 +177,7 @@ impl PhysicalPlan {
             | Self::Project { est_cost, .. }
             | Self::Sort { est_cost, .. }
             | Self::Limit { est_cost, .. }
+            | Self::Distinct { est_cost, .. }
             | Self::Aggregate { est_cost, .. }
             | Self::NestedLoopJoin { est_cost, .. }
             | Self::HashJoin { est_cost, .. } => *est_cost,
@@ -175,6 +186,7 @@ impl PhysicalPlan {
 }
 
 /// Lower a logical plan into a cost-annotated physical plan.
+#[allow(clippy::too_many_lines)]
 pub fn plan(logical: &LogicalPlan, catalog: &Catalog) -> Result<PhysicalPlan> {
     match logical {
         // A bare scan: full table scan, no predicate.
@@ -263,6 +275,18 @@ pub fn plan(logical: &LogicalPlan, catalog: &Catalog) -> Result<PhysicalPlan> {
             let est_cost = child.est_cost();
             Ok(PhysicalPlan::Limit {
                 n: *n,
+                input: Box::new(child),
+                est_rows,
+                est_cost,
+            })
+        }
+        LogicalPlan::Distinct { input } => {
+            let child = plan(input, catalog)?;
+            // A scan of the child plus, worst case, every row distinct.
+            let est_rows = child.est_rows();
+            #[allow(clippy::cast_precision_loss)]
+            let est_cost = child.est_cost() + child.est_rows() as f64;
+            Ok(PhysicalPlan::Distinct {
                 input: Box::new(child),
                 est_rows,
                 est_cost,

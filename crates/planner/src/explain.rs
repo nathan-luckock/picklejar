@@ -90,6 +90,10 @@ fn render(plan: &PhysicalPlan, depth: usize, out: &mut String) {
             let _ = writeln!(out, "{pad}Limit {n}  {stats}");
             render(input, depth + 1, out);
         }
+        PhysicalPlan::Distinct { input, .. } => {
+            let _ = writeln!(out, "{pad}Distinct  {stats}");
+            render(input, depth + 1, out);
+        }
         PhysicalPlan::Aggregate {
             group_by,
             aggregates,
