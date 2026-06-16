@@ -61,6 +61,11 @@ pub enum Keyword {
     Unique,
     True,
     False,
+    // Predicates.
+    In,
+    Between,
+    Like,
+    Is,
     // Column types.
     Int,
     Text,
@@ -113,6 +118,10 @@ impl Keyword {
             "unique" => Self::Unique,
             "true" => Self::True,
             "false" => Self::False,
+            "in" => Self::In,
+            "between" => Self::Between,
+            "like" => Self::Like,
+            "is" => Self::Is,
             "int" | "integer" => Self::Int,
             "text" | "varchar" => Self::Text,
             "float" | "real" | "double" => Self::Float,

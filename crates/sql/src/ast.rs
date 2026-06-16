@@ -99,6 +99,8 @@ pub enum BinOp {
     Mul,
     /// `/`
     Div,
+    /// `LIKE` (SQL pattern match: `%` any run, `_` any one character)
+    Like,
 }
 
 impl fmt::Display for BinOp {
@@ -116,18 +118,27 @@ impl fmt::Display for BinOp {
             Self::Sub => "-",
             Self::Mul => "*",
             Self::Div => "/",
+            Self::Like => "LIKE",
         };
         f.write_str(s)
     }
 }
 
 /// A unary operator.
+///
+/// `IsNull` / `IsNotNull` are unary so the existing `Expr::Unary` machinery
+/// (binding, aggregate collection) handles `x IS NULL` with no new node; only
+/// their rendering is postfix (see `Expr`'s `Display`).
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum UnOp {
     /// `NOT`
     Not,
     /// unary `-`
     Neg,
+    /// postfix `IS NULL`
+    IsNull,
+    /// postfix `IS NOT NULL`
+    IsNotNull,
 }
 
 impl fmt::Display for UnOp {
@@ -135,6 +146,9 @@ impl fmt::Display for UnOp {
         match self {
             Self::Not => f.write_str("NOT "),
             Self::Neg => f.write_str("-"),
+            // Rendered postfix by `Expr`'s Display; these are for completeness.
+            Self::IsNull => f.write_str("IS NULL"),
+            Self::IsNotNull => f.write_str("IS NOT NULL"),
         }
     }
 }
@@ -207,6 +221,15 @@ impl fmt::Display for Expr {
             Self::Star => f.write_str("*"),
             // Fully parenthesized so re-parsing reproduces the same tree.
             Self::Binary { op, left, right } => write!(f, "({left} {op} {right})"),
+            // IS NULL / IS NOT NULL render postfix; the other unary ops prefix.
+            Self::Unary {
+                op: UnOp::IsNull,
+                expr,
+            } => write!(f, "({expr} IS NULL)"),
+            Self::Unary {
+                op: UnOp::IsNotNull,
+                expr,
+            } => write!(f, "({expr} IS NOT NULL)"),
             Self::Unary { op, expr } => write!(f, "({op}{expr})"),
             Self::Func { name, args } => {
                 write!(f, "{name}(")?;

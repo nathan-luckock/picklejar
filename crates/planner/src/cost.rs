@@ -74,8 +74,9 @@ fn binary_selectivity(op: BinOp, left: &Expr, right: &Expr, table: &TableMeta) -
                 UNKNOWN_SELECTIVITY
             }
         }
-        // Arithmetic operators are not boolean predicates.
-        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => UNKNOWN_SELECTIVITY,
+        // LIKE has no cheap cardinality estimate, and the arithmetic operators
+        // are not boolean predicates: both fall back to the default.
+        BinOp::Like | BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => UNKNOWN_SELECTIVITY,
     }
 }
 

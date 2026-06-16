@@ -141,7 +141,18 @@ impl Parser {
     /// an infix operator must have to be consumed at this level.
     fn parse_bp(&mut self, min_bp: u8) -> Result<Expr> {
         let mut lhs = self.parse_prefix()?;
-        while let Some((op, l_bp, r_bp)) = infix_binding_power(self.peek()) {
+        loop {
+            // Keyword predicates (IN, BETWEEN, LIKE, IS [NOT] NULL), optionally
+            // negated, bind at comparison precedence.
+            if COMPARISON_BP >= min_bp {
+                if let Some(expr) = self.try_keyword_predicate(&lhs)? {
+                    lhs = expr;
+                    continue;
+                }
+            }
+            let Some((op, l_bp, r_bp)) = infix_binding_power(self.peek()) else {
+                break;
+            };
             if l_bp < min_bp {
                 break;
             }
@@ -150,6 +161,110 @@ impl Parser {
             lhs = Expr::binary(op, lhs, rhs);
         }
         Ok(lhs)
+    }
+
+    /// If the next token introduces a keyword predicate applied to `lhs`
+    /// (`IN`, `BETWEEN`, `LIKE`, each optionally preceded by `NOT`, or `IS
+    /// [NOT] NULL`), consume it and return the resulting expression. Otherwise
+    /// returns `None` and consumes nothing.
+    fn try_keyword_predicate(&mut self, lhs: &Expr) -> Result<Option<Expr>> {
+        let negated = matches!(self.peek(), TokenKind::Keyword(Keyword::Not));
+        let kw = if negated {
+            // `NOT IN` / `NOT BETWEEN` / `NOT LIKE`: peek past the NOT.
+            match self.tokens.get(self.pos + 1).map(|t| &t.kind) {
+                Some(TokenKind::Keyword(k @ (Keyword::In | Keyword::Between | Keyword::Like))) => {
+                    *k
+                }
+                _ => return Ok(None),
+            }
+        } else {
+            match self.peek() {
+                TokenKind::Keyword(
+                    k @ (Keyword::In | Keyword::Between | Keyword::Like | Keyword::Is),
+                ) => *k,
+                _ => return Ok(None),
+            }
+        };
+        if negated {
+            self.advance(); // consume NOT
+        }
+        self.advance(); // consume the predicate keyword
+        let expr = match kw {
+            Keyword::In => self.parse_in(lhs, negated)?,
+            Keyword::Between => self.parse_between(lhs, negated)?,
+            Keyword::Like => self.parse_like(lhs.clone(), negated)?,
+            Keyword::Is => self.parse_is_null(lhs.clone())?,
+            _ => unreachable!("guarded by the match above"),
+        };
+        Ok(Some(expr))
+    }
+
+    /// `x [NOT] IN (a, b, ...)`, desugared to an OR of equalities (or, when
+    /// negated, an AND of inequalities).
+    fn parse_in(&mut self, lhs: &Expr, negated: bool) -> Result<Expr> {
+        self.expect(&TokenKind::LParen)?;
+        let mut items = vec![self.parse_expr()?];
+        while self.eat(&TokenKind::Comma) {
+            items.push(self.parse_expr()?);
+        }
+        self.expect(&TokenKind::RParen)?;
+        let (cmp, join) = if negated {
+            (BinOp::Ne, BinOp::And)
+        } else {
+            (BinOp::Eq, BinOp::Or)
+        };
+        let mut iter = items.into_iter();
+        let first = iter.next().expect("IN list is never empty");
+        let mut acc = Expr::binary(cmp, lhs.clone(), first);
+        for item in iter {
+            acc = Expr::binary(join, acc, Expr::binary(cmp, lhs.clone(), item));
+        }
+        Ok(acc)
+    }
+
+    /// `x [NOT] BETWEEN low AND high`, desugared to a pair of comparisons.
+    fn parse_between(&mut self, lhs: &Expr, negated: bool) -> Result<Expr> {
+        // Parse the bounds above AND's binding power so the `AND` separator and
+        // any trailing `AND` terminate them.
+        let low = self.parse_bp(COMPARISON_BP + 1)?;
+        self.expect_keyword(Keyword::And)?;
+        let high = self.parse_bp(COMPARISON_BP + 1)?;
+        if negated {
+            Ok(Expr::binary(
+                BinOp::Or,
+                Expr::binary(BinOp::Lt, lhs.clone(), low),
+                Expr::binary(BinOp::Gt, lhs.clone(), high),
+            ))
+        } else {
+            Ok(Expr::binary(
+                BinOp::And,
+                Expr::binary(BinOp::Ge, lhs.clone(), low),
+                Expr::binary(BinOp::Le, lhs.clone(), high),
+            ))
+        }
+    }
+
+    /// `x [NOT] LIKE pattern`, a `Like` comparison wrapped in `NOT` if negated.
+    fn parse_like(&mut self, lhs: Expr, negated: bool) -> Result<Expr> {
+        let pattern = self.parse_bp(COMPARISON_BP + 1)?;
+        let like = Expr::binary(BinOp::Like, lhs, pattern);
+        Ok(if negated {
+            Expr::unary(UnOp::Not, like)
+        } else {
+            like
+        })
+    }
+
+    /// `x IS [NOT] NULL` (the `IS` is already consumed).
+    fn parse_is_null(&mut self, lhs: Expr) -> Result<Expr> {
+        let negated = self.eat_keyword(Keyword::Not);
+        self.expect_keyword(Keyword::Null)?;
+        let op = if negated {
+            UnOp::IsNotNull
+        } else {
+            UnOp::IsNull
+        };
+        Ok(Expr::unary(op, lhs))
     }
 
     /// Parse a function-call argument list (the inside of the parentheses),
@@ -249,6 +364,9 @@ impl Parser {
 const NOT_OPERAND_BP: u8 = 5;
 /// Unary minus binds tighter than `* /` (9/10).
 const NEG_OPERAND_BP: u8 = 11;
+/// Binding power of the keyword predicates (`IN`, `BETWEEN`, `LIKE`, `IS
+/// NULL`), the same comparison level as `=` and `<`.
+const COMPARISON_BP: u8 = 5;
 
 /// Left and right binding powers for an infix operator, or `None` if the
 /// token is not an infix operator. Left-associative: `r_bp = l_bp + 1`.

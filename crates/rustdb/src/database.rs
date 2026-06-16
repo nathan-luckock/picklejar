@@ -1388,4 +1388,109 @@ mod tests {
             ]
         );
     }
+
+    // --- predicates: IN, BETWEEN, LIKE, IS NULL ---
+
+    fn seed_fruit(db: &mut Database) {
+        db.execute("CREATE TABLE t (id INT, name TEXT)").unwrap();
+        db.execute(
+            "INSERT INTO t VALUES (1, 'apple'), (2, 'banana'), (3, 'cherry'), (4, 'avocado')",
+        )
+        .unwrap();
+    }
+
+    fn id_set(rows: &[Vec<Value>]) -> Vec<i64> {
+        rows.iter()
+            .map(|r| match r[0] {
+                Value::Int(n) => n,
+                ref o => panic!("want int, got {o:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn in_and_not_in() {
+        let (_d, mut db) = db();
+        seed_fruit(&mut db);
+        let (_c, rows) = query(&mut db, "SELECT id FROM t WHERE id IN (1, 3) ORDER BY id");
+        assert_eq!(id_set(&rows), vec![1, 3]);
+        let (_c, rows2) = query(
+            &mut db,
+            "SELECT id FROM t WHERE id NOT IN (1, 3) ORDER BY id",
+        );
+        assert_eq!(id_set(&rows2), vec![2, 4]);
+    }
+
+    #[test]
+    fn between_and_not_between() {
+        let (_d, mut db) = db();
+        seed_fruit(&mut db);
+        let (_c, rows) = query(
+            &mut db,
+            "SELECT id FROM t WHERE id BETWEEN 2 AND 3 ORDER BY id",
+        );
+        assert_eq!(id_set(&rows), vec![2, 3]);
+        let (_c, rows2) = query(
+            &mut db,
+            "SELECT id FROM t WHERE id NOT BETWEEN 2 AND 3 ORDER BY id",
+        );
+        assert_eq!(id_set(&rows2), vec![1, 4]);
+    }
+
+    #[test]
+    fn like_and_not_like() {
+        let (_d, mut db) = db();
+        seed_fruit(&mut db);
+        // a% -> apple, avocado
+        let (_c, rows) = query(&mut db, "SELECT id FROM t WHERE name LIKE 'a%' ORDER BY id");
+        assert_eq!(id_set(&rows), vec![1, 4]);
+        // %a_a -> banana (ends 'a','n','a'? no) ; use %rr% style: cherry has 'rr'
+        let (_c, rows2) = query(&mut db, "SELECT id FROM t WHERE name LIKE '%rr%'");
+        assert_eq!(id_set(&rows2), vec![3]);
+        // _pple -> apple
+        let (_c, rows3) = query(&mut db, "SELECT id FROM t WHERE name LIKE '_pple'");
+        assert_eq!(id_set(&rows3), vec![1]);
+        // NOT LIKE 'a%' -> banana, cherry
+        let (_c, rows4) = query(
+            &mut db,
+            "SELECT id FROM t WHERE name NOT LIKE 'a%' ORDER BY id",
+        );
+        assert_eq!(id_set(&rows4), vec![2, 3]);
+    }
+
+    #[test]
+    fn is_null_and_is_not_null() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE t (id INT, note TEXT)").unwrap();
+        db.execute("INSERT INTO t (id, note) VALUES (1, 'x')")
+            .unwrap();
+        db.execute("INSERT INTO t (id) VALUES (2)").unwrap(); // note defaults to NULL
+        db.execute("INSERT INTO t (id, note) VALUES (3, 'y')")
+            .unwrap();
+        let (_c, nulls) = query(&mut db, "SELECT id FROM t WHERE note IS NULL");
+        assert_eq!(id_set(&nulls), vec![2]);
+        let (_c, present) = query(
+            &mut db,
+            "SELECT id FROM t WHERE note IS NOT NULL ORDER BY id",
+        );
+        assert_eq!(id_set(&present), vec![1, 3]);
+    }
+
+    #[test]
+    fn predicates_compose_with_and_or() {
+        let (_d, mut db) = db();
+        seed_fruit(&mut db);
+        // (id IN (1,2,4)) AND (name LIKE 'a%') -> apple(1), avocado(4)
+        let (_c, rows) = query(
+            &mut db,
+            "SELECT id FROM t WHERE id IN (1, 2, 4) AND name LIKE 'a%' ORDER BY id",
+        );
+        assert_eq!(id_set(&rows), vec![1, 4]);
+        // id BETWEEN 1 AND 2 OR id = 4
+        let (_c, rows2) = query(
+            &mut db,
+            "SELECT id FROM t WHERE id BETWEEN 1 AND 2 OR id = 4 ORDER BY id",
+        );
+        assert_eq!(id_set(&rows2), vec![1, 2, 4]);
+    }
 }

@@ -62,6 +62,10 @@ fn resolve(name: &str, row: &[Value], columns: &[String]) -> Result<Value> {
 fn eval_unary(op: UnOp, expr: &Expr, row: &[Value], columns: &[String]) -> Result<Value> {
     let v = eval(expr, row, columns)?;
     match (op, v) {
+        // IS [NOT] NULL is a total predicate: it never returns NULL, so it is
+        // checked before the NULL-propagating arm below.
+        (UnOp::IsNull, v) => Ok(Value::Bool(matches!(v, Value::Null))),
+        (UnOp::IsNotNull, v) => Ok(Value::Bool(!matches!(v, Value::Null))),
         (_, Value::Null) => Ok(Value::Null),
         (UnOp::Not, Value::Bool(b)) => Ok(Value::Bool(!b)),
         (UnOp::Neg, Value::Int(n)) => Ok(Value::Int(n.wrapping_neg())),
@@ -99,8 +103,52 @@ fn eval_binary(
         BinOp::Gt => Ok(Value::Bool(compare(&l, &r)? == Ordering::Greater)),
         BinOp::Ge => Ok(Value::Bool(compare(&l, &r)? != Ordering::Less)),
         BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => arithmetic(op, &l, &r),
+        BinOp::Like => like(&l, &r),
         BinOp::And | BinOp::Or => unreachable!("handled above"),
     }
+}
+
+/// SQL `LIKE`: both operands must be text. `%` matches any run of characters
+/// (including empty), `_` matches exactly one character; every other character
+/// matches literally.
+fn like(l: &Value, r: &Value) -> Result<Value> {
+    let (Value::Text(text), Value::Text(pattern)) = (l, r) else {
+        return Err(ExecError::Type(format!(
+            "LIKE needs text operands, found {l:?} and {r:?}"
+        )));
+    };
+    Ok(Value::Bool(like_match(text, pattern)))
+}
+
+/// Backtracking matcher for a SQL `LIKE` pattern over character slices.
+fn like_match(text: &str, pattern: &str) -> bool {
+    let text: Vec<char> = text.chars().collect();
+    let pat: Vec<char> = pattern.chars().collect();
+    // `star_*` remembers the last `%`: its pattern position and where in the
+    // text it began matching, so a failed branch resumes by letting that `%`
+    // absorb one more character.
+    let (mut t, mut p) = (0usize, 0usize);
+    let (mut star_p, mut star_t): (Option<usize>, usize) = (None, 0);
+    while t < text.len() {
+        if p < pat.len() && (pat[p] == '_' || pat[p] == text[t]) {
+            t += 1;
+            p += 1;
+        } else if p < pat.len() && pat[p] == '%' {
+            star_p = Some(p);
+            star_t = t;
+            p += 1;
+        } else if let Some(sp) = star_p {
+            p = sp + 1;
+            star_t += 1;
+            t = star_t;
+        } else {
+            return false;
+        }
+    }
+    while p < pat.len() && pat[p] == '%' {
+        p += 1;
+    }
+    p == pat.len()
 }
 
 /// SQL three-valued AND: false dominates, then NULL, then true.
@@ -286,5 +334,26 @@ mod tests {
             eval(&expr, &row(), &cols()),
             Err(ExecError::Type(_))
         ));
+    }
+
+    #[test]
+    fn like_match_patterns() {
+        // Literal.
+        assert!(like_match("abc", "abc"));
+        assert!(!like_match("abc", "abd"));
+        // `_` matches exactly one character.
+        assert!(like_match("abc", "a_c"));
+        assert!(!like_match("ac", "a_c"));
+        // `%` matches any run, including empty.
+        assert!(like_match("abc", "a%"));
+        assert!(like_match("abc", "%c"));
+        assert!(like_match("abc", "%b%"));
+        assert!(like_match("abc", "%"));
+        assert!(like_match("", "%"));
+        assert!(like_match("abc", "abc%"));
+        // Backtracking: overlapping `%` segments.
+        assert!(like_match("xabxaby", "x%ab%y"));
+        assert!(!like_match("abc", "%d%"));
+        assert!(!like_match("abc", "abcd"));
     }
 }
