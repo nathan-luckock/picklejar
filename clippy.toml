@@ -1,0 +1,3 @@
+# Domain terms that read as prose, not code, in doc comments. ".." keeps
+# clippy's built-in allowlist and appends ours.
+doc-valid-idents = ["PostgreSQL", "BackendKeyData", "RowDescription", "DataRow", "CommandComplete", "ReadyForQuery", "ErrorResponse", "SQLState", ".."]

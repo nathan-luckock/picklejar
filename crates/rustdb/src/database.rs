@@ -450,6 +450,14 @@ impl Database {
         self.tables.len()
     }
 
+    /// Whether an explicit transaction (`BEGIN` without a matching `COMMIT` /
+    /// `ROLLBACK`) is currently open. Used by the wire protocol to report the
+    /// transaction status in `ReadyForQuery`.
+    #[must_use]
+    pub const fn in_transaction(&self) -> bool {
+        self.current_txn.is_some()
+    }
+
     /// The names of all tables, sorted, for `\dt`-style listings.
     #[must_use]
     pub fn table_names(&self) -> Vec<String> {

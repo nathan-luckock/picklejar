@@ -519,6 +519,7 @@ version = "0.0.1"
 dependencies = [
  "clap",
  "rustdb",
+ "tempfile",
  "tracing",
  "tracing-subscriber",
 ]
