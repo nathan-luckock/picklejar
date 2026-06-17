@@ -376,12 +376,15 @@ impl Parser {
             TokenKind::Ident(name) => {
                 self.advance();
                 if self.eat(&TokenKind::LParen) {
-                    // Function call: name '(' [args] ')', e.g. SUM(total) or
-                    // COUNT(*). The name is stored upper-cased and canonical.
+                    // Function call: name '(' [DISTINCT] [args] ')', e.g.
+                    // SUM(total), COUNT(*), or COUNT(DISTINCT col). The name is
+                    // stored upper-cased and canonical.
+                    let distinct = self.eat_keyword(Keyword::Distinct);
                     let args = self.parse_call_args()?;
                     self.expect(&TokenKind::RParen)?;
                     Ok(Expr::Func {
                         name: name.to_ascii_uppercase(),
+                        distinct,
                         args,
                     })
                 } else if self.eat(&TokenKind::Dot) {

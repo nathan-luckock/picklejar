@@ -29,7 +29,7 @@ pub fn eval(expr: &Expr, row: &[Value], columns: &[String]) -> Result<Value> {
         // A scalar function is computed here; anything else (an aggregate call,
         // computed by the Aggregate operator below) resolves to that operator's
         // output column by its rendered name.
-        Expr::Func { name, args } => eval_scalar_func(name, args, row, columns)?
+        Expr::Func { name, args, .. } => eval_scalar_func(name, args, row, columns)?
             .map_or_else(|| resolve(&expr.to_string(), row, columns), Ok),
         Expr::Case {
             operand,

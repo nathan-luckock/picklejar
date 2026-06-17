@@ -820,6 +820,12 @@ mod tests {
     }
 
     #[test]
+    fn count_distinct_round_trips() {
+        round_trip("SELECT COUNT(DISTINCT col) FROM t");
+        round_trip("SELECT g, SUM(DISTINCT n) FROM t GROUP BY g");
+    }
+
+    #[test]
     fn concat_and_offset_round_trip() {
         round_trip("SELECT a || '-' || b FROM t");
         round_trip("SELECT id FROM t ORDER BY id LIMIT 5 OFFSET 10");

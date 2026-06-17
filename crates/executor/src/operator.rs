@@ -413,10 +413,12 @@ enum AggFunc {
     Avg,
 }
 
-/// A parsed aggregate: a function and its argument (`None` for `COUNT(*)`).
+/// A parsed aggregate: a function, its argument (`None` for `COUNT(*)`), and
+/// whether it is a `DISTINCT` aggregate.
 struct AggSpec {
     func: AggFunc,
     arg: Option<Expr>,
+    distinct: bool,
 }
 
 /// Per-group, per-aggregate running state. Each field is used only by the
@@ -435,11 +437,18 @@ struct Acc {
     /// Running min / max of non-null values.
     min: Option<Value>,
     max: Option<Value>,
+    /// Values already folded, for a `DISTINCT` aggregate (empty otherwise).
+    seen: HashSet<Vec<u8>>,
 }
 
 /// Parse an aggregate call expression into a spec.
 fn parse_agg(expr: &Expr) -> Result<AggSpec> {
-    let Expr::Func { name, args } = expr else {
+    let Expr::Func {
+        name,
+        distinct,
+        args,
+    } = expr
+    else {
         return Err(ExecError::Unsupported(format!(
             "non-aggregate expression {expr} in an aggregate query"
         )));
@@ -461,7 +470,11 @@ fn parse_agg(expr: &Expr) -> Result<AggSpec> {
             )))
         }
     };
-    Ok(AggSpec { func, arg })
+    Ok(AggSpec {
+        func,
+        arg,
+        distinct: *distinct,
+    })
 }
 
 /// Fold one input row into an accumulator.
@@ -473,6 +486,10 @@ fn update_acc(acc: &mut Acc, spec: &AggSpec, row: &[Value], cols: &[String]) -> 
     };
     let v = eval(arg, row, cols)?;
     if matches!(v, Value::Null) {
+        return Ok(());
+    }
+    // A DISTINCT aggregate folds each value at most once per group.
+    if spec.distinct && !acc.seen.insert(group_key_bytes(std::slice::from_ref(&v))) {
         return Ok(());
     }
     acc.count += 1;

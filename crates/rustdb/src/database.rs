@@ -1762,4 +1762,51 @@ mod tests {
         let (_c, rest) = query(&mut db, "SELECT id FROM t ORDER BY id OFFSET 3");
         assert_eq!(id_set(&rest), vec![4, 5]);
     }
+
+    // --- DISTINCT aggregates ---
+
+    #[test]
+    fn count_and_sum_distinct() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE t (g TEXT, n INT)").unwrap();
+        // group a: values 1,1,2 -> distinct {1,2}; group b: 5,5 -> {5}
+        db.execute("INSERT INTO t VALUES ('a',1),('a',1),('a',2),('b',5),('b',5)")
+            .unwrap();
+        let (cols, rows) = query(
+            &mut db,
+            "SELECT g, COUNT(n), COUNT(DISTINCT n), SUM(DISTINCT n) FROM t GROUP BY g ORDER BY g",
+        );
+        assert_eq!(
+            names(&cols),
+            ["g", "COUNT(n)", "COUNT(DISTINCT n)", "SUM(DISTINCT n)"]
+        );
+        // a: count 3, distinct count 2, distinct sum 3 ; b: 2, 1, 5
+        assert_eq!(
+            rows,
+            vec![
+                vec![
+                    Value::Text("a".into()),
+                    Value::Int(3),
+                    Value::Int(2),
+                    Value::Int(3)
+                ],
+                vec![
+                    Value::Text("b".into()),
+                    Value::Int(2),
+                    Value::Int(1),
+                    Value::Int(5)
+                ],
+            ]
+        );
+    }
+
+    #[test]
+    fn count_distinct_whole_table() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE t (c TEXT)").unwrap();
+        db.execute("INSERT INTO t VALUES ('x'),('y'),('x'),('z'),('y')")
+            .unwrap();
+        let (_c, rows) = query(&mut db, "SELECT COUNT(DISTINCT c) FROM t");
+        assert_eq!(rows, vec![vec![Value::Int(3)]]);
+    }
 }

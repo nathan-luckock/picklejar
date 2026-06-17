@@ -189,6 +189,8 @@ pub enum Expr {
     Func {
         /// Upper-cased function name.
         name: String,
+        /// `DISTINCT` argument, as in `COUNT(DISTINCT col)`.
+        distinct: bool,
         /// Argument expressions (`COUNT(*)` carries a single [`Self::Star`]).
         args: Vec<Self>,
     },
@@ -245,8 +247,15 @@ impl fmt::Display for Expr {
                 expr,
             } => write!(f, "({expr} IS NOT NULL)"),
             Self::Unary { op, expr } => write!(f, "({op}{expr})"),
-            Self::Func { name, args } => {
+            Self::Func {
+                name,
+                distinct,
+                args,
+            } => {
                 write!(f, "{name}(")?;
+                if *distinct {
+                    f.write_str("DISTINCT ")?;
+                }
                 for (i, a) in args.iter().enumerate() {
                     if i > 0 {
                         f.write_str(", ")?;
