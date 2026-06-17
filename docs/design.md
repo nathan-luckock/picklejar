@@ -1,6 +1,20 @@
-# picklejar - Design Document
+<div align="center">
 
-> Living design document. It records the architecture and the rationale behind each major decision, including the alternatives that were considered and rejected, so that a reviewer can reconstruct why the engine is shaped the way it is from this single file.
+# picklejar design
+
+The architecture, and the reasoning behind every decision.
+
+[Overview](../README.md) &nbsp;·&nbsp; [Features](FEATURES.md) &nbsp;·&nbsp; [Build log](sprints.md)
+
+</div>
+
+---
+
+This document records each major design decision in the engine together with the
+alternatives that were considered and rejected, so a reader can reconstruct why
+every layer is shaped the way it is. For the order in which the pieces were
+built, see [sprints.md](sprints.md); for the full SQL and engine surface, see
+[FEATURES.md](FEATURES.md).
 
 ## Goals
 
@@ -14,33 +28,22 @@ Non-goals: distributed replication, network protocol compatibility with Postgres
 
 ## Ground rules
 
-1. **Everything graded is implemented in this workspace, not delegated to a third-party crate.** The storage engine, WAL and recovery, MVCC, the SQL parser, and the planner are all part of the codebase. External crates are restricted to plumbing that is not part of the graded engine: error handling (`thiserror`), logging (`tracing`), CLI argument parsing (`clap`). No embedded database (SQLite, sled, RocksDB), no SQL parser crate (`sqlparser`), no checksum crate (`crc32fast`).
+1. **Every core component is implemented in this workspace, not delegated to a third-party crate.** The storage engine, WAL and recovery, MVCC, the SQL parser, and the planner are all part of the codebase. External crates are restricted to plumbing outside the engine: error handling (`thiserror`), logging (`tracing`), CLI argument parsing (`clap`). No embedded database (SQLite, sled, RocksDB), no SQL parser crate (`sqlparser`), no checksum crate (`crc32fast`).
 2. **Every change carries its reasoning.** Each commit ships with a `Design notes:` section recording what was chosen and why, and the larger decisions land in this document with the alternatives that were rejected.
 3. **Test before commit.** `cargo build`, `fmt`, `clippy -D warnings`, and the full test suite pass on every change.
 
 ---
 
-## Implementation status (running)
+## Status
 
-| Sprint | Scope | Status |
-|---|---|---|
-| 0 | Bootstrap: workspace, CI, design doc, working agreement | Shipped (PR #1) |
-| 1 | Storage I: file manager, page header and CRC32, slotted page, property tests | Shipped (PRs #7-#10) |
-| 2 | Storage II: buffer pool and B+ tree, property tests | Shipped (PRs #17-#21) |
-| 3 | WAL: record format, writer, reader, buffer-pool integration, property tests | Shipped (PRs #27-#31) |
-| 4 | ARIES recovery: analysis, redo, undo, forced-kill torture test | Shipped (PRs #37-#42) |
-| 5 | Transactions and MVCC: manager, visibility, versions, `MvccTable`, isolation levels | Shipped (PRs #49-#54) |
-| 6 | MVCC polish: write-write conflict detection, version garbage collection | Deferred |
-| 7 | SQL parser: lexer, Pratt expressions, DDL, DML, SELECT with JOIN/GROUP/ORDER/LIMIT | Shipped (PRs #62-#67) |
-| 8 | Cost-based planner (M6): catalog, logical plan, cost model, join selection, EXPLAIN | Shipped (PRs #73-#77) |
-| 9 | Executor and CLI (M1): row codec, MVCC scan, engine, Volcano operators, joins, aggregates, catalog persistence, CLI | Shipped (PRs #85-#99) |
-| 10 | Deepen the engine: full DML, explicit transactions, constraints, types, real indexes | In progress (DML, BEGIN/COMMIT/ROLLBACK, PRIMARY KEY/UNIQUE/NOT NULL shipped; more types, real index-scan runtime, and concurrency remain) |
-| 11 | Studio: HTTP API and web UI | Planned |
-| 12 | Demo, write-up, and presentation | Planned |
+Every layer below the SQL surface is implemented and tested: storage, the
+write-ahead log and ARIES recovery, MVCC, the parser, the cost-based planner,
+the executor, and the PostgreSQL wire protocol. The SQL surface is deep
+(joins, window functions, set operations, CTEs, subqueries, a full everyday
+type system) and still growing. [sprints.md](sprints.md) tracks what shipped in
+what order.
 
----
-
-## High-level architecture
+## Architecture
 
 ```
     +--------------------------+
@@ -92,7 +95,7 @@ Non-goals: distributed replication, network protocol compatibility with Postgres
 
 Exposed as `picklejar_storage::PAGE_SIZE` (`usize`) and `PAGE_SIZE_U16` (typed mirror for `u16` arithmetic in the slot directory). A compile-time assertion in `page.rs` keeps them in sync.
 
-### File manager (Sprint 1 - shipped)
+### File manager
 
 `picklejar_storage::FileManager` owns the database file and exposes page-granular I/O. Single source of truth for raw page reads and writes; higher layers (buffer pool, WAL flush path) go through it.
 
@@ -109,14 +112,14 @@ impl FileManager {
 
 **Decisions:**
 
-- `&mut self` on read/write. Concurrent reads are the buffer pool's job (Sprint 2). Pushing positional pread/pwrite into the file layer would be premature optimization for the capstone's single-node scope.
+- `&mut self` on read/write. Concurrent reads are the buffer pool's job. Pushing positional pread/pwrite into the file layer would be premature optimization for the capstone's single-node scope.
 - `allocate_page` uses `set_len` to extend the file. OS guarantees zero-fill for the new region; faster than a `seek + write_zeros` loop and identical semantics.
 - File opened with `truncate(false)` AND `create(true)`. Explicit so a refactor doesn't accidentally start truncating live databases.
 - `MisalignedFile` is a real error, not a panic. A wrong-page-size build or a half-written torture-test artifact needs to surface to the caller so they can decide to abort, repair, or ignore.
 - **Rejected**: `O_DIRECT`. We want the OS page cache for the demo - cache effects are part of what the buffer pool buys.
 - **Rejected**: positional I/O for now. Sprint 1 surface is small enough that seeking is fine; revisit if benchmarks show seek overhead matters.
 
-### Page header (Sprint 1 - shipped)
+### Page header
 
 Every page starts with a 24-byte header, little-endian:
 
@@ -128,7 +131,7 @@ Every page starts with a 24-byte header, little-endian:
 | 14 | 2 | `slot_count: u16` | Live + tombstoned slots. |
 | 16 | 2 | `free_space_ptr: u16` | Offset where the tuple region begins (tuples grow up toward lower offsets from here). |
 | 18 | 2 | `flags: u16` | Bit 0 = `FLAG_DIRTY` (in-memory only), Bit 1 = `FLAG_NEEDS_VACUUM`. |
-| 20 | 4 | `reserved: u32` | Zero on disk. Reserved for MVCC version-chain pointer (Sprint 6). |
+| 20 | 4 | `reserved: u32` | Zero on disk. Reserved for MVCC version-chain pointer. |
 
 **Decisions:**
 
@@ -149,7 +152,7 @@ Every page starts with a 24-byte header, little-endian:
 - **Rejected**: SIMD-accelerated CRC32 (e.g. `crc32` intrinsic). The page checksum runs over 8 KiB at a time - not the hot path that benefits from intrinsics.
 - **Rejected**: blake3 / xxHash. CRC32 catches accidental corruption (the documented threat model). Cryptographic strength isn't needed for a single-node DB.
 
-### Slotted-page heap layout (Sprint 1 - shipped)
+### Slotted-page heap layout
 
 ```
  0       24                            free_space_ptr        PAGE_SIZE
@@ -165,24 +168,24 @@ Slot directory entry (4 bytes, little-endian): `(offset: u16, length: u16)`. Len
 
 **Decisions:**
 
-- **Slot IDs are stable for the page's lifetime and never recycled.** Once a `SlotId` is assigned by an `insert`, it always refers to the same logical slot, even after `delete`. This is the foundation that secondary B+ tree indexes (Sprint 2) rely on. The alternative - reusing freed slot IDs on the next insert - saves 4 bytes per delete but silently breaks any external `(page_id, slot_id)` reference. Hard no.
+- **Slot IDs are stable for the page's lifetime and never recycled.** Once a `SlotId` is assigned by an `insert`, it always refers to the same logical slot, even after `delete`. This is the foundation that secondary B+ tree indexes rely on. The alternative - reusing freed slot IDs on the next insert - saves 4 bytes per delete but silently breaks any external `(page_id, slot_id)` reference. Hard no.
 - **Tombstone marker = slot length 0**, not a separate flag bit. Smaller (no extra bit per slot), simpler (one comparison in `get`, not two). Cost: empty tuples can't be stored. Schemas with zero-length columns will use NULL bitmaps; not a real loss.
 - **`compact` is explicit, never implicit.** Inserts and reads never trigger compaction on their own. The buffer pool will decide when to schedule it based on the `FLAG_NEEDS_VACUUM` hint. Keeps the hot path predictable - no "this insert took 50ms because it compacted" surprises.
 - **`FLAG_NEEDS_VACUUM` threshold: 1024 bytes** of tombstoned space. Arbitrary for the capstone - real systems use adaptive thresholds based on page utilization and access patterns.
 - **`compact` allocates a small temp `Vec<(u16, Vec<u8>)>`.** Page-local, ~30 tuples max at typical sizes, not on the hot path. A zero-alloc in-place compaction is doable via overlapping copies but adds complexity unjustified for Sprint 1's budget.
 - **Rejected**: storing tuples in slot order. Insertion order makes `compact` a simple "walk live slots, copy to end" pass. Keeping tuples sorted by slot ID would force a re-sort after every `compact`.
 
-### B+ tree (Sprint 2 - shipped)
+### B+ tree
 
 Fanout 509 keys per internal node and 453 entries per leaf, for 8 KiB pages with `u64` keys. An internal node holds sorted keys plus child page IDs; a leaf holds sorted keys plus tuple references `(PageId, SlotId)` and a sibling pointer for range scans. `BTree` exposes `insert`, `search`, `upsert`, `delete`, and `range_scan` over the buffer pool, splitting and propagating to a new root as needed.
 
-### Buffer pool (Sprint 2 - shipped)
+### Buffer pool
 
 LRU-K (K=2) replacement. Pin and unpin are handled by RAII read and write guards; pinned pages are evict-immune, and the dirty bit is set on the first write through a write guard. The pool is interior-mutable (`&self`) so multiple guards can coexist, and it routes flushes through the WAL hook so write-ahead ordering is preserved.
 
 ---
 
-## WAL (Sprint 3 - shipped)
+## WAL
 
 ### Log record layout (29-byte header + payload + 4-byte trailer)
 
@@ -229,7 +232,7 @@ Forward `Iterator<Item = Result<(RecordHeader, LogRecord)>>`. Clean `None` on EO
 - WAL segment rotation. Single-file fits demo scope.
 - `O_DIRECT` for the WAL. OS page cache hides write latency without changing semantics, since we explicitly `sync_all` for durability.
 
-## Recovery (Sprint 4 - shipped)
+## Recovery
 
 The log record layout:
 
@@ -243,7 +246,7 @@ The log record layout:
 | `payload` | `[u8]` | Per-type body. |
 | `checksum` | `u32` | Over the preceding fields. |
 
-### Three-phase recovery (ARIES) - Sprint 4, shipped
+### Three-phase recovery (ARIES)
 
 Implemented in `crates/wal/src/recovery.rs`. `recover(pool, wal_path)` runs all three phases and returns a `RecoveryStats { winners, losers, redone, undone }`.
 
@@ -272,7 +275,7 @@ A dirty page cannot be flushed before its corresponding log records are fsync'd.
 
 ---
 
-## Transactions + MVCC (Sprint 5 - shipped)
+## Transactions + MVCC
 
 Implemented in the `picklejar-txn` crate. Snapshot isolation is the default; Read Committed is also available.
 
@@ -317,7 +320,7 @@ Every write logs an `Update` WAL record (WAL-before-page) so versions are durabl
 
 ### Scope and deferrals
 
-- **Write-write conflict detection** (first-committer-wins / Serializable, SSI) is a Sprint 6 stretch. Sprint 5 delivers snapshot-stable concurrent **reads** (requirement M5).
+- **Write-write conflict detection** (first-committer-wins / Serializable, SSI) is a Sprint 6 stretch. Sprint 5 delivers snapshot-stable concurrent **reads**.
 - **MVCC-aware crash recovery** (rebuilding the index, undoing versions) integrates with the executor in a later sprint. Writes are WAL-logged today.
 - **Version GC / vacuum.** `VACUUM [table]` reclaims the space held by dead
   versions and stale index entries by rewriting a table's currently visible
@@ -332,7 +335,7 @@ The page header's `reserved: u32` field remains available for an on-page version
 
 ---
 
-## SQL parser (Sprint 7 - shipped)
+## SQL parser
 
 No `sqlparser-rs`; implemented in `picklejar-sql`.
 
@@ -461,9 +464,9 @@ persisted to a `<base>.cons` sidecar, so they survive a reopen. `ON DELETE` /
 
 ---
 
-## Planner (Sprint 8 - shipped, M6)
+## Planner
 
-The planner is the cost-based optimizer (requirement M6). It turns a parsed
+The planner is the cost-based optimizer. It turns a parsed
 `SELECT` into a logical plan, then into a cost-annotated physical plan,
 making two cost-driven choices: sequential scan vs index scan per table, and
 nested-loop vs hash join per join. `crates/planner`, no external dependencies.
@@ -545,15 +548,14 @@ What is deliberately *not* here yet: logical rewrites beyond single-table
 predicate pushdown (no projection pushdown or constant folding), multi-index
 intersection, and join-order enumeration (joins are planned in written
 order). These are optimizer refinements, not correctness gaps, and are out of
-scope for the must-have M6.
+scope for the planner.
 
 ---
 
-## Executor and engine (Sprint 9 - M1)
+## Executor and engine
 
 The executor runs a physical plan against stored data, and the `picklejar`
-engine ties every layer together so a SQL string produces rows. This is
-requirement M1 (CREATE / INSERT / SELECT with WHERE).
+engine ties every layer together so a SQL string produces rows.
 
 ### Row codec
 
@@ -689,7 +691,7 @@ the planner can cost an `IndexScan`, and persists its root page in the sidecar.
   free of storage lifetimes and pin bookkeeping. Streaming is a later
   optimization.
 
-### Known limitations (tracked, not gaps in M1)
+### Known limitations
 
 - `IndexScan` uses a real index lookup for unique INT columns (`PRIMARY KEY` /
   `UNIQUE`); see Secondary indexes above. Non-unique and TEXT predicates fall
@@ -719,7 +721,7 @@ the planner can cost an `IndexScan`, and persists its root page in the sidecar.
 
 `picklejar-cli` is a psql-style REPL: SQL terminated by `;` prints an aligned
 table, `EXPLAIN <select>` prints the plan, and backslash meta-commands
-(`\dt`, `\d <table>`, `\q`) introspect and exit. This is the M1 demo surface.
+(`\dt`, `\d <table>`, `\q`) introspect and exit. This is the core CLI surface.
 
 ### HTTP API server
 
@@ -805,50 +807,34 @@ serial, hence correct, just not yet concurrent.
 
 - **Unit tests** in each module. Fast (`cargo test --lib` runs in <50ms today).
 - **Property tests** via `proptest` in `crates/storage/tests/proptests.rs`. Covers header round-trip, a full checksum bit-flip sweep (8 KiB x 8 bits = 65K flips per case), insert/delete/compact op-sequence invariants against an oracle, and file-manager durability across reopen.
-- **Crash-recovery torture test** (Sprint 4, shipped): `crates/wal/tests/torture.rs` spawns the `crash_harness` binary, force-kills it mid-write, recovers, and asserts no committed row is lost. Runs several rounds. A polish pass in Sprint 10 will extend the run length and add a long-soak variant.
+- **Crash-recovery torture test**: `crates/wal/tests/torture.rs` spawns the `crash_harness` binary, force-kills it mid-write, recovers, and asserts no committed row is lost. Runs several rounds. A polish pass in Sprint 10 will extend the run length and add a long-soak variant.
 - **Deterministic simulation testing** (`crates/wal/src/sim.rs`, the `dst` binary): seeded, reproducible crash-recovery exploration over a durability-modeling fault disk. Found and fixed a real undo bug. See [Crash model and the torture test](#crash-model-and-the-torture-test).
 - **Differential testing against SQLite** (`crates/picklejar-difftest`, the `difftest` binary): for each seed, a generator emits random SQL in a dialect-shared subset (INT/TEXT columns, type-correct predicates, integer aggregates, no `ORDER BY` reliance) and runs the identical SQL through both picklejar and SQLite, comparing results as a sorted multiset. SQLite is the independent oracle: any divergence is a picklejar bug. Thousands of seeds covering joins, `GROUP BY` / `HAVING`, `DISTINCT`, and three-valued NULL logic agree with SQLite. The generator is deliberately type-correct, since picklejar (like Postgres) rejects cross-type comparisons that SQLite's dynamic typing would coerce; that difference is by design, not a bug. The generated subset will widen over time (more operators and types) to push the comparison further.
 - CI bumps `PROPTEST_CASES=512` (local default 256).
 
 ---
 
-## Open questions
+## Future work
 
-Resolved during Sprint 1 (moved to the relevant sections above):
-- ~~Page size~~ -> 8 KiB.
-- ~~Checksum algorithm~~ -> CRC32 IEEE, scope `[12..PAGE_SIZE]`.
-- ~~Slot ID recycling policy~~ -> no recycling, IDs stable for page lifetime.
-- ~~Tombstone encoding~~ -> slot length 0.
+The query path is complete; these are the deliberate next steps, each tracked
+as an issue.
 
-Resolved during Sprint 2/3 (moved to relevant sections above):
-- ~~B+ tree fanout~~: 509 keys per internal node, 453 per leaf, locked.
-- ~~Buffer pool replacement~~: LRU-K with K=2.
-- ~~WAL record field ordering~~: locked (length, type, lsn, txn, prev_lsn, payload, checksum).
+- **Richer indexing.** A secondary index currently requires a unique key,
+  because the B+ tree rejects duplicate keys. A duplicate-aware leaf (or a key
+  suffix) would allow an index on any column.
+- **Concurrency depth.** Dead versions are reclaimed by `VACUUM`; epoch-based
+  background garbage collection and first-updater-wins write-write conflict
+  detection for overlapping explicit transactions are the next steps.
+- **Checkpointing and group commit.** The `Checkpoint` record type exists and
+  carries the active-transaction table; bounding recovery to the last
+  checkpoint, and batching `fsync` across committers, are additive performance
+  work.
+- **Authentication and TLS** for the wire server, so it is safe to expose.
+- **Replication and point-in-time recovery**, built on the existing WAL.
 
-Resolved during Sprint 4 (moved to relevant sections above):
-- ~~CLR granularity~~: one CLR per undo step, with `undo_next` chaining for crash-safe, idempotent rollback.
-- ~~Recovery start point~~: scan from the start of the WAL. The dirty-page-table optimization (start redo at the earliest recovery LSN) is deferred - with no long-running server, a full scan is fast and far simpler to reason about. The `Checkpoint` record type exists and carries the active txn table so adding a checkpoint-bounded analysis later is additive.
-- ~~Crash model for testing~~: forced process kill of a child harness, plus an in-process "drop the pool without flushing" simulation.
+## References
 
-Still open (resolve before the relevant sprint):
-
-| Question | When to resolve |
-|---|---|
-| Free-space tracking: per-page free-space map, or scan-on-demand? | Sprint 5 (executor needs it) |
-| MVCC garbage collection: epoch-based or vacuum scan? | Sprint 6 |
-| Write-write conflict detection: first-committer-wins or SSI? | Sprint 6 |
-| Checkpoint strategy: fuzzy vs sharp, and frequency (time / txn-count / WAL-size)? | Sprint 6 (when there is a long-running server to checkpoint) |
-| Page checksum maintenance on the write path (recompute on flush)? | Sprint 6 |
-| Group commit: batch fsync across multiple committers? | Sprint 6 |
-
-Resolved during Sprint 5 (moved to the Transactions + MVCC section above):
-- ~~Snapshot model~~: txid-based (Postgres-style xmin/xmax/active set).
-- ~~Isolation levels~~: RepeatableRead (default) + ReadCommitted shipped; SI is the baseline.
-- ~~Version chain storage~~: chain pointer (prev `TupleRef`) inside the version payload, not the page header.
-
----
-
-## Reference reading (load when relevant)
+- Mohan et al., *ARIES: A Transaction Recovery Method Supporting Fine-Granularity Locking and Partial Rollbacks Using Write-Ahead Logging* (1992).
 
 - Mohan et al., *ARIES: A Transaction Recovery Method Supporting Fine-Granularity Locking and Partial Rollbacks Using Write-Ahead Logging* (1992).
 - CMU 15-445 / 15-721 lectures (Pavlo).
