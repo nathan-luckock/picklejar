@@ -207,6 +207,32 @@ impl Catalog {
         Ok(())
     }
 
+    /// Append a column to an existing table (for `ALTER TABLE ADD COLUMN`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the table is unknown or the column already exists.
+    pub fn add_column(&mut self, table: &str, col: &rustdb_sql::ColumnDef) -> Result<()> {
+        let meta = self
+            .tables
+            .get_mut(table)
+            .ok_or_else(|| PlanError::UnknownTable(table.to_string()))?;
+        if meta.column_index(&col.name).is_some() {
+            return Err(PlanError::Unsupported(format!(
+                "column {} already exists",
+                col.name
+            )));
+        }
+        meta.columns.push(Column {
+            name: col.name.clone(),
+            ty: col.ty,
+            primary_key: col.primary_key,
+            not_null: col.not_null || col.primary_key,
+            unique: col.unique || col.primary_key,
+        });
+        Ok(())
+    }
+
     /// Set a column's statistics.
     pub fn set_column_stats(
         &mut self,

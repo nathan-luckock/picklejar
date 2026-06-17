@@ -310,6 +310,10 @@ impl Database {
             }
             Statement::DropTable { ref name } => self.drop_table(&stmt, name),
             Statement::Truncate { ref table } => self.truncate_table(table),
+            Statement::AlterTableAddColumn {
+                ref table,
+                ref column,
+            } => self.alter_add_column(table, column),
             // EXPLAIN only plans; it touches no data.
             Statement::Explain(_) => self.run_explain(&stmt),
             // DML and SELECT run inside the open transaction, or a fresh
@@ -493,6 +497,115 @@ impl Database {
             sec.root = Index::create(&self.pool)?.root();
         }
         self.catalog.set_row_count(name, 0)?;
+        self.persist()?;
+        Ok(QueryOutcome::Ddl)
+    }
+
+    /// Append a column to a table, rewriting every existing row into fresh
+    /// storage under the new schema (the new column takes its DEFAULT or NULL).
+    /// Rewriting into new pages avoids leaving old-schema versions that a later
+    /// snapshot could not decode.
+    #[allow(clippy::too_many_lines)]
+    fn alter_add_column(&mut self, table: &str, col: &ColumnDef) -> Result<QueryOutcome> {
+        // 1. Read every current row under the existing schema.
+        let old_schema: Vec<DataType> = self
+            .catalog
+            .get_table(table)
+            .ok_or_else(|| DbError::UnknownTable(table.to_string()))?
+            .columns
+            .iter()
+            .map(|c| c.ty)
+            .collect();
+        let reader = self.mgr.begin();
+        let old_rows: Vec<Vec<Value>> = {
+            let store = self
+                .tables
+                .get(table)
+                .ok_or_else(|| DbError::UnknownTable(table.to_string()))?;
+            let handle = MvccTable::open(
+                &self.pool,
+                self.wal.clone(),
+                &self.mgr,
+                store.index_root,
+                store.version_page,
+            );
+            handle
+                .scan(&reader)?
+                .into_iter()
+                .map(|(_k, bytes)| decode_row(&bytes, &old_schema))
+                .collect::<std::result::Result<_, _>>()?
+        };
+        self.mgr.commit(&reader);
+
+        // 2. Extend the catalog and const-evaluate the new column's default.
+        self.catalog.add_column(table, col)?;
+        let default = col.default.as_ref().map(const_eval).transpose()?;
+        let new_schema: Vec<DataType> = self
+            .catalog
+            .get_table(table)
+            .expect("just added")
+            .columns
+            .iter()
+            .map(|c| c.ty)
+            .collect();
+
+        // 3. Fresh storage and a rebuilt secondary index per unique INT column
+        //    (registering a catalog index for any newly indexable column).
+        let new_table = MvccTable::create(&self.pool, self.wal.clone(), &self.mgr)?;
+        let cols = self
+            .catalog
+            .get_table(table)
+            .expect("present")
+            .columns
+            .clone();
+        let mut secondary = Vec::new();
+        for (i, c) in cols.iter().enumerate() {
+            if c.ty == DataType::Int && c.unique {
+                if self
+                    .catalog
+                    .get_table(table)
+                    .and_then(|m| m.index_on(&c.name))
+                    .is_none()
+                {
+                    self.catalog.apply(&Statement::CreateIndex {
+                        name: format!("{table}_{}_idx", c.name),
+                        table: table.to_string(),
+                        column: c.name.clone(),
+                    })?;
+                }
+                secondary.push(SecondaryIndex {
+                    column: i,
+                    root: Index::create(&self.pool)?.root(),
+                });
+            }
+        }
+
+        // 4. Re-insert each row with the new column appended.
+        let writer = self.mgr.begin();
+        let mut rowid: u64 = 0;
+        for mut values in old_rows {
+            values.push(default.clone().unwrap_or(Value::Null));
+            let bytes = encode_row(&values, &new_schema)?;
+            new_table.insert(&writer, rowid, &bytes)?;
+            for sec in &mut secondary {
+                let index = Index::open(&self.pool, sec.root);
+                index.put(&values[sec.column], rowid)?;
+                sec.root = index.root();
+            }
+            rowid += 1;
+        }
+        self.mgr.commit(&writer);
+
+        // 5. Swap in the new anchors and persist.
+        let index_root = new_table.index_root();
+        let version_page = new_table.version_page();
+        let store = self.tables.get_mut(table).expect("present");
+        store.index_root = index_root;
+        store.version_page = version_page;
+        store.next_rowid = rowid;
+        store.secondary = secondary;
+        store.defaults.push(default);
+        self.catalog.set_row_count(table, rowid)?;
         self.persist()?;
         Ok(QueryOutcome::Ddl)
     }
@@ -2253,6 +2366,68 @@ mod tests {
             "SELECT name FROM emp WHERE NOT EXISTS (SELECT 1 FROM dept WHERE region = 'north') ORDER BY name LIMIT 1",
         );
         assert_eq!(name_set(&empty_ok), vec!["a"]);
+    }
+
+    // --- ALTER TABLE ADD COLUMN ---
+
+    #[test]
+    fn alter_add_column_backfills_existing_rows() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE t (id INT, name TEXT)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b')")
+            .unwrap();
+        // Add a column with a default; existing rows get the default.
+        db.execute("ALTER TABLE t ADD COLUMN active BOOL DEFAULT TRUE")
+            .unwrap();
+        // And one without a default (NULL-backfilled).
+        db.execute("ALTER TABLE t ADD COLUMN note TEXT").unwrap();
+        let (cols, rows) = query(&mut db, "SELECT id, name, active, note FROM t ORDER BY id");
+        assert_eq!(names(&cols), ["id", "name", "active", "note"]);
+        assert_eq!(
+            rows,
+            vec![
+                vec![
+                    Value::Int(1),
+                    Value::Text("a".into()),
+                    Value::Bool(true),
+                    Value::Null
+                ],
+                vec![
+                    Value::Int(2),
+                    Value::Text("b".into()),
+                    Value::Bool(true),
+                    Value::Null
+                ],
+            ]
+        );
+        // New inserts can supply the added columns.
+        db.execute("INSERT INTO t (id, name, active, note) VALUES (3, 'c', FALSE, 'hi')")
+            .unwrap();
+        let (_c, r3) = query(&mut db, "SELECT active, note FROM t WHERE id = 3");
+        assert_eq!(r3, vec![vec![Value::Bool(false), Value::Text("hi".into())]]);
+    }
+
+    #[test]
+    fn alter_add_column_survives_reopen() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("alt.db");
+        {
+            let mut db = Database::open(&path).expect("open");
+            db.execute("CREATE TABLE t (id INT)").unwrap();
+            db.execute("INSERT INTO t VALUES (1)").unwrap();
+            db.execute("ALTER TABLE t ADD COLUMN score INT DEFAULT 5")
+                .unwrap();
+        }
+        let mut db = Database::open(&path).expect("reopen");
+        db.execute("INSERT INTO t (id) VALUES (2)").unwrap();
+        let (_c, rows) = query(&mut db, "SELECT id, score FROM t ORDER BY id");
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Int(1), Value::Int(5)],
+                vec![Value::Int(2), Value::Int(5)],
+            ]
+        );
     }
 
     // --- TRUNCATE ---
