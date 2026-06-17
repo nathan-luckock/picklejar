@@ -6,7 +6,7 @@
 //! table and column exists. A single-table WHERE is placed directly above
 //! the Scan (predicate pushdown); with joins it sits above the join tree.
 
-use rustdb_sql::{Expr, Select, SelectItem, Statement, TableRef};
+use rustdb_sql::{Expr, Select, SelectItem, Statement, TableRef, Value};
 
 use crate::catalog::{Catalog, TableMeta};
 use crate::error::{PlanError, Result};
@@ -125,8 +125,11 @@ fn bind_select(catalog: &Catalog, select: &Select) -> Result<LogicalPlan> {
     if !select.order_by.is_empty() {
         let mut keys = Vec::with_capacity(select.order_by.len());
         for item in &select.order_by {
-            resolve_expr(&item.expr, &scope)?;
-            keys.push((item.expr.clone(), item.desc));
+            // `ORDER BY 2` (an ordinal) or `ORDER BY alias` resolves to the
+            // matching projection expression; anything else is a plain column.
+            let key = resolve_order_key(&item.expr, &select.projections);
+            resolve_expr(&key, &scope)?;
+            keys.push((key, item.desc));
         }
         plan = LogicalPlan::Sort {
             keys,
@@ -231,6 +234,30 @@ fn resolve_expr(expr: &Expr, scope: &[ScopeEntry<'_>]) -> Result<()> {
             PlanError::Unsupported("correlated subqueries are not supported".to_string()),
         ),
     }
+}
+
+/// Map an `ORDER BY` key that is a positional ordinal (`ORDER BY 2`) or an
+/// output-column alias to the underlying projection expression. Anything else
+/// (a plain or computed column reference) is returned unchanged.
+fn resolve_order_key(expr: &Expr, projections: &[SelectItem]) -> Expr {
+    if let Expr::Literal(Value::Int(n)) = expr {
+        if let Ok(i) = usize::try_from(*n) {
+            if let Some(SelectItem::Expr(e, _)) = i.checked_sub(1).and_then(|j| projections.get(j))
+            {
+                return e.clone();
+            }
+        }
+    }
+    if let Expr::Column(name) = expr {
+        for item in projections {
+            if let SelectItem::Expr(e, Some(alias)) = item {
+                if alias == name {
+                    return e.clone();
+                }
+            }
+        }
+    }
+    expr.clone()
 }
 
 /// Whether `name` (already upper-cased by the parser) is an aggregate.

@@ -2222,6 +2222,37 @@ mod tests {
         );
     }
 
+    // --- ORDER BY ordinal and output alias ---
+
+    #[test]
+    fn order_by_ordinal_and_alias() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE t (a INT, b INT)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 30), (2, 10), (3, 20)")
+            .unwrap();
+        // ORDER BY 2 sorts by the second projected column (b).
+        let (_c, rows) = query(&mut db, "SELECT a, b FROM t ORDER BY 2");
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Int(2), Value::Int(10)],
+                vec![Value::Int(3), Value::Int(20)],
+                vec![Value::Int(1), Value::Int(30)],
+            ]
+        );
+        // ORDER BY an output alias backed by an expression.
+        let (cols, sums) = query(&mut db, "SELECT a + b AS s FROM t ORDER BY s DESC");
+        assert_eq!(names(&cols), ["s"]);
+        assert_eq!(
+            sums,
+            vec![
+                vec![Value::Int(31)],
+                vec![Value::Int(23)],
+                vec![Value::Int(12)],
+            ]
+        );
+    }
+
     // --- more built-in functions ---
 
     #[test]
