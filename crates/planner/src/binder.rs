@@ -304,6 +304,9 @@ fn resolve_expr(expr: &Expr, scope: &[ScopeEntry]) -> Result<()> {
         // by the engine before binding); its body is validated when it runs per
         // row in the executor's subquery runner.
         Expr::Literal(_) | Expr::Star | Expr::Subquery(_) | Expr::Exists(_) => Ok(()),
+        // A parameter must be bound to a value (by the wire protocol) before
+        // planning; one surviving to the binder was never supplied.
+        Expr::Parameter(n) => Err(PlanError::Unsupported(format!("unbound parameter ${n}"))),
     }
 }
 

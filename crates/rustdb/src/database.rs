@@ -1429,9 +1429,11 @@ impl Database {
                     .transpose()?,
             }),
             // Leaves carry no nested expressions.
-            Expr::Column(_) | Expr::QualifiedColumn(..) | Expr::Literal(_) | Expr::Star => {
-                Ok(expr.clone())
-            }
+            Expr::Column(_)
+            | Expr::QualifiedColumn(..)
+            | Expr::Literal(_)
+            | Expr::Parameter(_)
+            | Expr::Star => Ok(expr.clone()),
         }
     }
 

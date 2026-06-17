@@ -92,7 +92,16 @@ postgres->  WHERE rust_years > (SELECT AVG(rust_years) FROM engineers WHERE acti
 (1 row)
 ```
 
-The correlated subquery, the aggregate, and `EXPLAIN` all run through the engine and render as ordinary psql tables. The simple query protocol is implemented; the extended (parse/bind/execute) protocol used by some drivers is the next step.
+The correlated subquery, the aggregate, and `EXPLAIN` all run through the engine and render as ordinary psql tables. Both the simple and the **extended query protocol** (parse/bind/execute with `$N` parameters) are implemented, so server-side prepared statements and the drivers that use them work. Verified against `psql` 18's `\bind`:
+
+```text
+postgres=> SELECT name, age FROM users WHERE age > $1 ORDER BY age \bind 28 \g
+ name  | age
+-------+-----
+ alice |  30
+ carol |  40
+(2 rows)
+```
 
 ## Correctness and crash safety
 
@@ -182,10 +191,10 @@ The project targets Rust 1.80+ and has no external database, SQL-parser, wire-pr
 ## Roadmap
 
 Done: the storage / WAL+ARIES / MVCC / planner / executor core, a deep SQL
-surface, `CHECK` and `FOREIGN KEY` constraints, the PostgreSQL wire protocol,
-deterministic simulation testing, and differential testing against SQLite.
-Next: the extended wire protocol for drivers, more column types
-(`DATE` / `TIMESTAMP` / `DECIMAL`), and concurrent connections (the engine is
+surface, `CHECK` and `FOREIGN KEY` constraints, the PostgreSQL wire protocol
+(simple and extended, with parameters), deterministic simulation testing, and
+differential testing against SQLite. Next: more column types
+(`DATE` / `TIMESTAMP` / `DECIMAL`) and concurrent connections (the engine is
 single-threaded today). See [docs/sprints.md](docs/sprints.md) and
 [docs/design.md](docs/design.md).
 

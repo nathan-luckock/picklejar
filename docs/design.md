@@ -665,6 +665,41 @@ its API have no external dependencies beyond CLI and logging plumbing.
 This is the boundary the studio UI is built on: a SQL editor posts to
 `/api/query` and renders the tagged result.
 
+### PostgreSQL wire protocol
+
+`rustdb-pg` (in the `rustdb-server` crate, module `pgwire`) serves the engine
+over the real PostgreSQL v3 frontend/backend protocol, so the actual `psql`
+client, GUI tools, and language drivers connect to it directly. Like the HTTP
+server it is single-threaded and owns one `Database`, serving one connection at
+a time. The framing is exact: each backend message is a one-byte type tag, a
+big-endian length that counts itself but not the tag, then the payload.
+
+- **Startup**: SSL/GSS negotiation is declined with a single byte so clients
+  fall back to cleartext; protocol 3.0 is accepted with trust authentication,
+  a few `ParameterStatus` values, `BackendKeyData`, and `ReadyForQuery`.
+- **Simple query** (`Query`): a statement string (split on `;`, respecting
+  quoted semicolons) is run through `Database::execute`. Rows become
+  `RowDescription` + `DataRow` per row + `CommandComplete` (with the right tag:
+  `SELECT n`, `INSERT 0 n`, `CREATE TABLE`, ...); `EXPLAIN` renders as a
+  `QUERY PLAN` text column; an error becomes `ErrorResponse` and abandons the
+  rest of the batch.
+- **Extended query** (`Parse` / `Bind` / `Describe` / `Execute` / `Close` /
+  `Sync` / `Flush`): positional parameters `$N` are a parser-level expression
+  (`Expr::Parameter`). `Bind` decodes each value (text format typed by its OID,
+  with an unspecified type inferred, plus the common binary scalar formats) and
+  substitutes it into the statement (`Statement::substitute_params`), turning a
+  prepared statement into an ordinary one. `Describe` of a portal runs a
+  row-returning statement to learn its columns and caches the result for the
+  following `Execute`; a non-row statement answers `NoData` and runs once on
+  `Execute`. This is what lets drivers that use server-side prepared statements
+  (and `psql`'s `\bind`) work, verified end to end against `psql` 18.
+- **Types**: `INT` / `FLOAT` / `BOOL` / `TEXT` map to the int8 / float8 / bool /
+  text OIDs; values are sent in text format (bool as `t` / `f`). Result column
+  types are inferred from the first non-null value in the result.
+
+The wire protocol reuses the same `Database::execute` entry point as the CLI and
+the HTTP API, so every interface exercises one engine.
+
 ---
 
 ## Testing strategy

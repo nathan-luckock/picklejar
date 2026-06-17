@@ -370,6 +370,10 @@ impl Parser {
                 self.advance();
                 Ok(Expr::Literal(Value::Text(s)))
             }
+            TokenKind::Param(n) => {
+                self.advance();
+                Ok(Expr::Parameter(n))
+            }
             TokenKind::Keyword(Keyword::Null) => {
                 self.advance();
                 Ok(Expr::Literal(Value::Null))

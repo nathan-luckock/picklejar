@@ -11,7 +11,7 @@
 
 use std::fmt;
 
-use crate::ast::Expr;
+use crate::ast::{Expr, Value};
 use crate::error::{Result, SqlError};
 use crate::parser::Parser;
 use crate::token::{Keyword, TokenKind};
@@ -1138,6 +1138,138 @@ impl Parser {
             }
         }
         Ok(idents)
+    }
+}
+
+impl Statement {
+    /// Replace every positional parameter (`$N`) anywhere in the statement with
+    /// `params[N-1]`, so a prepared statement bound by the wire protocol becomes
+    /// an ordinary, runnable statement.
+    #[must_use]
+    pub fn substitute_params(&self, params: &[Value]) -> Self {
+        match self {
+            Self::Select(s) => Self::Select(Box::new(s.substitute_params(params))),
+            Self::Insert {
+                table,
+                columns,
+                rows,
+            } => Self::Insert {
+                table: table.clone(),
+                columns: columns.clone(),
+                rows: rows
+                    .iter()
+                    .map(|r| r.iter().map(|e| e.substitute_params(params)).collect())
+                    .collect(),
+            },
+            Self::Update {
+                table,
+                assignments,
+                where_clause,
+            } => Self::Update {
+                table: table.clone(),
+                assignments: assignments
+                    .iter()
+                    .map(|(c, e)| (c.clone(), e.substitute_params(params)))
+                    .collect(),
+                where_clause: where_clause.as_ref().map(|w| w.substitute_params(params)),
+            },
+            Self::Delete {
+                table,
+                where_clause,
+            } => Self::Delete {
+                table: table.clone(),
+                where_clause: where_clause.as_ref().map(|w| w.substitute_params(params)),
+            },
+            Self::Union {
+                all,
+                left,
+                right,
+                order_by,
+                limit,
+                offset,
+            } => Self::Union {
+                all: *all,
+                left: Box::new(left.substitute_params(params)),
+                right: Box::new(right.substitute_params(params)),
+                order_by: order_by
+                    .iter()
+                    .map(|o| OrderItem {
+                        expr: o.expr.substitute_params(params),
+                        desc: o.desc,
+                    })
+                    .collect(),
+                limit: *limit,
+                offset: *offset,
+            },
+            Self::Explain(inner) => Self::Explain(Box::new(inner.substitute_params(params))),
+            Self::CreateView { name, query } => Self::CreateView {
+                name: name.clone(),
+                query: Box::new(query.substitute_params(params)),
+            },
+            // DDL and transaction control carry no expressions to bind.
+            other => other.clone(),
+        }
+    }
+}
+
+impl Select {
+    fn substitute_params(&self, params: &[Value]) -> Self {
+        Self {
+            distinct: self.distinct,
+            projections: self
+                .projections
+                .iter()
+                .map(|p| match p {
+                    SelectItem::Star => SelectItem::Star,
+                    SelectItem::Expr(e, alias) => {
+                        SelectItem::Expr(e.substitute_params(params), alias.clone())
+                    }
+                })
+                .collect(),
+            from: self.from.substitute_params(params),
+            joins: self
+                .joins
+                .iter()
+                .map(|j| Join {
+                    kind: j.kind,
+                    table: j.table.substitute_params(params),
+                    on: j.on.substitute_params(params),
+                })
+                .collect(),
+            where_clause: self
+                .where_clause
+                .as_ref()
+                .map(|w| w.substitute_params(params)),
+            group_by: self
+                .group_by
+                .iter()
+                .map(|g| g.substitute_params(params))
+                .collect(),
+            having: self.having.as_ref().map(|h| h.substitute_params(params)),
+            order_by: self
+                .order_by
+                .iter()
+                .map(|o| OrderItem {
+                    expr: o.expr.substitute_params(params),
+                    desc: o.desc,
+                })
+                .collect(),
+            limit: self.limit,
+            offset: self.offset,
+        }
+    }
+}
+
+impl TableRef {
+    fn substitute_params(&self, params: &[Value]) -> Self {
+        Self {
+            name: self.name.clone(),
+            alias: self.alias.clone(),
+            subquery: self
+                .subquery
+                .as_ref()
+                .map(|q| Box::new(q.substitute_params(params))),
+        }
     }
 }
 

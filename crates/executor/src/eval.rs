@@ -63,6 +63,7 @@ pub fn eval_with(
             resolve(&format!("{qualifier}.{name}"), row, columns)
         }
         Expr::Star => Err(ExecError::Unsupported("`*` used as a value".into())),
+        Expr::Parameter(n) => Err(ExecError::Unsupported(format!("unbound parameter ${n}"))),
         Expr::Unary { op, expr } => eval_unary(*op, expr, row, columns, runner),
         Expr::Binary { op, left, right } => eval_binary(*op, left, right, row, columns, runner),
         // A scalar function is computed here; anything else (an aggregate call,

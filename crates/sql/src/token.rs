@@ -191,6 +191,9 @@ pub enum TokenKind {
     Float(f64),
     /// A single-quoted string literal (contents, unescaped).
     Str(String),
+    /// A positional parameter placeholder `$N` (the extended wire protocol
+    /// binds a value to each before execution).
+    Param(u32),
 
     // Operators and punctuation.
     /// `=`

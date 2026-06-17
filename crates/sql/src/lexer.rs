@@ -56,6 +56,7 @@ impl<'a> Lexer<'a> {
                 b'!' => self.bang()?,
                 b'|' => self.pipe()?,
                 b'\'' => self.string()?,
+                b'$' => self.param()?,
                 b'0'..=b'9' => self.number()?,
                 c if is_ident_start(c) => self.word(),
                 other => {
@@ -181,6 +182,22 @@ impl<'a> Lexer<'a> {
                 }
             }
         }
+    }
+
+    /// Lex a positional parameter `$N`. The `$` is consumed here, then the
+    /// digits. A `$` with no following digit is an error.
+    fn param(&mut self) -> Result<TokenKind> {
+        self.bump(); // consume '$'
+        let start = self.pos;
+        while matches!(self.peek(), Some(b'0'..=b'9')) {
+            self.bump();
+        }
+        let text = &self.src[start..self.pos];
+        let n = text.parse::<u32>().map_err(|_| SqlError::UnexpectedChar {
+            ch: '$',
+            pos: start,
+        })?;
+        Ok(TokenKind::Param(n))
     }
 
     fn number(&mut self) -> Result<TokenKind> {

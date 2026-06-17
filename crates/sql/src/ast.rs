@@ -165,6 +165,9 @@ pub enum Expr {
     QualifiedColumn(String, String),
     /// A literal value.
     Literal(Value),
+    /// A positional parameter `$N` (1-based), bound to a value by the extended
+    /// wire protocol before the statement runs.
+    Parameter(u32),
     /// `*` (only valid in a projection list; parsed as an expression for
     /// uniformity).
     Star,
@@ -223,6 +226,70 @@ pub enum Expr {
 }
 
 impl Expr {
+    /// Replace every positional parameter `$N` with `params[N-1]` (or `NULL`
+    /// when out of range), recursing through the whole expression and any
+    /// nested subqueries. Used by the extended wire protocol to bind values.
+    #[must_use]
+    pub fn substitute_params(&self, params: &[Value]) -> Self {
+        match self {
+            Self::Parameter(n) => Self::Literal(
+                (*n as usize)
+                    .checked_sub(1)
+                    .and_then(|i| params.get(i))
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            ),
+            Self::Binary { op, left, right } => Self::Binary {
+                op: *op,
+                left: Box::new(left.substitute_params(params)),
+                right: Box::new(right.substitute_params(params)),
+            },
+            Self::Unary { op, expr } => Self::Unary {
+                op: *op,
+                expr: Box::new(expr.substitute_params(params)),
+            },
+            Self::Func {
+                name,
+                distinct,
+                args,
+            } => Self::Func {
+                name: name.clone(),
+                distinct: *distinct,
+                args: args.iter().map(|a| a.substitute_params(params)).collect(),
+            },
+            Self::Case {
+                operand,
+                whens,
+                else_result,
+            } => Self::Case {
+                operand: operand
+                    .as_ref()
+                    .map(|o| Box::new(o.substitute_params(params))),
+                whens: whens
+                    .iter()
+                    .map(|(w, t)| (w.substitute_params(params), t.substitute_params(params)))
+                    .collect(),
+                else_result: else_result
+                    .as_ref()
+                    .map(|e| Box::new(e.substitute_params(params))),
+            },
+            Self::Subquery(q) => Self::Subquery(Box::new(q.substitute_params(params))),
+            Self::Exists(q) => Self::Exists(Box::new(q.substitute_params(params))),
+            Self::InSubquery {
+                expr,
+                query,
+                negated,
+            } => Self::InSubquery {
+                expr: Box::new(expr.substitute_params(params)),
+                query: Box::new(query.substitute_params(params)),
+                negated: *negated,
+            },
+            Self::Column(_) | Self::QualifiedColumn(..) | Self::Literal(_) | Self::Star => {
+                self.clone()
+            }
+        }
+    }
+
     /// Build a binary expression node.
     #[must_use]
     pub fn binary(op: BinOp, left: Self, right: Self) -> Self {
@@ -249,6 +316,7 @@ impl fmt::Display for Expr {
             Self::Column(c) => f.write_str(c),
             Self::QualifiedColumn(t, c) => write!(f, "{t}.{c}"),
             Self::Literal(v) => write!(f, "{v}"),
+            Self::Parameter(n) => write!(f, "${n}"),
             Self::Star => f.write_str("*"),
             // Fully parenthesized so re-parsing reproduces the same tree.
             Self::Binary { op, left, right } => write!(f, "({left} {op} {right})"),
