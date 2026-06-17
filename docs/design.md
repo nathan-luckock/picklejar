@@ -398,6 +398,13 @@ Transaction control is `BEGIN` / `COMMIT` / `ROLLBACK`. `SELECT` covers:
 - Derived tables: a subquery as a `FROM` / `JOIN` relation,
   `(SELECT ...) AS x`, with its columns re-qualified under the alias. A view
   reference expands to the same machinery over its stored query.
+- Common table expressions: `WITH name AS (query), ... body`. The engine
+  inlines each CTE reference in the body (and in later CTEs) into a derived
+  table over its query before planning, so a CTE is just a named subquery and
+  reuses the derived-table machinery. CTEs are processed in declaration order,
+  so a later one may reference an earlier one. `WITH RECURSIVE` and a
+  self-referencing CTE are rejected for now (recursion is future work), as is
+  a `WITH` column-rename list.
 - `EXPLAIN` of any of the above.
 
 The expression grammar has four column types (`INT`, `FLOAT`, `BOOL`, `TEXT`),

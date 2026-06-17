@@ -36,7 +36,7 @@ use rustdb_planner::{bind, explain, plan, Catalog, ColumnStats};
 use crate::correlated;
 use crate::correlated::{CorrelatedRunner, MaterializedSource};
 use rustdb_sql::statement::{
-    ColumnDef, ConflictAction, DataType, Join, OnConflict, OrderItem, Select, SelectItem,
+    ColumnDef, ConflictAction, Cte, DataType, Join, OnConflict, OrderItem, Select, SelectItem,
     TableConstraint, TableRef,
 };
 use rustdb_sql::{BinOp, Expr, Parser, Statement, UnOp, Value};
@@ -452,6 +452,9 @@ impl Database {
     /// yet supported.
     pub fn execute(&mut self, sql: &str) -> Result<QueryOutcome> {
         let stmt = Parser::from_sql(sql)?.parse_statement()?;
+        // Inline any WITH common table expressions into the body before routing,
+        // so the rest of the engine only sees plain queries and derived tables.
+        let stmt = expand_ctes(stmt)?;
         match stmt {
             // Transaction control.
             Statement::Begin => self.begin_txn(),
@@ -478,6 +481,10 @@ impl Database {
             } => self.alter_add_column(table, column),
             // EXPLAIN only plans; it touches no data.
             Statement::Explain(_) => self.run_explain(&stmt),
+            // `expand_ctes` above rewrote any WITH into a plain query.
+            Statement::With { .. } => {
+                unreachable!("WITH is expanded into its body before dispatch")
+            }
             // DML and SELECT run inside the open transaction, or a fresh
             // auto-commit one.
             Statement::Insert { .. }
@@ -2105,6 +2112,141 @@ fn find_equality(predicate: &Expr, col: &str) -> Option<Value> {
     }
 }
 
+/// Inline a top-level `WITH` (or `EXPLAIN WITH`) into a plain query, leaving
+/// every other statement untouched. After this the engine only ever routes
+/// `Select` / `Union` / DML, never a `With`.
+fn expand_ctes(stmt: Statement) -> Result<Statement> {
+    match stmt {
+        Statement::With {
+            recursive,
+            ctes,
+            body,
+        } => inline_with(recursive, &ctes, &body),
+        Statement::Explain(inner) => Ok(Statement::Explain(Box::new(expand_ctes(*inner)?))),
+        other => Ok(other),
+    }
+}
+
+/// Rewrite every reference to a CTE in `body` (and in later CTEs) into a derived
+/// table over the CTE's query. CTEs are processed in order so a later one may
+/// reference an earlier one. Recursion is not supported yet and is rejected.
+fn inline_with(recursive: bool, ctes: &[Cte], body: &Statement) -> Result<Statement> {
+    if recursive {
+        return Err(DbError::Unsupported(
+            "WITH RECURSIVE is not yet supported".into(),
+        ));
+    }
+    let mut resolved: HashMap<String, Statement> = HashMap::new();
+    for cte in ctes {
+        if !cte.columns.is_empty() {
+            return Err(DbError::Unsupported(
+                "a column list on a WITH query is not yet supported".into(),
+            ));
+        }
+        // A CTE that names itself would need RECURSIVE; reject it clearly.
+        if references_table(&cte.query, &cte.name) {
+            return Err(DbError::Unsupported(format!(
+                "CTE {} references itself; WITH RECURSIVE is required and not yet supported",
+                cte.name
+            )));
+        }
+        let inlined = rewrite_cte_query(&cte.query, &resolved);
+        resolved.insert(cte.name.clone(), inlined);
+    }
+    Ok(rewrite_cte_query(body, &resolved))
+}
+
+/// Rewrite CTE references in a query node (a `Select` or set operation),
+/// recursing through set-operation branches.
+fn rewrite_cte_query(stmt: &Statement, ctes: &HashMap<String, Statement>) -> Statement {
+    match stmt {
+        Statement::Select(s) => Statement::Select(Box::new(rewrite_cte_select(s, ctes))),
+        Statement::Union {
+            op,
+            all,
+            left,
+            right,
+            order_by,
+            limit,
+            offset,
+        } => Statement::Union {
+            op: *op,
+            all: *all,
+            left: Box::new(rewrite_cte_query(left, ctes)),
+            right: Box::new(rewrite_cte_query(right, ctes)),
+            order_by: order_by.clone(),
+            limit: *limit,
+            offset: *offset,
+        },
+        other => other.clone(),
+    }
+}
+
+/// Rewrite CTE references in a `Select`'s FROM and JOIN relations.
+fn rewrite_cte_select(s: &Select, ctes: &HashMap<String, Statement>) -> Select {
+    let mut out = s.clone();
+    out.from = rewrite_cte_table_ref(&s.from, ctes);
+    out.joins = s
+        .joins
+        .iter()
+        .map(|j| Join {
+            kind: j.kind,
+            table: rewrite_cte_table_ref(&j.table, ctes),
+            on: j.on.clone(),
+        })
+        .collect();
+    out
+}
+
+/// Turn a reference to a CTE into a derived table over its query; recurse into
+/// an existing derived table's own subquery. A plain table reference is left
+/// as is.
+fn rewrite_cte_table_ref(tr: &TableRef, ctes: &HashMap<String, Statement>) -> TableRef {
+    if tr.subquery.is_none() {
+        if let Some(query) = ctes.get(&tr.name) {
+            return TableRef {
+                name: String::new(),
+                // A reference keeps its alias; an unaliased one is qualified by
+                // the CTE name (as the planner does for any derived table).
+                alias: Some(tr.alias.clone().unwrap_or_else(|| tr.name.clone())),
+                subquery: Some(Box::new(query.clone())),
+            };
+        }
+        return tr.clone();
+    }
+    TableRef {
+        name: tr.name.clone(),
+        alias: tr.alias.clone(),
+        subquery: tr
+            .subquery
+            .as_ref()
+            .map(|q| Box::new(rewrite_cte_query(q, ctes))),
+    }
+}
+
+/// Whether a query references a base table named `name` in any FROM or JOIN
+/// (recursing through derived tables and set operations). Used to detect a
+/// self-referencing (recursive) CTE.
+fn references_table(stmt: &Statement, name: &str) -> bool {
+    match stmt {
+        Statement::Select(s) => {
+            table_ref_names(&s.from, name)
+                || s.joins.iter().any(|j| table_ref_names(&j.table, name))
+        }
+        Statement::Union { left, right, .. } => {
+            references_table(left, name) || references_table(right, name)
+        }
+        _ => false,
+    }
+}
+
+/// Whether a table reference (or a derived table's inner query) names `name`.
+fn table_ref_names(tr: &TableRef, name: &str) -> bool {
+    tr.subquery
+        .as_ref()
+        .map_or_else(|| tr.name == name, |q| references_table(q, name))
+}
+
 /// The planned outcome for one row of an `INSERT ... ON CONFLICT`.
 enum RowPlan {
     /// Write the row as a fresh tuple.
@@ -3268,6 +3410,67 @@ mod tests {
             other => panic!("expected explain, got {other:?}"),
         };
         assert!(plan.contains("EXCEPT"), "plan was:\n{plan}");
+    }
+
+    // --- WITH (common table expressions) ---
+
+    #[test]
+    fn with_cte_is_usable_as_a_table() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE t (id INT, n INT)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 5), (2, 15), (3, 25)")
+            .unwrap();
+        let (cols, rows) = query(
+            &mut db,
+            "WITH big AS (SELECT id FROM t WHERE n > 10) SELECT id FROM big",
+        );
+        assert_eq!(names(&cols), ["id"]);
+        assert_eq!(int_col_sorted(&rows), vec![2, 3]);
+    }
+
+    #[test]
+    fn with_cte_can_be_joined_to_itself() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE t (id INT, n INT)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 5), (2, 15)").unwrap();
+        // The same CTE referenced under two aliases, joined on the key.
+        let (_c, rows) = query(
+            &mut db,
+            "WITH c AS (SELECT id FROM t WHERE n > 0) SELECT a.id FROM c AS a INNER JOIN c AS b ON a.id = b.id",
+        );
+        assert_eq!(int_col_sorted(&rows), vec![1, 2]);
+    }
+
+    #[test]
+    fn with_later_cte_references_earlier_one() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE t (id INT)").unwrap();
+        db.execute("INSERT INTO t VALUES (1), (2), (3)").unwrap();
+        let (_c, rows) = query(
+            &mut db,
+            "WITH a AS (SELECT id FROM t), b AS (SELECT id FROM a WHERE id > 1) SELECT id FROM b",
+        );
+        assert_eq!(int_col_sorted(&rows), vec![2, 3]);
+    }
+
+    #[test]
+    fn with_recursive_is_rejected_for_now() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE t (id INT)").unwrap();
+        let err = db
+            .execute("WITH RECURSIVE c AS (SELECT id FROM t) SELECT id FROM c")
+            .unwrap_err();
+        assert!(matches!(err, DbError::Unsupported(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn with_self_reference_without_recursive_is_rejected() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE t (id INT)").unwrap();
+        let err = db
+            .execute("WITH c AS (SELECT id FROM c) SELECT id FROM c")
+            .unwrap_err();
+        assert!(matches!(err, DbError::Unsupported(_)), "got {err:?}");
     }
 
     // --- subqueries (uncorrelated scalar and IN) ---

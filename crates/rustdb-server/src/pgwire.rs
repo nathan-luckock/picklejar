@@ -266,7 +266,10 @@ fn handle_bind<S: Write>(session: &mut Session, stream: &mut S, payload: &[u8]) 
     let bound = parsed.substitute_params(&values);
     let row_returning = matches!(
         bound,
-        Statement::Select(_) | Statement::Union { .. } | Statement::Explain(_)
+        Statement::Select(_)
+            | Statement::Union { .. }
+            | Statement::With { .. }
+            | Statement::Explain(_)
     );
     session.portals.insert(
         portal_name,

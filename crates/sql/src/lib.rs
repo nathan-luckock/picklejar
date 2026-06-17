@@ -23,7 +23,7 @@ pub use error::{Result, SqlError};
 pub use lexer::Lexer;
 pub use parser::Parser;
 pub use statement::{
-    ColumnDef, DataType, ForeignKey, Join, JoinKind, OrderItem, Select, SelectItem, SetOp,
+    ColumnDef, Cte, DataType, ForeignKey, Join, JoinKind, OrderItem, Select, SelectItem, SetOp,
     Statement, TableConstraint, TableRef,
 };
 pub use token::{Keyword, Span, Token, TokenKind};

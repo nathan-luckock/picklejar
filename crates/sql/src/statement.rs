@@ -325,6 +325,27 @@ impl SetOp {
     }
 }
 
+/// One common table expression: `name [(cols)] AS (query)` in a `WITH` clause.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Cte {
+    /// The CTE's name, referenced like a table in the body.
+    pub name: String,
+    /// Optional output column names (empty if not given).
+    pub columns: Vec<String>,
+    /// The defining query.
+    pub query: Box<Statement>,
+}
+
+impl fmt::Display for Cte {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.name)?;
+        if !self.columns.is_empty() {
+            write!(f, " ({})", self.columns.join(", "))?;
+        }
+        write!(f, " AS ({})", self.query)
+    }
+}
+
 /// A parsed SQL statement. Grows as SELECT and DML parsers land.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Statement {
@@ -420,6 +441,17 @@ pub enum Statement {
     Commit,
     /// `ROLLBACK`: abort the current transaction.
     Rollback,
+    /// `WITH [RECURSIVE] cte, ... body`: common table expressions scoped to the
+    /// body query. The engine inlines each reference before planning.
+    With {
+        /// Whether `RECURSIVE` was given (a CTE may reference itself).
+        recursive: bool,
+        /// The named CTEs, in declaration order (a later one may reference an
+        /// earlier one).
+        ctes: Vec<Cte>,
+        /// The query the CTEs are visible to.
+        body: Box<Self>,
+    },
     /// `left {UNION|INTERSECT|EXCEPT} [ALL] right`. `left` and `right` are
     /// queries (a `Select` or a nested set operation). Without `all`, duplicate
     /// rows are removed. A trailing `ORDER BY` / `LIMIT` / `OFFSET` applies to
@@ -649,6 +681,23 @@ impl fmt::Display for Statement {
             Self::Begin => f.write_str("BEGIN"),
             Self::Commit => f.write_str("COMMIT"),
             Self::Rollback => f.write_str("ROLLBACK"),
+            Self::With {
+                recursive,
+                ctes,
+                body,
+            } => {
+                f.write_str("WITH ")?;
+                if *recursive {
+                    f.write_str("RECURSIVE ")?;
+                }
+                for (i, cte) in ctes.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{cte}")?;
+                }
+                write!(f, " {body}")
+            }
             Self::Union {
                 op,
                 all,
@@ -709,6 +758,7 @@ impl Parser {
                 Statement::AlterTableAddColumn { table, column }
             }
             TokenKind::Keyword(Keyword::Select) => self.parse_query()?,
+            TokenKind::Keyword(Keyword::With) => self.parse_with()?,
             TokenKind::Keyword(Keyword::Insert) => self.parse_insert()?,
             TokenKind::Keyword(Keyword::Update) => self.parse_update()?,
             TokenKind::Keyword(Keyword::Delete) => self.parse_delete()?,
@@ -785,6 +835,42 @@ impl Parser {
             _ => unreachable!("parse_query builds only Select or Union"),
         }
         Ok(query)
+    }
+
+    /// Parse `WITH [RECURSIVE] cte, ... body`, where each CTE is
+    /// `name [(cols)] AS (query)`.
+    fn parse_with(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::With)?;
+        let recursive = self.eat_keyword(Keyword::Recursive);
+        let mut ctes = Vec::new();
+        loop {
+            let name = self.parse_ident()?;
+            let columns = if self.eat(&TokenKind::LParen) {
+                let cols = self.parse_ident_list()?;
+                self.expect(&TokenKind::RParen)?;
+                cols
+            } else {
+                Vec::new()
+            };
+            self.expect_keyword(Keyword::As)?;
+            self.expect(&TokenKind::LParen)?;
+            let query = self.parse_query()?;
+            self.expect(&TokenKind::RParen)?;
+            ctes.push(Cte {
+                name,
+                columns,
+                query: Box::new(query),
+            });
+            if !self.eat(&TokenKind::Comma) {
+                break;
+            }
+        }
+        let body = self.parse_query()?;
+        Ok(Statement::With {
+            recursive,
+            ctes,
+            body: Box::new(body),
+        })
     }
 
     /// Consume a leading set-operation keyword (`UNION` / `INTERSECT` /
@@ -1436,6 +1522,22 @@ impl Statement {
                 where_clause: where_clause.as_ref().map(|w| w.substitute_params(params)),
                 returning: returning.clone(),
             },
+            Self::With {
+                recursive,
+                ctes,
+                body,
+            } => Self::With {
+                recursive: *recursive,
+                ctes: ctes
+                    .iter()
+                    .map(|c| Cte {
+                        name: c.name.clone(),
+                        columns: c.columns.clone(),
+                        query: Box::new(c.query.substitute_params(params)),
+                    })
+                    .collect(),
+                body: Box::new(body.substitute_params(params)),
+            },
             Self::Union {
                 op,
                 all,
@@ -1604,6 +1706,26 @@ mod tests {
         round_trip("SELECT a FROM t UNION ALL SELECT b FROM u");
         // Left-associative chain.
         round_trip("SELECT a FROM t UNION SELECT b FROM u UNION ALL SELECT c FROM v");
+    }
+
+    #[test]
+    fn with_cte_round_trips() {
+        round_trip("WITH c AS (SELECT a FROM t) SELECT a FROM c");
+        round_trip("WITH c (x, y) AS (SELECT a, b FROM t) SELECT x FROM c");
+        round_trip(
+            "WITH a AS (SELECT x FROM t), b AS (SELECT y FROM u) SELECT x FROM a INNER JOIN b ON a.x = b.y",
+        );
+        round_trip("WITH RECURSIVE c AS (SELECT 1 FROM t) SELECT a FROM c");
+        let s = parse("WITH c AS (SELECT a FROM t) SELECT a FROM c");
+        let Statement::With {
+            recursive, ctes, ..
+        } = s
+        else {
+            panic!("expected WITH");
+        };
+        assert!(!recursive);
+        assert_eq!(ctes.len(), 1);
+        assert_eq!(ctes[0].name, "c");
     }
 
     #[test]
