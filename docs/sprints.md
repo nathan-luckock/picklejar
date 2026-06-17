@@ -1,7 +1,17 @@
-# Sprint plan - picklejar
+<div align="center">
+
+# picklejar build log
+
+How the engine was sequenced, sprint by sprint.
+
+[Overview](../README.md) &nbsp;·&nbsp; [Design](design.md) &nbsp;·&nbsp; [Features](FEATURES.md)
+
+</div>
+
+---
 
 Each sprint is roughly one week. Every sprint maps to a GitHub milestone, and
-every task to a pull request that is squash-merged once CI-equivalent checks
+every task to a pull request that is squash-merged once the checks
 (`cargo fmt`, `cargo clippy -D warnings`, `cargo test`) pass.
 
 ## Plan
@@ -18,9 +28,10 @@ every task to a pull request that is squash-merged once CI-equivalent checks
 | 7 | SQL parser: lexer, Pratt expressions, DDL, DML, SELECT | Shipped |
 | 8 | Cost-based planner: catalog, logical and physical plan, EXPLAIN | Shipped |
 | 9 | Executor and CLI: row codec, Volcano operators, joins, aggregates, persistence | Shipped |
-| 10 | Deepen the engine: transactions, constraints, more types, real indexes | In progress |
-| 11 | Studio: HTTP API and web UI | Planned |
-| 12 | Demo, write-up, presentation | Planned |
+| 10 | Deepen the engine: full DML, constraints, the everyday type system, sequences, views, subqueries, window functions, set operations, CTEs | Shipped |
+| 11 | Make it real: PostgreSQL wire protocol, deterministic and differential testing, multi-connection concurrency, VACUUM | Shipped |
+| 12 | Studio: HTTP API and web UI | Planned |
+| 13 | Demo, write-up, presentation | Planned |
 
 ## What shipped, by sprint
 
@@ -90,30 +101,37 @@ nested-loop join, group-by aggregate) with a three-valued-logic expression
 evaluator. The psql-style CLI runs CREATE / INSERT / SELECT / JOIN / GROUP BY /
 EXPLAIN, and the schema and data persist across a restart.
 
-### Sprint 10 - Deepen the engine (in progress)
+### Sprint 10 - Deepen the engine
 
-Making it behave like a real database:
+Making it behave like a real database: full DML (`INSERT` / `UPDATE` /
+`DELETE`), explicit transactions (`BEGIN` / `COMMIT` / `ROLLBACK`), the
+constraint set (`PRIMARY KEY`, `UNIQUE`, `NOT NULL`, `CHECK`, `FOREIGN KEY`),
+sequences and `SERIAL`, `RETURNING`, `ON CONFLICT` upserts, views, derived
+tables and correlated subqueries, window functions, `UNION` / `INTERSECT` /
+`EXCEPT`, CTEs (including `WITH RECURSIVE`), the `information_schema`, and the
+full everyday type system (`BOOL`, `FLOAT`, `DATE`, `TIMESTAMP`, `JSON`,
+`DECIMAL`) with casts and the supporting functions.
 
-- [x] Full DML: `INSERT` (with or without a column list), `UPDATE`, `DELETE`.
-- [x] Explicit transactions: `BEGIN` / `COMMIT` / `ROLLBACK`, exposing MVCC.
-- [x] Constraints: `PRIMARY KEY`, `UNIQUE`, `NOT NULL`, enforced.
-- [ ] More column types (`BOOL`, `FLOAT`).
-- [ ] Real secondary-index lookups (B+ tree duplicate keys).
-- [ ] Concurrent connections with write-write conflict detection.
+### Sprint 11 - Make it real
+
+Proving and exposing the engine: the PostgreSQL v3 wire protocol (simple and
+extended) so real clients connect over TCP, deterministic simulation testing
+and differential testing against SQLite, multi-connection concurrency via an
+engine actor with transaction exclusivity, and `VACUUM` for MVCC space
+reclamation.
 
 ## Direction
 
-The goal is a from-scratch engine that behaves like PostgreSQL, with a
-Supabase-style studio on top:
+A from-scratch engine that behaves like PostgreSQL, with a studio on top:
 
-1. Finish deepening the engine (Sprint 10).
-2. Build the studio: an HTTP API over the engine and a web UI with a SQL
-   editor, a results grid, a schema browser, a live cost-based plan
-   visualizer, and a crash-recovery panel (Sprint 11).
+1. The engine is deep and speaks Postgres over the wire (sprints 10-11).
+2. Next: a studio, an HTTP API over the engine and a web UI with a SQL editor,
+   a results grid, a schema browser, a live cost-based plan visualizer, and a
+   crash-recovery panel.
 
 ## Out of scope
 
-- Distributed replication.
+- Distributed replication and point-in-time recovery (candidate future work).
 - Right and full outer joins (inner and left are supported).
-- Network protocol compatibility with PostgreSQL on the wire (the studio talks
-  to the engine through the embedded API).
+- Authentication and TLS on the wire (candidate future work before exposing
+  the server publicly).

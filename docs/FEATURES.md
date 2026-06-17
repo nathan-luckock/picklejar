@@ -1,58 +1,68 @@
-# Features
+<div align="center">
 
-The complete engine and SQL surface. For the *why* behind each decision, see
-[design.md](design.md); for a quick tour, see the [README](../README.md).
+# picklejar features
+
+The complete SQL and engine surface.
+
+[Overview](../README.md) &nbsp;·&nbsp; [Design](design.md) &nbsp;·&nbsp; [Build log](sprints.md)
+
+</div>
+
+---
+
+For the reasoning behind each decision, see [design.md](design.md); for a quick
+tour, see the [README](../README.md).
 
 ## SQL
 
-- **DDL** — `CREATE TABLE` (with `PRIMARY KEY` / `UNIQUE` / `NOT NULL` /
+- **DDL** - `CREATE TABLE` (with `PRIMARY KEY` / `UNIQUE` / `NOT NULL` /
   `DEFAULT` / `SERIAL`, plus `CHECK` and single-column `FOREIGN KEY`
   constraints), `DROP TABLE`, `TRUNCATE TABLE`, `CREATE INDEX`,
   `CREATE VIEW` / `DROP VIEW`, and `CREATE TABLE name AS <query>` (build and
   populate a table from a query result, inferring its columns).
   `CREATE TABLE IF NOT EXISTS` and `DROP TABLE` / `DROP VIEW ... IF EXISTS`
   make a schema script re-runnable.
-- **`ALTER TABLE`** — `ADD COLUMN` (existing rows take the column's `DEFAULT`
+- **`ALTER TABLE`** - `ADD COLUMN` (existing rows take the column's `DEFAULT`
   or NULL), `DROP COLUMN [IF EXISTS]`, `RENAME COLUMN a TO b`, and
   `RENAME TO new_name`. Add and drop rewrite the table into fresh storage; a
   drop or rename is refused when a `CHECK` or `FOREIGN KEY` constraint names
   the column, so no constraint is left pointing at a stale name.
-- **Auto-increment** — a `SERIAL` column fills in the next id (running max plus
+- **Auto-increment** - a `SERIAL` column fills in the next id (running max plus
   one) when an `INSERT` omits it; the set of serial columns survives a restart
   in a `.seq` sidecar.
-- **Constraints** — `CHECK` predicates and `FOREIGN KEY` referential integrity,
+- **Constraints** - `CHECK` predicates and `FOREIGN KEY` referential integrity,
   enforced on write (a foreign key is `RESTRICT` on the parent side) and
   persisted across restarts.
-- **DML** — `INSERT` (with or without a column list, from `VALUES` or from a
+- **DML** - `INSERT` (with or without a column list, from `VALUES` or from a
   query: `INSERT INTO t [(cols)] SELECT ...`), `UPDATE`, `DELETE`, each with an
   optional `RETURNING` projection over the affected rows.
-- **Bulk CSV** — `COPY table FROM 'file.csv' [HEADER]` loads rows (through the
+- **Bulk CSV** - `COPY table FROM 'file.csv' [HEADER]` loads rows (through the
   normal insert path, so all constraints apply), and `COPY table TO 'file.csv'
   [HEADER]` writes the table out as RFC-4180 CSV (quoting fields with commas or
   quotes, NULL as an empty field).
-- **Upserts** — `INSERT ... ON CONFLICT [(cols)] DO NOTHING | DO UPDATE SET ...
+- **Upserts** - `INSERT ... ON CONFLICT [(cols)] DO NOTHING | DO UPDATE SET ...
   [WHERE ...]`, with `excluded.col` referring to the rejected row's proposed
   value.
-- **Queries** — projection and `*`, `WHERE` with SQL three-valued logic,
+- **Queries** - projection and `*`, `WHERE` with SQL three-valued logic,
   `INNER` / `LEFT` / `CROSS JOIN`, `GROUP BY` with `COUNT` / `SUM` / `MIN` /
   `MAX` / `AVG` (and `DISTINCT` aggregates), `HAVING`, `DISTINCT`, `ORDER BY`,
   `LIMIT` / `OFFSET`.
-- **Set operations** — `UNION`, `INTERSECT`, and `EXCEPT`, each with optional
+- **Set operations** - `UNION`, `INTERSECT`, and `EXCEPT`, each with optional
   `ALL` (multiset) semantics.
-- **Window functions** — `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `LAG` / `LEAD`, and
+- **Window functions** - `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `LAG` / `LEAD`, and
   the aggregates `OVER (PARTITION BY ... ORDER BY ...)`.
-- **Subqueries** — scalar, `IN`, and `EXISTS`, both uncorrelated and
+- **Subqueries** - scalar, `IN`, and `EXISTS`, both uncorrelated and
   correlated; derived tables (`FROM (SELECT ...)`); views expand to the same
   machinery.
-- **CTEs** — `WITH name AS (query), ... SELECT ...`, inlined as derived tables;
+- **CTEs** - `WITH name AS (query), ... SELECT ...`, inlined as derived tables;
   `WITH RECURSIVE` evaluated to a fixpoint (e.g. a transitive closure).
-- **Introspection** — queryable `information_schema.tables` and
+- **Introspection** - queryable `information_schema.tables` and
   `information_schema.columns` views, so a client can discover the schema.
-- **Dump / restore** — the CLI's `\dump [file]` writes a self-contained SQL
+- **Dump / restore** - the CLI's `\dump [file]` writes a self-contained SQL
   script (tables in foreign-key-safe order with their constraints, then
   explicit indexes, views, and an `INSERT` per table) that recreates the whole
   database when run on an empty one. This is picklejar's `pg_dump`.
-- **Temporal types** — `DATE` and `TIMESTAMP` columns, with `DATE '2024-01-15'`
+- **Temporal types** - `DATE` and `TIMESTAMP` columns, with `DATE '2024-01-15'`
   / `TIMESTAMP '2024-01-15 10:30:00'` typed literals (a bare string is coerced
   into a temporal column). Stored as an epoch offset (days / microseconds) so
   they compare, `ORDER BY`, and index as time, not text. The date math is
@@ -60,22 +70,22 @@ The complete engine and SQL surface. For the *why* behind each decision, see
   type words are not reserved. `EXTRACT(field FROM ts)` / `DATE_PART('field',
   ts)` pull out a component (year, month, day, hour, minute, second, dow, doy)
   and `DATE_TRUNC('field', ts)` floors to the start of one.
-- **JSON** — a `JSON` column (validated on write, stored as text) with the
+- **JSON** - a `JSON` column (validated on write, stored as text) with the
   `->` (returns JSON) and `->>` (returns text) access operators, navigating by
   a text member name or an integer array index, and chainable
   (`body -> 'a' ->> 0`). The JSON parser is in-tree (no external crate).
-- **Decimal** — a `DECIMAL` / `NUMERIC` column with exact base-10 arithmetic
+- **Decimal** - a `DECIMAL` / `NUMERIC` column with exact base-10 arithmetic
   (`0.1 + 0.2` is `0.3`, not a binary-float approximation), `DECIMAL '12.34'`
   literals, and exact `SUM` / `AVG`. Stored as an `i128` mantissa plus a scale,
   so it compares and `ORDER BY`s as a number; the `(precision, scale)` in a
   type is accepted and each value keeps its own scale. The arithmetic is
   in-tree (no external bignum).
-- **Casts** — `CAST(expr AS type)` and the `expr::type` shorthand, converting
+- **Casts** - `CAST(expr AS type)` and the `expr::type` shorthand, converting
   between `INT` / `FLOAT` / `BOOL` / `TEXT` / `DATE` / `TIMESTAMP` / `JSON`
   (text is parsed, a float rounds to an int, any value renders to text, a
   timestamp truncates to a date, text validates as JSON). A cast over a
   constant folds at insert time.
-- **Expressions** — `INT` / `FLOAT` / `BOOL` / `TEXT` / `DATE` / `TIMESTAMP`,
+- **Expressions** - `INT` / `FLOAT` / `BOOL` / `TEXT` / `DATE` / `TIMESTAMP`,
   arithmetic with int-to-float promotion, `IN` / `BETWEEN` / `LIKE` / `IS NULL`,
   `CASE`, string `||`, and a library of scalar functions: string (`LENGTH`,
   `UPPER` / `LOWER`,
@@ -83,16 +93,16 @@ The complete engine and SQL surface. For the *why* behind each decision, see
   `REPLACE`, `STRPOS` / `POSITION`, `CONCAT`), numeric (`ABS`, `SIGN`, `MOD`,
   `ROUND`, `TRUNC`, `FLOOR`, `CEIL`, `POWER`, `SQRT`, `EXP`, `LN`, `LOG`), and
   conditional (`COALESCE`, `NULLIF`, `GREATEST`, `LEAST`).
-- **Transactions** — `BEGIN` / `COMMIT` / `ROLLBACK` over MVCC snapshots;
+- **Transactions** - `BEGIN` / `COMMIT` / `ROLLBACK` over MVCC snapshots;
   auto-commit otherwise.
-- **`EXPLAIN`** — the cost-annotated physical plan, showing the planner's scan
+- **`EXPLAIN`** - the cost-annotated physical plan, showing the planner's scan
   and join choices. `EXPLAIN ANALYZE` also runs the query and appends the
   actual row count and wall-clock time.
-- **`ANALYZE [table]`** — scan the live rows and record real per-column
+- **`ANALYZE [table]`** - scan the live rows and record real per-column
   statistics (distinct count and integer min/max) so the cost model estimates
   selectivity from data instead of defaults; a range bound now uses the
   column's observed `[min, max]` span.
-- **`VACUUM [table]`** — compact a table by rewriting only its currently
+- **`VACUUM [table]`** - compact a table by rewriting only its currently
   visible rows into fresh MVCC storage with rebuilt indexes, reclaiming the
   space held by dead row versions (from updates and deletes) and stale index
   entries. Refused inside a transaction block, since the rewrite would
@@ -100,14 +110,14 @@ The complete engine and SQL surface. For the *why* behind each decision, see
 
 ## Engine
 
-- **Durability** — write-ahead logging, ARIES crash recovery, and schema plus
+- **Durability** - write-ahead logging, ARIES crash recovery, and schema plus
   data that survive a restart.
-- **Storage** — 8 KiB slotted pages, an LRU-K buffer pool, a B+ tree primary
+- **Storage** - 8 KiB slotted pages, an LRU-K buffer pool, a B+ tree primary
   index, secondary indexes, and CRC32 page checksums.
-- **Concurrency control** — MVCC with snapshot isolation and version chains.
-- **Interfaces** — an embeddable library, a `psql`-style CLI, and a
+- **Concurrency control** - MVCC with snapshot isolation and version chains.
+- **Interfaces** - an embeddable library, a `psql`-style CLI, and a
   PostgreSQL-wire-protocol server (simple + extended, with `$N` parameters).
-- **Concurrency** — the wire server handles many client connections at once: the
+- **Concurrency** - the wire server handles many client connections at once: the
   single-threaded engine runs as an actor on its own thread, and each connection
   gets its own thread and session handle. Transaction exclusivity keeps explicit
   transactions isolated; auto-commit statements from different connections
@@ -118,13 +128,13 @@ The complete engine and SQL surface. For the *why* behind each decision, see
 The graded requirement is "forced crash, no committed data loss." picklejar proves
 it three ways:
 
-1. **In-process recovery tests** — drive a workload, drop the buffer pool
+1. **In-process recovery tests** - drive a workload, drop the buffer pool
    without flushing (losing dirty pages, exactly as a kill does), recover from
    the WAL, and assert committed rows survive while uncommitted rows roll back.
-2. **Forced process kill** — a child process commits rows forever and is
+2. **Forced process kill** - a child process commits rows forever and is
    hard-killed (`SIGKILL` / `TerminateProcess`); recovery must reproduce every
    row recorded as durable.
-3. **Deterministic simulation testing (DST)** — every run is one `u64` seed, so
+3. **Deterministic simulation testing (DST)** - every run is one `u64` seed, so
    any failure replays exactly. The data file is a fault-injecting in-memory
    disk that models durability honestly (only `fsync`-ed writes survive a
    crash). Each seed builds a random workload, crashes at a random durable/lost

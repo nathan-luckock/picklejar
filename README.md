@@ -77,21 +77,22 @@ Storage · pages, buffer pool, B+ tree     ██████████  done
 WAL + ARIES crash recovery                ██████████  done
 MVCC transactions                         ██████████  done
 SQL surface · joins, windows, CTEs, sets  █████████▒  deep
+Types · date, timestamp, json, decimal    ██████████  done
 Cost-based planner · ANALYZE, EXPLAIN     █████████▒  solid
 PostgreSQL wire · simple + extended       █████████▒  solid
 Concurrency · many connections (actor)    ████████▒▒  works
-Types · DATE / TIMESTAMP / DECIMAL        ██▒▒▒▒▒▒▒▒  next
+Indexing, auth, replication               ███▒▒▒▒▒▒▒  next
 ```
 
 The full roadmap and the reasoning behind every decision are in [docs/design.md](docs/design.md).
 
 ## 🔬 Proof, not vibes
 
-Correctness isn't asserted, it's tested three independent ways — all under `clippy -D warnings` and `rustfmt` in CI:
+Correctness isn't asserted, it's tested three independent ways - all under `clippy -D warnings` and `rustfmt` in CI:
 
 - ✅ **500+ unit tests + parser property tests** across 10 crates.
-- 🎲 **Deterministic simulation testing** — every crash scenario is one `u64` seed against a fault-injecting disk, so any failure replays exactly. It found and fixed a real recovery bug.
-- 🆚 **Differential testing vs SQLite** — random SQL run through both engines, results compared as a sorted multiset, with SQLite as the independent oracle.
+- 🎲 **Deterministic simulation testing** - every crash scenario is one `u64` seed against a fault-injecting disk, so any failure replays exactly. It found and fixed a real recovery bug.
+- 🆚 **Differential testing vs SQLite** - random SQL run through both engines, results compared as a sorted multiset, with SQLite as the independent oracle.
 
 ```bash
 cargo run --release --bin dst -- 100000        # 100k reproducible crash scenarios
