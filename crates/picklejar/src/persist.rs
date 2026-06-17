@@ -357,6 +357,10 @@ pub enum Constraint {
         parent_table: String,
         /// Referenced column in the parent table.
         parent_column: String,
+        /// `ON DELETE` action as a compact token (e.g. `cascade`).
+        on_delete: String,
+        /// `ON UPDATE` action as a compact token.
+        on_update: String,
     },
 }
 
@@ -381,8 +385,13 @@ pub fn save_constraints(path: &Path, constraints: &[Constraint]) -> io::Result<(
                 column,
                 parent_table,
                 parent_column,
+                on_delete,
+                on_update,
             } => {
-                let _ = writeln!(out, "{table} F {column} {parent_table} {parent_column}");
+                let _ = writeln!(
+                    out,
+                    "{table} F {column} {parent_table} {parent_column} {on_delete} {on_update}"
+                );
             }
         }
     }
@@ -418,14 +427,20 @@ pub fn load_constraints(path: &Path) -> io::Result<Vec<Constraint>> {
             }),
             "F" => {
                 let parts: Vec<&str> = body.split_whitespace().collect();
-                let [column, parent_table, parent_column] = parts[..] else {
-                    return Err(invalid());
+                // 3 fields is the legacy form (no referential actions); 5 adds
+                // the ON DELETE / ON UPDATE action tokens.
+                let (column, parent_table, parent_column, on_delete, on_update) = match parts[..] {
+                    [c, pt, pc] => (c, pt, pc, "noaction", "noaction"),
+                    [c, pt, pc, od, ou] => (c, pt, pc, od, ou),
+                    _ => return Err(invalid()),
                 };
                 out.push(Constraint::ForeignKey {
                     table: table.to_string(),
                     column: column.to_string(),
                     parent_table: parent_table.to_string(),
                     parent_column: parent_column.to_string(),
+                    on_delete: on_delete.to_string(),
+                    on_update: on_update.to_string(),
                 });
             }
             _ => return Err(invalid()),

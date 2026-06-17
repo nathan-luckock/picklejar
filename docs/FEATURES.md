@@ -31,8 +31,10 @@ tour, see the [README](../README.md).
   one) when an `INSERT` omits it; the set of serial columns survives a restart
   in a `.seq` sidecar.
 - **Constraints** - `CHECK` predicates and `FOREIGN KEY` referential integrity,
-  enforced on write (a foreign key is `RESTRICT` on the parent side) and
-  persisted across restarts.
+  enforced on write and persisted across restarts. A foreign key takes the
+  usual referential actions, `ON DELETE` / `ON UPDATE` `NO ACTION` / `RESTRICT`
+  / `CASCADE` / `SET NULL`, and cascades run through the normal delete/update
+  path so they recurse and stay transactional.
 - **DML** - `INSERT` (with or without a column list, from `VALUES` or from a
   query: `INSERT INTO t [(cols)] SELECT ...`), `UPDATE`, `DELETE`, each with an
   optional `RETURNING` projection over the affected rows.

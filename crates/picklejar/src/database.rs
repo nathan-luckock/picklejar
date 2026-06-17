@@ -37,7 +37,7 @@ use crate::correlated;
 use crate::correlated::{CorrelatedRunner, MaterializedSource};
 use picklejar_sql::statement::{
     AlterAction, ColumnDef, ConflictAction, Cte, DataType, ForeignKey, Join, OnConflict, OrderItem,
-    Select, SelectItem, TableConstraint, TableRef,
+    RefAction, Select, SelectItem, TableConstraint, TableRef,
 };
 use picklejar_sql::{BinOp, Expr, Parser, SetOp, Statement, UnOp, Value};
 use picklejar_storage::{BufferPool, FileManager, PageId};
@@ -111,6 +111,10 @@ struct ForeignKeyMeta {
     parent_table: String,
     /// The referenced column in the parent table.
     parent_column: String,
+    /// What to do to this child when the parent row is deleted.
+    on_delete: RefAction,
+    /// What to do to this child when the parent key is updated.
+    on_update: RefAction,
 }
 
 /// The constraints attached to one table, beyond the per-column NOT NULL /
@@ -328,6 +332,8 @@ impl Database {
                     column,
                     parent_table,
                     parent_column,
+                    on_delete,
+                    on_update,
                 } => self
                     .constraints
                     .entry(table)
@@ -337,6 +343,8 @@ impl Database {
                         column,
                         parent_table,
                         parent_column,
+                        on_delete: ref_action_from_token(&on_delete),
+                        on_update: ref_action_from_token(&on_update),
                     }),
             }
         }
@@ -362,6 +370,8 @@ impl Database {
                     column: fk.column.clone(),
                     parent_table: fk.parent_table.clone(),
                     parent_column: fk.parent_column.clone(),
+                    on_delete: ref_action_token(fk.on_delete).to_string(),
+                    on_update: ref_action_token(fk.on_update).to_string(),
                 });
             }
         }
@@ -838,6 +848,8 @@ impl Database {
                         column: fk.column.clone(),
                         parent_table: fk.parent_table.clone(),
                         parent_column: fk.parent_column.clone(),
+                        on_delete: fk.on_delete,
+                        on_update: fk.on_update,
                     }));
                 }
                 v
@@ -1057,6 +1069,8 @@ impl Database {
                         column: fk.column.clone(),
                         parent_table: fk.parent_table.clone(),
                         parent_column: fk.parent_column.clone(),
+                        on_delete: fk.on_delete,
+                        on_update: fk.on_update,
                     });
                 }
             }
@@ -1782,16 +1796,21 @@ impl Database {
         Ok(())
     }
 
-    /// Reject the change to a parent `row` if a child still references the value
-    /// being removed (foreign-key `RESTRICT`). Used on `DELETE`, and on `UPDATE`
-    /// when a referenced column changes.
-    fn enforce_fk_restrict(
-        &self,
+    /// Apply each referencing child's `ON DELETE` action when a parent row is
+    /// deleted: reject (`NO ACTION` / `RESTRICT`), delete the children
+    /// (`CASCADE`), or NULL their referencing column (`SET NULL`). Cascades run
+    /// through the normal delete/update path, so they recurse and stay
+    /// transactional.
+    fn apply_fk_on_delete(
+        &mut self,
         txn: &Transaction,
         parent_table: &str,
         parent_columns: &[String],
         parent_row: &[Value],
     ) -> Result<()> {
+        // Collect (child_table, child_column, action, referenced_value) first, so
+        // the borrow of self.constraints ends before a child table is mutated.
+        let mut actions: Vec<(String, String, RefAction, Value)> = Vec::new();
         for (child_table, tc) in &self.constraints {
             for fk in &tc.foreign_keys {
                 if fk.parent_table != parent_table {
@@ -1800,24 +1819,41 @@ impl Database {
                 let Some(pidx) = parent_columns.iter().position(|c| c == &fk.parent_column) else {
                     continue;
                 };
-                let value = &parent_row[pidx];
+                let value = parent_row[pidx].clone();
                 if matches!(value, Value::Null) {
                     continue;
                 }
-                if self.column_has_value(txn, child_table, &fk.column, value)? {
-                    return Err(DbError::Constraint(format!(
-                        "foreign key violation: {child_table}.{} still references {parent_table}.{}",
-                        fk.column, fk.parent_column
-                    )));
+                actions.push((child_table.clone(), fk.column.clone(), fk.on_delete, value));
+            }
+        }
+        for (child_table, child_col, action, value) in actions {
+            let pred = eq_literal(&child_col, &value);
+            match action {
+                RefAction::NoAction | RefAction::Restrict => {
+                    if self.column_has_value(txn, &child_table, &child_col, &value)? {
+                        return Err(DbError::Constraint(format!(
+                            "foreign key violation: {child_table}.{child_col} still references \
+                             {parent_table}"
+                        )));
+                    }
+                }
+                RefAction::Cascade => {
+                    self.run_delete(txn, &child_table, Some(&pred), &[])?;
+                }
+                RefAction::SetNull => {
+                    let assignments = [(child_col.clone(), Expr::Literal(Value::Null))];
+                    self.run_update(txn, &child_table, &assignments, Some(&pred), &[])?;
                 }
             }
         }
         Ok(())
     }
 
-    /// Reject an `UPDATE` of a parent `table` that changes a referenced column
-    /// to a new value while a child still references the old one (`RESTRICT`).
-    fn enforce_fk_parent_update(
+    /// Reject (`NO ACTION` / `RESTRICT`) an update that changes a referenced key
+    /// while a child still references the old value. Runs before the parent is
+    /// written; the `CASCADE` / `SET NULL` actions run after (see
+    /// [`Self::apply_fk_on_update`]).
+    fn check_fk_update_restrict(
         &self,
         txn: &Transaction,
         table: &str,
@@ -1827,14 +1863,15 @@ impl Database {
     ) -> Result<()> {
         for (child_table, tc) in &self.constraints {
             for fk in &tc.foreign_keys {
-                if fk.parent_table != table {
+                if fk.parent_table != table
+                    || !matches!(fk.on_update, RefAction::NoAction | RefAction::Restrict)
+                {
                     continue;
                 }
                 let Some(pidx) = columns.iter().position(|c| c == &fk.parent_column) else {
                     continue;
                 };
                 let old = &old_row[pidx];
-                // Only a real change to the referenced value can orphan a child.
                 if old == &new_row[pidx] || matches!(old, Value::Null) {
                     continue;
                 }
@@ -1845,6 +1882,54 @@ impl Database {
                     )));
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Apply the `CASCADE` / `SET NULL` actions to children when a parent's
+    /// referenced key changes (the parent already carries the new value). The
+    /// `NO ACTION` / `RESTRICT` cases are handled earlier by
+    /// [`Self::check_fk_update_restrict`].
+    fn apply_fk_on_update(
+        &mut self,
+        txn: &Transaction,
+        table: &str,
+        columns: &[String],
+        old_row: &[Value],
+        new_row: &[Value],
+    ) -> Result<()> {
+        let mut actions: Vec<(String, String, RefAction, Value, Value)> = Vec::new();
+        for (child_table, tc) in &self.constraints {
+            for fk in &tc.foreign_keys {
+                if fk.parent_table != table
+                    || !matches!(fk.on_update, RefAction::Cascade | RefAction::SetNull)
+                {
+                    continue;
+                }
+                let Some(pidx) = columns.iter().position(|c| c == &fk.parent_column) else {
+                    continue;
+                };
+                let old = old_row[pidx].clone();
+                if old == new_row[pidx] || matches!(old, Value::Null) {
+                    continue;
+                }
+                actions.push((
+                    child_table.clone(),
+                    fk.column.clone(),
+                    fk.on_update,
+                    old,
+                    new_row[pidx].clone(),
+                ));
+            }
+        }
+        for (child_table, child_col, action, old, new) in actions {
+            let pred = eq_literal(&child_col, &old);
+            let assignments = if matches!(action, RefAction::SetNull) {
+                [(child_col.clone(), Expr::Literal(Value::Null))]
+            } else {
+                [(child_col.clone(), Expr::Literal(new))]
+            };
+            self.run_update(txn, &child_table, &assignments, Some(&pred), &[])?;
         }
         Ok(())
     }
@@ -2845,44 +2930,77 @@ impl Database {
                 .ok_or_else(|| DbError::UnknownTable(table.to_string()))?;
             (s.index_root, s.version_page)
         };
-        let read = MvccTable::open(
-            &self.pool,
-            self.wal.clone(),
-            &self.mgr,
-            index_root,
-            version_page,
-        );
+        // Pass 1: find matching rows and validate the new versions. Scoped so
+        // the scan's borrow of the pool is released before a referential action
+        // below mutates a child table.
+        let updates: Vec<(u64, Vec<Value>, Vec<Value>)> = {
+            let read = MvccTable::open(
+                &self.pool,
+                self.wal.clone(),
+                &self.mgr,
+                index_root,
+                version_page,
+            );
+            let mut updates = Vec::new();
+            for (key, bytes) in read.scan(txn)? {
+                let row = decode_row(&bytes, &schema)?;
+                if let Some(pred) = where_clause {
+                    if !is_truthy(&eval(pred, &row, &columns)?) {
+                        continue;
+                    }
+                }
+                // Each SET expression is evaluated against the existing row, so
+                // `SET n = n + 1` sees the old value.
+                let mut new_row = row.clone();
+                for ((_, expr), &pos) in assignments.iter().zip(&targets) {
+                    new_row[pos] = coerce_value(eval(expr, &row, &columns)?, schema[pos])?;
+                }
+                for &col in &not_null {
+                    if matches!(new_row[col], Value::Null) {
+                        return Err(DbError::Constraint(format!(
+                            "column {} cannot be NULL",
+                            columns[col]
+                        )));
+                    }
+                }
+                self.enforce_checks(table, &columns, &new_row)?;
+                self.enforce_fk_child(txn, table, &columns, &new_row)?;
+                // RESTRICT / NO ACTION on a changed referenced key blocks before
+                // any write; CASCADE / SET NULL run after the parent is updated.
+                self.check_fk_update_restrict(txn, table, &columns, &row, &new_row)?;
+                updates.push((key, row, new_row));
+            }
+            updates
+        };
 
-        // Pass 1: find matching rows and validate the new versions.
-        let mut updates: Vec<(u64, Vec<Value>)> = Vec::new();
-        for (key, bytes) in read.scan(txn)? {
-            let row = decode_row(&bytes, &schema)?;
-            if let Some(pred) = where_clause {
-                if !is_truthy(&eval(pred, &row, &columns)?) {
-                    continue;
-                }
-            }
-            // Each SET expression is evaluated against the existing row, so
-            // `SET n = n + 1` sees the old value.
-            let mut new_row = row.clone();
-            for ((_, expr), &pos) in assignments.iter().zip(&targets) {
-                new_row[pos] = coerce_value(eval(expr, &row, &columns)?, schema[pos])?;
-            }
-            for &col in &not_null {
-                if matches!(new_row[col], Value::Null) {
-                    return Err(DbError::Constraint(format!(
-                        "column {} cannot be NULL",
-                        columns[col]
-                    )));
-                }
-            }
-            self.enforce_checks(table, &columns, &new_row)?;
-            self.enforce_fk_child(txn, table, &columns, &new_row)?;
-            self.enforce_fk_parent_update(txn, table, &columns, &row, &new_row)?;
-            updates.push((key, new_row));
+        // Pass 2: write the validated updates (a mutable table borrow held only
+        // inside the helper, so it is released before the actions below).
+        let new_rows = self.write_updates(txn, table, &updates, &schema)?;
+
+        // Now the parent rows carry their new keys, cascade ON UPDATE CASCADE /
+        // SET NULL to the children that referenced the old keys.
+        for (_key, old_row, new_row) in &updates {
+            self.apply_fk_on_update(txn, table, &columns, old_row, new_row)?;
         }
 
-        // Pass 2: apply the validated updates.
+        if !returning.is_empty() {
+            return project_returning(returning, &columns, &new_rows);
+        }
+        Ok(QueryOutcome::Mutation {
+            affected: new_rows.len(),
+        })
+    }
+
+    /// Write each validated `(key, old, new)` update into `table`'s storage and
+    /// refresh its secondary indexes, returning the new rows. The mutable table
+    /// borrow is confined here.
+    fn write_updates(
+        &mut self,
+        txn: &Transaction,
+        table: &str,
+        updates: &[(u64, Vec<Value>, Vec<Value>)],
+        schema: &[DataType],
+    ) -> Result<Vec<Vec<Value>>> {
         let store = self
             .tables
             .get_mut(table)
@@ -2894,27 +3012,21 @@ impl Database {
             store.index_root,
             store.version_page,
         );
-        let mut new_rows: Vec<Vec<Value>> = Vec::with_capacity(updates.len());
-        for (key, new_row) in updates {
-            handle.update(txn, key, &encode_row(&new_row, &schema)?)?;
+        let mut new_rows = Vec::with_capacity(updates.len());
+        for (key, _old_row, new_row) in updates {
+            handle.update(txn, *key, &encode_row(new_row, schema)?)?;
             // Point each indexed column's key at this rowid's new value. Old
-            // values are left in the tree (upsert only, never delete) and are
-            // filtered out on read; see `crate::index`.
+            // values stay in the tree (upsert only) and are filtered on read.
             for sec in &mut store.secondary {
                 let index = Index::open(&self.pool, sec.root);
-                index.put(&new_row[sec.column], key)?;
+                index.put(&new_row[sec.column], *key)?;
                 sec.root = index.root();
             }
-            new_rows.push(new_row);
+            new_rows.push(new_row.clone());
         }
         store.index_root = handle.index_root();
         store.version_page = handle.version_page();
-        if !returning.is_empty() {
-            return project_returning(returning, &columns, &new_rows);
-        }
-        Ok(QueryOutcome::Mutation {
-            affected: new_rows.len(),
-        })
+        Ok(new_rows)
     }
 
     fn run_delete(
@@ -2942,26 +3054,35 @@ impl Database {
                 .ok_or_else(|| DbError::UnknownTable(table.to_string()))?;
             (s.index_root, s.version_page)
         };
-        let read = MvccTable::open(
-            &self.pool,
-            self.wal.clone(),
-            &self.mgr,
-            index_root,
-            version_page,
-        );
 
-        // Pass 1: find matching rows; reject any deletion a child still
-        // references (foreign-key RESTRICT). Keep each deleted row for RETURNING.
-        let mut victims: Vec<(u64, Vec<Value>)> = Vec::new();
-        for (key, bytes) in read.scan(txn)? {
-            let row = decode_row(&bytes, &schema)?;
-            if let Some(pred) = where_clause {
-                if !is_truthy(&eval(pred, &row, &columns)?) {
-                    continue;
+        // Pass 1: find the matching rows (keep each for RETURNING). Scoped so the
+        // scan's borrow of the pool is released before a referential action below
+        // mutates a child table.
+        let victims: Vec<(u64, Vec<Value>)> = {
+            let read = MvccTable::open(
+                &self.pool,
+                self.wal.clone(),
+                &self.mgr,
+                index_root,
+                version_page,
+            );
+            let mut victims = Vec::new();
+            for (key, bytes) in read.scan(txn)? {
+                let row = decode_row(&bytes, &schema)?;
+                if let Some(pred) = where_clause {
+                    if !is_truthy(&eval(pred, &row, &columns)?) {
+                        continue;
+                    }
                 }
+                victims.push((key, row));
             }
-            self.enforce_fk_restrict(txn, table, &columns, &row)?;
-            victims.push((key, row));
+            victims
+        };
+
+        // Apply ON DELETE referential actions (cascade / set null), or reject
+        // (RESTRICT), on the children of each row being deleted.
+        for (_key, row) in &victims {
+            self.apply_fk_on_delete(txn, table, &columns, row)?;
         }
 
         // Pass 2: delete.
@@ -3791,6 +3912,37 @@ fn expr_mentions_column(expr: &Expr, col: &str) -> bool {
                 || order_by.iter().any(|o| expr_mentions_column(&o.expr, col))
         }
         _ => false,
+    }
+}
+
+/// Build the predicate `column = value`, for cascading a referential action to
+/// the child rows that reference a given key.
+fn eq_literal(column: &str, value: &Value) -> Expr {
+    Expr::Binary {
+        op: BinOp::Eq,
+        left: Box::new(Expr::Column(column.to_string())),
+        right: Box::new(Expr::Literal(value.clone())),
+    }
+}
+
+/// The compact sidecar token for a referential action.
+const fn ref_action_token(a: RefAction) -> &'static str {
+    match a {
+        RefAction::NoAction => "noaction",
+        RefAction::Restrict => "restrict",
+        RefAction::Cascade => "cascade",
+        RefAction::SetNull => "setnull",
+    }
+}
+
+/// Parse a referential-action token back from the sidecar (unknown defaults to
+/// `NO ACTION`).
+fn ref_action_from_token(s: &str) -> RefAction {
+    match s {
+        "restrict" => RefAction::Restrict,
+        "cascade" => RefAction::Cascade,
+        "setnull" => RefAction::SetNull,
+        _ => RefAction::NoAction,
     }
 }
 
@@ -6416,6 +6568,62 @@ mod tests {
         db.execute("DELETE FROM p WHERE id = 2").unwrap();
         let (_c, rows) = query(&mut db, "SELECT id FROM p ORDER BY id");
         assert_eq!(rows, vec![vec![Value::Int(1)]]);
+    }
+
+    #[test]
+    fn fk_on_delete_cascade_and_set_null() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("casc.db");
+        {
+            let mut db = Database::open(&path).expect("open");
+            db.execute("CREATE TABLE p (id INT PRIMARY KEY)").unwrap();
+            db.execute(
+                "CREATE TABLE child_c (id INT, pid INT REFERENCES p (id) ON DELETE CASCADE)",
+            )
+            .unwrap();
+            db.execute(
+                "CREATE TABLE child_n (id INT, pid INT REFERENCES p (id) ON DELETE SET NULL)",
+            )
+            .unwrap();
+            db.execute("INSERT INTO p VALUES (1), (2)").unwrap();
+            db.execute("INSERT INTO child_c VALUES (10, 1), (11, 2)")
+                .unwrap();
+            db.execute("INSERT INTO child_n VALUES (20, 1), (21, 2)")
+                .unwrap();
+
+            // Deleting parent 1 cascades to child_c (row gone) and sets child_n's
+            // pid to NULL.
+            db.execute("DELETE FROM p WHERE id = 1").unwrap();
+            let (_c, c_rows) = query(&mut db, "SELECT id FROM child_c ORDER BY id");
+            assert_eq!(c_rows, vec![vec![Value::Int(11)]]); // 10 cascaded away
+            let (_c, n_rows) = query(&mut db, "SELECT id, pid FROM child_n ORDER BY id");
+            assert_eq!(
+                n_rows,
+                vec![
+                    vec![Value::Int(20), Value::Null], // pid nulled
+                    vec![Value::Int(21), Value::Int(2)],
+                ]
+            );
+        }
+        // The actions survive a reopen (persisted in the .cons sidecar).
+        let mut db = Database::open(&path).expect("reopen");
+        db.execute("DELETE FROM p WHERE id = 2").unwrap();
+        let (_c, c_rows) = query(&mut db, "SELECT id FROM child_c");
+        assert_eq!(c_rows, Vec::<Vec<Value>>::new()); // 11 cascaded away too
+    }
+
+    #[test]
+    fn fk_on_update_cascade() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE p (id INT PRIMARY KEY)").unwrap();
+        db.execute("CREATE TABLE c (id INT, pid INT REFERENCES p (id) ON UPDATE CASCADE)")
+            .unwrap();
+        db.execute("INSERT INTO p VALUES (1)").unwrap();
+        db.execute("INSERT INTO c VALUES (10, 1)").unwrap();
+        // Changing the parent key cascades the new value to the child.
+        db.execute("UPDATE p SET id = 99 WHERE id = 1").unwrap();
+        let (_c, rows) = query(&mut db, "SELECT pid FROM c");
+        assert_eq!(rows, vec![vec![Value::Int(99)]]);
     }
 
     #[test]

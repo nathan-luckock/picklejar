@@ -278,6 +278,34 @@ impl fmt::Display for ColumnDef {
     }
 }
 
+/// What happens to a child row when the parent row it references is deleted or
+/// its referenced key is updated.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Default)]
+pub enum RefAction {
+    /// `NO ACTION` (the default): reject the change if a child still references.
+    #[default]
+    NoAction,
+    /// `RESTRICT`: reject the change if a child still references.
+    Restrict,
+    /// `CASCADE`: delete the child rows, or update their key to follow.
+    Cascade,
+    /// `SET NULL`: set the child's referencing column to NULL.
+    SetNull,
+}
+
+impl RefAction {
+    /// The SQL keywords for this action, or `None` for the default `NO ACTION`.
+    #[must_use]
+    pub const fn keyword(self) -> Option<&'static str> {
+        match self {
+            Self::NoAction => None,
+            Self::Restrict => Some("RESTRICT"),
+            Self::Cascade => Some("CASCADE"),
+            Self::SetNull => Some("SET NULL"),
+        }
+    }
+}
+
 /// A single-column foreign-key reference: `column` of this table must match
 /// `parent_column` of `parent_table` (or be NULL).
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -288,6 +316,10 @@ pub struct ForeignKey {
     pub parent_table: String,
     /// The referenced column in the parent table.
     pub parent_column: String,
+    /// Action when the referenced parent row is deleted.
+    pub on_delete: RefAction,
+    /// Action when the referenced parent key is updated.
+    pub on_update: RefAction,
 }
 
 impl fmt::Display for ForeignKey {
@@ -296,7 +328,14 @@ impl fmt::Display for ForeignKey {
             f,
             "FOREIGN KEY ({}) REFERENCES {} ({})",
             self.column, self.parent_table, self.parent_column
-        )
+        )?;
+        if let Some(kw) = self.on_delete.keyword() {
+            write!(f, " ON DELETE {kw}")?;
+        }
+        if let Some(kw) = self.on_update.keyword() {
+            write!(f, " ON UPDATE {kw}")?;
+        }
+        Ok(())
     }
 }
 
@@ -1520,11 +1559,50 @@ impl Parser {
         self.expect(&TokenKind::LParen)?;
         let parent_column = self.parse_ident()?;
         self.expect(&TokenKind::RParen)?;
+        // Optional `ON DELETE <action>` / `ON UPDATE <action>`, in either order.
+        let mut on_delete = RefAction::NoAction;
+        let mut on_update = RefAction::NoAction;
+        while self.eat_keyword(Keyword::On) {
+            if self.eat_keyword(Keyword::Delete) {
+                on_delete = self.parse_ref_action()?;
+            } else if self.eat_keyword(Keyword::Update) {
+                on_update = self.parse_ref_action()?;
+            } else {
+                return Err(SqlError::parse(
+                    "expected DELETE or UPDATE after ON",
+                    self.span(),
+                ));
+            }
+        }
         Ok(ForeignKey {
             column,
             parent_table,
             parent_column,
+            on_delete,
+            on_update,
         })
+    }
+
+    /// Parse a referential action: `CASCADE`, `RESTRICT`, `NO ACTION`, or
+    /// `SET NULL`. The action words are not reserved, so they are matched
+    /// context-sensitively.
+    fn parse_ref_action(&mut self) -> Result<RefAction> {
+        if self.eat_ident_kw("cascade") {
+            Ok(RefAction::Cascade)
+        } else if self.eat_ident_kw("restrict") {
+            Ok(RefAction::Restrict)
+        } else if self.eat_ident_kw("no") {
+            self.eat_ident_kw("action");
+            Ok(RefAction::NoAction)
+        } else if self.eat_keyword(Keyword::Set) {
+            self.expect_keyword(Keyword::Null)?;
+            Ok(RefAction::SetNull)
+        } else {
+            Err(SqlError::parse(
+                "expected a referential action (CASCADE, RESTRICT, NO ACTION, or SET NULL)",
+                self.span(),
+            ))
+        }
     }
 
     fn parse_create_index_tail(&mut self) -> Result<Statement> {
@@ -2131,6 +2209,16 @@ mod tests {
         round_trip("CREATE TABLE t (lo INT, hi INT, CHECK (lo <= hi))");
         round_trip("CREATE TABLE c (id INT, pid INT REFERENCES p (id))");
         round_trip("CREATE TABLE c (id INT, pid INT, FOREIGN KEY (pid) REFERENCES p (id))");
+        // Referential actions round-trip; NO ACTION is the default and prints
+        // nothing, while CASCADE / SET NULL / RESTRICT print after the reference.
+        round_trip("CREATE TABLE c (id INT, pid INT, FOREIGN KEY (pid) REFERENCES p (id) ON DELETE CASCADE)");
+        round_trip("CREATE TABLE c (id INT, pid INT, FOREIGN KEY (pid) REFERENCES p (id) ON DELETE SET NULL ON UPDATE CASCADE)");
+        round_trip("CREATE TABLE c (id INT, pid INT, FOREIGN KEY (pid) REFERENCES p (id) ON UPDATE RESTRICT)");
+        // NO ACTION parses but is the default, so it is not re-emitted.
+        assert_eq!(
+            parse("CREATE TABLE c (id INT, pid INT, FOREIGN KEY (pid) REFERENCES p (id) ON DELETE NO ACTION)").to_string(),
+            "CREATE TABLE c (id INT, pid INT, FOREIGN KEY (pid) REFERENCES p (id))"
+        );
     }
 
     #[test]
