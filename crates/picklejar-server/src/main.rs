@@ -166,6 +166,8 @@ fn value_json(v: &Value) -> Json {
         // JSON has no date type; render the canonical string form.
         Value::Date(days) => Json::Str(picklejar_sql::datetime::format_date(*days)),
         Value::Timestamp(micros) => Json::Str(picklejar_sql::datetime::format_timestamp(*micros)),
+        // A number rendered as a JSON number (it is exact base-10 text).
+        Value::Decimal(m, s) => Json::Str(picklejar_sql::decimal::format(*m, *s)),
         Value::Null => Json::Null,
     }
 }
@@ -205,6 +207,7 @@ const fn type_name(ty: DataType) -> &'static str {
         DataType::Date => "DATE",
         DataType::Timestamp => "TIMESTAMP",
         DataType::Json => "JSON",
+        DataType::Decimal => "DECIMAL",
     }
 }
 

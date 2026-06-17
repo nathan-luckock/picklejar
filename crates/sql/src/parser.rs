@@ -478,15 +478,11 @@ impl Parser {
             }
             TokenKind::Ident(name) => {
                 self.advance();
-                // Typed temporal literal: `DATE '...'` / `TIMESTAMP '...'`. The
-                // type word is a plain identifier (not reserved), recognized
-                // only when a string literal follows immediately.
-                if matches!(self.peek(), TokenKind::Str(_))
-                    && (name.eq_ignore_ascii_case("date")
-                        || name.eq_ignore_ascii_case("timestamp")
-                        || name.eq_ignore_ascii_case("datetime"))
-                {
-                    return self.parse_temporal_literal(&name);
+                // A typed literal (`DATE '...'`, `DECIMAL '...'`, ...) when a
+                // string follows the (non-reserved) type word; else an ordinary
+                // function call or column reference.
+                if let Some(literal) = self.try_typed_literal(&name)? {
+                    return Ok(literal);
                 }
                 self.parse_ident_primary(name)
             }
@@ -575,11 +571,26 @@ impl Parser {
             {
                 DataType::Json
             }
+            TokenKind::Ident(s)
+                if s.eq_ignore_ascii_case("decimal") || s.eq_ignore_ascii_case("numeric") =>
+            {
+                self.advance();
+                // An optional `(precision[, scale])` is accepted and ignored:
+                // each decimal value carries its own scale.
+                if self.eat(&TokenKind::LParen) {
+                    self.parse_expr()?;
+                    if self.eat(&TokenKind::Comma) {
+                        self.parse_expr()?;
+                    }
+                    self.expect(&TokenKind::RParen)?;
+                }
+                return Ok(DataType::Decimal);
+            }
             other => {
                 return Err(SqlError::parse(
                     format!(
-                        "expected a type (INT, FLOAT, BOOL, TEXT, DATE, TIMESTAMP, or JSON), \
-                         found {other:?}"
+                        "expected a type (INT, FLOAT, BOOL, TEXT, DATE, TIMESTAMP, JSON, or \
+                         DECIMAL), found {other:?}"
                     ),
                     self.span(),
                 ));
@@ -587,6 +598,29 @@ impl Parser {
         };
         self.advance();
         Ok(ty)
+    }
+
+    /// Recognize a typed literal `TYPE '...'` where `name` is a (non-reserved)
+    /// type word and a string follows: `DATE` / `TIMESTAMP` / `DECIMAL` and
+    /// their aliases. Returns `None` (consuming nothing) when it is not one.
+    fn try_typed_literal(&mut self, name: &str) -> Result<Option<Expr>> {
+        if !matches!(self.peek(), TokenKind::Str(_)) {
+            return Ok(None);
+        }
+        if name.eq_ignore_ascii_case("date")
+            || name.eq_ignore_ascii_case("timestamp")
+            || name.eq_ignore_ascii_case("datetime")
+        {
+            return self.parse_temporal_literal(name).map(Some);
+        }
+        if name.eq_ignore_ascii_case("decimal") || name.eq_ignore_ascii_case("numeric") {
+            let text = self.parse_string()?;
+            let (m, s) = crate::decimal::parse(&text).ok_or_else(|| {
+                SqlError::parse(format!("invalid DECIMAL literal '{text}'"), self.span())
+            })?;
+            return Ok(Some(Expr::Literal(Value::Decimal(m, s))));
+        }
+        Ok(None)
     }
 
     /// Parse the string following a `DATE` / `TIMESTAMP` type word into the

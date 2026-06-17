@@ -153,6 +153,7 @@ const fn type_name(ty: DataType) -> &'static str {
         DataType::Date => "DATE",
         DataType::Timestamp => "TIMESTAMP",
         DataType::Json => "JSON",
+        DataType::Decimal => "DECIMAL",
     }
 }
 
@@ -224,6 +225,7 @@ fn fmt_value(v: &Value) -> String {
         Value::Bool(b) => b.to_string(),
         Value::Date(days) => picklejar::datetime::format_date(*days),
         Value::Timestamp(micros) => picklejar::datetime::format_timestamp(*micros),
+        Value::Decimal(m, s) => picklejar::decimal::format(*m, *s),
         Value::Null => "NULL".to_string(),
     }
 }

@@ -3267,6 +3267,7 @@ fn csv_field_from_value(value: &Value) -> String {
         Value::Bool(b) => if *b { "true" } else { "false" }.to_string(),
         Value::Date(days) => picklejar_sql::datetime::format_date(*days),
         Value::Timestamp(micros) => picklejar_sql::datetime::format_timestamp(*micros),
+        Value::Decimal(m, s) => picklejar_sql::decimal::format(*m, *s),
         Value::Text(s) | Value::Json(s) => s.clone(),
     }
 }
@@ -3313,6 +3314,11 @@ fn value_from_csv_field(field: &str, ty: DataType) -> Result<Value> {
                 "invalid json in CSV: {field:?}"
             )));
         }),
+        DataType::Decimal => {
+            let (m, s) = picklejar_sql::decimal::parse(field)
+                .ok_or_else(|| DbError::Constraint(format!("invalid decimal in CSV: {field:?}")))?;
+            Value::Decimal(m, s)
+        }
         DataType::Text => Value::Text(field.to_string()),
     })
 }
@@ -3325,6 +3331,7 @@ fn column_type(rows: &[Vec<Value>], i: usize) -> DataType {
             Some(Value::Int(_)) => Some(DataType::Int),
             Some(Value::Float(_)) => Some(DataType::Float),
             Some(Value::Json(_)) => Some(DataType::Json),
+            Some(Value::Decimal(..)) => Some(DataType::Decimal),
             Some(Value::Text(_)) => Some(DataType::Text),
             Some(Value::Bool(_)) => Some(DataType::Bool),
             Some(Value::Date(_)) => Some(DataType::Date),
@@ -3379,6 +3386,12 @@ fn stat_key(value: &Value) -> Vec<u8> {
             b.push(8);
             b.extend_from_slice(s.as_bytes());
         }
+        Value::Decimal(m, s) => {
+            let (nm, ns) = picklejar_sql::decimal::normalize(*m, *s);
+            b.push(9);
+            b.extend_from_slice(&nm.to_le_bytes());
+            b.extend_from_slice(&ns.to_le_bytes());
+        }
         Value::Bool(x) => {
             b.push(3);
             b.push(u8::from(*x));
@@ -3432,6 +3445,7 @@ const fn sql_type_name(ty: DataType) -> &'static str {
         DataType::Date => "date",
         DataType::Timestamp => "timestamp without time zone",
         DataType::Json => "json",
+        DataType::Decimal => "numeric",
     }
 }
 
@@ -3802,6 +3816,21 @@ fn coerce_value(value: Value, ty: DataType) -> Result<Value> {
             } else {
                 Err(DbError::Constraint(format!("invalid json literal {s:?}")))
             }
+        }
+        // Into a DECIMAL column: text and float are parsed exactly from their
+        // text form; an integer takes scale 0.
+        (Value::Text(s), DataType::Decimal) => picklejar_sql::decimal::parse(s)
+            .map(|(m, sc)| Value::Decimal(m, sc))
+            .ok_or_else(|| DbError::Constraint(format!("invalid decimal literal {s:?}"))),
+        (Value::Int(n), DataType::Decimal) => {
+            let (m, sc) = picklejar_sql::decimal::from_i64(*n);
+            Ok(Value::Decimal(m, sc))
+        }
+        (Value::Float(x), DataType::Decimal) => {
+            let text = x.to_string();
+            picklejar_sql::decimal::parse(&text)
+                .map(|(m, sc)| Value::Decimal(m, sc))
+                .ok_or_else(|| DbError::Constraint(format!("invalid decimal {text:?}")))
         }
         _ => Ok(value),
     }
@@ -6774,6 +6803,48 @@ mod tests {
         assert_eq!(n, vec![vec![Value::Text("x".into())]]);
         let (_c, c) = query(&mut db, "SELECT ('[1,2,3]'::json) ->> 2 FROM docs");
         assert_eq!(c, vec![vec![Value::Text("3".into())]]);
+    }
+
+    #[test]
+    fn decimal_exact_arithmetic_and_storage() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("d.db");
+        let dec = |s: &str| {
+            let (m, sc) = picklejar_sql::decimal::parse(s).expect("dec");
+            Value::Decimal(m, sc)
+        };
+        {
+            let mut db = Database::open(&path).expect("open");
+            db.execute("CREATE TABLE money (id INT, amount DECIMAL(10, 2))")
+                .unwrap();
+            // A bare numeric coerces; a string is exact.
+            db.execute("INSERT INTO money VALUES (1, 0.1), (2, '0.2'), (3, 100)")
+                .unwrap();
+            // Exact addition: 0.1 + 0.2 = 0.3 (not 0.30000000000000004).
+            let (_c, sum) = query(
+                &mut db,
+                "SELECT amount + DECIMAL '0.2' FROM money WHERE id = 1",
+            );
+            assert_eq!(sum, vec![vec![dec("0.3")]]);
+            // SUM over a decimal column stays exact, and ORDER BY sorts as numbers.
+            let (_c, total) = query(&mut db, "SELECT SUM(amount) FROM money");
+            assert_eq!(total, vec![vec![dec("100.30")]]);
+            let (_c, ordered) = query(&mut db, "SELECT amount FROM money ORDER BY amount DESC");
+            assert_eq!(
+                ordered,
+                vec![vec![dec("100.00")], vec![dec("0.2")], vec![dec("0.1")]]
+            );
+            // A comparison against a literal works across scales.
+            let (_c, big) = query(&mut db, "SELECT id FROM money WHERE amount > 0.15");
+            assert_eq!(big, vec![vec![Value::Int(2)], vec![Value::Int(3)]]);
+        }
+        // Values survive a reopen, and a cast round-trips.
+        let mut db = Database::open(&path).expect("reopen");
+        let (_c, rows) = query(&mut db, "SELECT amount FROM money WHERE id = 3");
+        assert_eq!(rows, vec![vec![dec("100.00")]]);
+        let (_c, c) = query(&mut db, "SELECT (22 / 7)::decimal FROM money WHERE id = 1");
+        // 22 and 7 are integers, so 22/7 is integer division (3), cast to decimal.
+        assert_eq!(c, vec![vec![dec("3")]]);
     }
 
     fn parse_day(s: &str) -> i64 {

@@ -34,6 +34,9 @@ pub enum Value {
     Timestamp(i64),
     /// A `JSON` document, stored as its (validated) text.
     Json(String),
+    /// An exact `DECIMAL` / `NUMERIC`, as `(mantissa, scale)`: the value is
+    /// `mantissa / 10^scale`.
+    Decimal(i128, u32),
     /// SQL `NULL`.
     Null,
 }
@@ -48,6 +51,10 @@ impl PartialEq for Value {
             (Self::Float(a), Self::Float(b)) => a.to_bits() == b.to_bits(),
             (Self::Text(a), Self::Text(b)) | (Self::Json(a), Self::Json(b)) => a == b,
             (Self::Bool(a), Self::Bool(b)) => a == b,
+            // Decimals are equal by value, so 12.30 and 12.3 group together.
+            (Self::Decimal(am, asc), Self::Decimal(bm, bsc)) => {
+                crate::decimal::compare(*am, *asc, *bm, *bsc) == std::cmp::Ordering::Equal
+            }
             (Self::Null, Self::Null) => true,
             _ => false,
         }
@@ -88,6 +95,8 @@ impl fmt::Display for Value {
             }
             // A quoted-text cast, so the value re-parses through the JSON cast.
             Self::Json(s) => write!(f, "'{}'::json", s.replace('\'', "''")),
+            // Typed-literal form, so the exact value re-parses (no float detour).
+            Self::Decimal(m, s) => write!(f, "DECIMAL '{}'", crate::decimal::format(*m, *s)),
             Self::Null => write!(f, "NULL"),
         }
     }

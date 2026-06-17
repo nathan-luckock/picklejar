@@ -13,6 +13,7 @@
 
 pub mod ast;
 pub mod datetime;
+pub mod decimal;
 pub mod error;
 pub mod json;
 pub mod lexer;
