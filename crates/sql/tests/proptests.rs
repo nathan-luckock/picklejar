@@ -109,6 +109,7 @@ fn column_def() -> impl Strategy<Value = ColumnDef> {
             not_null,
             unique,
             default: None,
+            serial: false,
         })
 }
 
