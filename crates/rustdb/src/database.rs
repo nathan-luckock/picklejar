@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 use rustdb_executor::eval::{eval, is_truthy};
 use rustdb_executor::{decode_row, encode_row, run, Relation, TableSource};
 use rustdb_planner::{bind, explain, plan, Catalog, ColumnStats};
-use rustdb_sql::statement::{ColumnDef, DataType};
+use rustdb_sql::statement::{ColumnDef, DataType, Join, OrderItem, Select, SelectItem};
 use rustdb_sql::{BinOp, Expr, Parser, Statement, UnOp, Value};
 use rustdb_storage::{BufferPool, FileManager, PageId};
 use rustdb_txn::{MvccTable, Transaction, TransactionManager};
@@ -588,9 +588,20 @@ impl Database {
     }
 
     fn run_select(&self, txn: &Transaction, stmt: &Statement) -> Result<QueryOutcome> {
-        // Bind and plan against the catalog, then run the physical plan over
-        // the transaction's snapshot. Base tables are read through
-        // `EngineSource`.
+        // Replace uncorrelated subqueries with their results, then plan and run
+        // the now subquery-free query against the transaction's snapshot.
+        let folded = self.fold_query(txn, stmt)?;
+        let (columns, rows) = self.execute_query(txn, &folded)?;
+        Ok(QueryOutcome::Rows { columns, rows })
+    }
+
+    /// Bind, plan, and run a query, returning its columns and rows. Base tables
+    /// are read through `EngineSource` under `txn`'s snapshot.
+    fn execute_query(
+        &self,
+        txn: &Transaction,
+        stmt: &Statement,
+    ) -> Result<(Vec<String>, Vec<Vec<Value>>)> {
         let logical = bind(&self.catalog, stmt)?;
         let physical = plan(&logical, &self.catalog)?;
         let source = EngineSource {
@@ -601,8 +612,180 @@ impl Database {
             tables: &self.tables,
             txn,
         };
-        let (columns, rows) = run(&physical, &source)?;
-        Ok(QueryOutcome::Rows { columns, rows })
+        Ok(run(&physical, &source)?)
+    }
+
+    /// Rewrite a query, replacing every uncorrelated subquery with its result
+    /// (a scalar becomes a literal; `IN (subquery)` becomes an `IN`-list).
+    fn fold_query(&self, txn: &Transaction, stmt: &Statement) -> Result<Statement> {
+        match stmt {
+            Statement::Select(s) => Ok(Statement::Select(Box::new(self.fold_select(txn, s)?))),
+            Statement::Union {
+                all,
+                left,
+                right,
+                order_by,
+                limit,
+                offset,
+            } => Ok(Statement::Union {
+                all: *all,
+                left: Box::new(self.fold_query(txn, left)?),
+                right: Box::new(self.fold_query(txn, right)?),
+                order_by: self.fold_order_keys(txn, order_by)?,
+                limit: *limit,
+                offset: *offset,
+            }),
+            other => Ok(other.clone()),
+        }
+    }
+
+    fn fold_select(&self, txn: &Transaction, s: &Select) -> Result<Select> {
+        let projections = s
+            .projections
+            .iter()
+            .map(|p| match p {
+                SelectItem::Star => Ok(SelectItem::Star),
+                SelectItem::Expr(e, alias) => {
+                    Ok(SelectItem::Expr(self.fold_expr(txn, e)?, alias.clone()))
+                }
+            })
+            .collect::<Result<_>>()?;
+        let joins = s
+            .joins
+            .iter()
+            .map(|j| {
+                Ok(Join {
+                    kind: j.kind,
+                    table: j.table.clone(),
+                    on: self.fold_expr(txn, &j.on)?,
+                })
+            })
+            .collect::<Result<_>>()?;
+        Ok(Select {
+            distinct: s.distinct,
+            projections,
+            from: s.from.clone(),
+            joins,
+            where_clause: s
+                .where_clause
+                .as_ref()
+                .map(|w| self.fold_expr(txn, w))
+                .transpose()?,
+            group_by: s
+                .group_by
+                .iter()
+                .map(|g| self.fold_expr(txn, g))
+                .collect::<Result<_>>()?,
+            having: s
+                .having
+                .as_ref()
+                .map(|h| self.fold_expr(txn, h))
+                .transpose()?,
+            order_by: self.fold_order_keys(txn, &s.order_by)?,
+            limit: s.limit,
+            offset: s.offset,
+        })
+    }
+
+    fn fold_order_keys(&self, txn: &Transaction, keys: &[OrderItem]) -> Result<Vec<OrderItem>> {
+        keys.iter()
+            .map(|o| {
+                Ok(OrderItem {
+                    expr: self.fold_expr(txn, &o.expr)?,
+                    desc: o.desc,
+                })
+            })
+            .collect()
+    }
+
+    /// Recursively rewrite subqueries inside an expression.
+    fn fold_expr(&self, txn: &Transaction, expr: &Expr) -> Result<Expr> {
+        match expr {
+            Expr::Subquery(q) => Ok(Expr::Literal(self.scalar_subquery(txn, q)?)),
+            Expr::InSubquery {
+                expr,
+                query,
+                negated,
+            } => {
+                let lhs = self.fold_expr(txn, expr)?;
+                let values = self.column_subquery(txn, query)?;
+                Ok(in_list_expr(&lhs, &values, *negated))
+            }
+            Expr::Binary { op, left, right } => Ok(Expr::Binary {
+                op: *op,
+                left: Box::new(self.fold_expr(txn, left)?),
+                right: Box::new(self.fold_expr(txn, right)?),
+            }),
+            Expr::Unary { op, expr } => Ok(Expr::Unary {
+                op: *op,
+                expr: Box::new(self.fold_expr(txn, expr)?),
+            }),
+            Expr::Func {
+                name,
+                distinct,
+                args,
+            } => Ok(Expr::Func {
+                name: name.clone(),
+                distinct: *distinct,
+                args: args
+                    .iter()
+                    .map(|a| self.fold_expr(txn, a))
+                    .collect::<Result<_>>()?,
+            }),
+            Expr::Case {
+                operand,
+                whens,
+                else_result,
+            } => Ok(Expr::Case {
+                operand: operand
+                    .as_ref()
+                    .map(|o| self.fold_expr(txn, o).map(Box::new))
+                    .transpose()?,
+                whens: whens
+                    .iter()
+                    .map(|(w, t)| Ok((self.fold_expr(txn, w)?, self.fold_expr(txn, t)?)))
+                    .collect::<Result<_>>()?,
+                else_result: else_result
+                    .as_ref()
+                    .map(|e| self.fold_expr(txn, e).map(Box::new))
+                    .transpose()?,
+            }),
+            // Leaves carry no nested expressions.
+            Expr::Column(_) | Expr::QualifiedColumn(..) | Expr::Literal(_) | Expr::Star => {
+                Ok(expr.clone())
+            }
+        }
+    }
+
+    /// Run a scalar subquery and return its single value (NULL if it returns no
+    /// rows). Errors if it returns more than one column or row.
+    fn scalar_subquery(&self, txn: &Transaction, stmt: &Statement) -> Result<Value> {
+        let folded = self.fold_query(txn, stmt)?;
+        let (columns, mut rows) = self.execute_query(txn, &folded)?;
+        if columns.len() != 1 {
+            return Err(DbError::Unsupported(
+                "a scalar subquery must return exactly one column".into(),
+            ));
+        }
+        match rows.len() {
+            0 => Ok(Value::Null),
+            1 => Ok(rows.remove(0).remove(0)),
+            _ => Err(DbError::Unsupported(
+                "a scalar subquery returned more than one row".into(),
+            )),
+        }
+    }
+
+    /// Run a one-column subquery and return all its values (for `IN`).
+    fn column_subquery(&self, txn: &Transaction, stmt: &Statement) -> Result<Vec<Value>> {
+        let folded = self.fold_query(txn, stmt)?;
+        let (columns, rows) = self.execute_query(txn, &folded)?;
+        if columns.len() != 1 {
+            return Err(DbError::Unsupported(
+                "an IN subquery must return exactly one column".into(),
+            ));
+        }
+        Ok(rows.into_iter().map(|mut r| r.remove(0)).collect())
     }
 
     fn run_update(
@@ -736,7 +919,11 @@ impl Database {
         };
         match inner.as_ref() {
             Statement::Select(_) | Statement::Union { .. } => {
-                let logical = bind(&self.catalog, inner)?;
+                // Fold subqueries under a transient read snapshot so EXPLAIN
+                // plans the same query the executor would run.
+                let txn = self.mgr.begin();
+                let folded = self.fold_query(&txn, inner)?;
+                let logical = bind(&self.catalog, &folded)?;
                 let physical = plan(&logical, &self.catalog)?;
                 Ok(QueryOutcome::Explain(explain(&physical)))
             }
@@ -871,6 +1058,35 @@ fn find_equality(predicate: &Expr, col: &str) -> Option<Value> {
         } => find_equality(left, col).or_else(|| find_equality(right, col)),
         _ => None,
     }
+}
+
+/// Desugar `lhs [NOT] IN (v1, v2, ...)` to a chain of equalities, the same
+/// shape the parser produces for a literal `IN`-list. An empty set is a
+/// constant: `IN ()` is false, `NOT IN ()` is true.
+fn in_list_expr(lhs: &Expr, values: &[Value], negated: bool) -> Expr {
+    if values.is_empty() {
+        return Expr::Literal(Value::Bool(negated));
+    }
+    let (cmp, join) = if negated {
+        (BinOp::Ne, BinOp::And)
+    } else {
+        (BinOp::Eq, BinOp::Or)
+    };
+    let eq = |v: &Value| Expr::Binary {
+        op: cmp,
+        left: Box::new(lhs.clone()),
+        right: Box::new(Expr::Literal(v.clone())),
+    };
+    let mut iter = values.iter();
+    let mut acc = eq(iter.next().expect("non-empty"));
+    for v in iter {
+        acc = Expr::Binary {
+            op: join,
+            left: Box::new(acc),
+            right: Box::new(eq(v)),
+        };
+    }
+    acc
 }
 
 /// Whether `expr` is a reference (bare or qualified) to the column `col`.
@@ -1859,5 +2075,89 @@ mod tests {
         assert!(db
             .execute("SELECT x, y FROM a UNION SELECT z FROM b")
             .is_err());
+    }
+
+    // --- subqueries (uncorrelated scalar and IN) ---
+
+    fn seed_emp(db: &mut Database) {
+        db.execute("CREATE TABLE emp (name TEXT, dept TEXT, salary INT)")
+            .unwrap();
+        db.execute("CREATE TABLE dept (name TEXT, region TEXT)")
+            .unwrap();
+        db.execute(
+            "INSERT INTO emp VALUES ('a','eng',100),('b','eng',60),('c','sales',80),('d','sales',40)",
+        )
+        .unwrap();
+        db.execute("INSERT INTO dept VALUES ('eng','west'),('sales','east')")
+            .unwrap();
+    }
+
+    fn name_set(rows: &[Vec<Value>]) -> Vec<String> {
+        rows.iter()
+            .map(|r| match &r[0] {
+                Value::Text(s) => s.clone(),
+                o => panic!("want text, got {o:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn scalar_subquery_in_where_and_projection() {
+        let (_d, mut db) = db();
+        seed_emp(&mut db);
+        // Average salary is 70; names above it: a (100), c (80).
+        let (_c, rows) = query(
+            &mut db,
+            "SELECT name FROM emp WHERE salary > (SELECT AVG(salary) FROM emp) ORDER BY name",
+        );
+        assert_eq!(name_set(&rows), vec!["a", "c"]);
+        // A scalar subquery in the projection (same value on every row).
+        let (_c, proj) = query(
+            &mut db,
+            "SELECT name, (SELECT MAX(salary) FROM emp) FROM emp ORDER BY name LIMIT 1",
+        );
+        assert_eq!(proj, vec![vec![Value::Text("a".into()), Value::Int(100)]]);
+    }
+
+    #[test]
+    fn in_and_not_in_subquery() {
+        let (_d, mut db) = db();
+        seed_emp(&mut db);
+        // Employees whose dept is in the west region (eng): a, b.
+        let (_c, rows) = query(
+            &mut db,
+            "SELECT name FROM emp WHERE dept IN (SELECT name FROM dept WHERE region = 'west') ORDER BY name",
+        );
+        assert_eq!(name_set(&rows), vec!["a", "b"]);
+        // NOT IN: the others.
+        let (_c, rows2) = query(
+            &mut db,
+            "SELECT name FROM emp WHERE dept NOT IN (SELECT name FROM dept WHERE region = 'west') ORDER BY name",
+        );
+        assert_eq!(name_set(&rows2), vec!["c", "d"]);
+    }
+
+    #[test]
+    fn empty_scalar_subquery_is_null() {
+        let (_d, mut db) = db();
+        seed_emp(&mut db);
+        // No rows match, so the scalar subquery is NULL and the comparison is
+        // unknown, excluding every row.
+        let (_c, rows) = query(
+            &mut db,
+            "SELECT name FROM emp WHERE salary > (SELECT AVG(salary) FROM emp WHERE dept = 'nope')",
+        );
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn correlated_subquery_is_rejected() {
+        let (_d, mut db) = db();
+        seed_emp(&mut db);
+        // The inner query references the outer `dept`, which it cannot see.
+        let err = db.execute(
+            "SELECT name FROM emp WHERE salary > (SELECT AVG(salary) FROM dept WHERE dept = region)",
+        );
+        assert!(err.is_err());
     }
 }

@@ -42,6 +42,10 @@ pub fn eval(expr: &Expr, row: &[Value], columns: &[String]) -> Result<Value> {
             row,
             columns,
         ),
+        // The engine folds subqueries to literals before execution.
+        Expr::Subquery(_) | Expr::InSubquery { .. } => Err(ExecError::Unsupported(
+            "subquery reached the evaluator (should have been folded)".into(),
+        )),
     }
 }
 

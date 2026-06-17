@@ -474,7 +474,7 @@ impl Parser {
     /// Parse a query: a `SELECT`, optionally combined with more `SELECT`s via
     /// `UNION` / `UNION ALL` (folded left-associatively), with any trailing
     /// `ORDER BY` / `LIMIT` / `OFFSET` applying to the whole query.
-    fn parse_query(&mut self) -> Result<Statement> {
+    pub(crate) fn parse_query(&mut self) -> Result<Statement> {
         let mut query = Statement::Select(Box::new(self.parse_select()?));
         while self.eat_keyword(Keyword::Union) {
             let all = self.eat_keyword(Keyword::All);
@@ -905,6 +905,14 @@ mod tests {
         let second = parse(&printed);
         assert_eq!(first, second, "round-trip mismatch: {src:?} -> {printed:?}");
         first
+    }
+
+    #[test]
+    fn subquery_round_trips() {
+        round_trip("SELECT a FROM t WHERE x > (SELECT MAX(y) FROM u)");
+        round_trip("SELECT (SELECT COUNT(*) FROM u) FROM t");
+        round_trip("SELECT a FROM t WHERE x IN (SELECT y FROM u)");
+        round_trip("SELECT a FROM t WHERE x NOT IN (SELECT y FROM u WHERE z > 0)");
     }
 
     #[test]

@@ -203,6 +203,16 @@ impl Parser {
     /// negated, an AND of inequalities).
     fn parse_in(&mut self, lhs: &Expr, negated: bool) -> Result<Expr> {
         self.expect(&TokenKind::LParen)?;
+        // `x [NOT] IN (SELECT ...)`: a subquery membership test.
+        if matches!(self.peek(), TokenKind::Keyword(Keyword::Select)) {
+            let query = self.parse_query()?;
+            self.expect(&TokenKind::RParen)?;
+            return Ok(Expr::InSubquery {
+                expr: Box::new(lhs.clone()),
+                query: Box::new(query),
+                negated,
+            });
+        }
         let mut items = vec![self.parse_expr()?];
         while self.eat(&TokenKind::Comma) {
             items.push(self.parse_expr()?);
@@ -337,9 +347,16 @@ impl Parser {
             }
             TokenKind::LParen => {
                 self.advance();
-                let inner = self.parse_expr()?;
-                self.expect(&TokenKind::RParen)?;
-                Ok(inner)
+                if matches!(self.peek(), TokenKind::Keyword(Keyword::Select)) {
+                    // A parenthesized query used as a scalar value.
+                    let query = self.parse_query()?;
+                    self.expect(&TokenKind::RParen)?;
+                    Ok(Expr::Subquery(Box::new(query)))
+                } else {
+                    let inner = self.parse_expr()?;
+                    self.expect(&TokenKind::RParen)?;
+                    Ok(inner)
+                }
             }
             TokenKind::Int(n) => {
                 self.advance();

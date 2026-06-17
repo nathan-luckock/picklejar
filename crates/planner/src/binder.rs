@@ -225,6 +225,11 @@ fn resolve_expr(expr: &Expr, scope: &[ScopeEntry<'_>]) -> Result<()> {
             }
             Ok(())
         }
+        // Subqueries are folded to literals by the engine before binding; one
+        // reaching here is correlated or in an unsupported position.
+        Expr::Subquery(_) | Expr::InSubquery { .. } => Err(PlanError::Unsupported(
+            "correlated subqueries are not supported".to_string(),
+        )),
     }
 }
 

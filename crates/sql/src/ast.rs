@@ -205,6 +205,18 @@ pub enum Expr {
         /// The `ELSE` result, or `None` (which yields `NULL`).
         else_result: Option<Box<Self>>,
     },
+    /// A scalar subquery `(SELECT ...)` used as a value. Evaluated to a single
+    /// value before planning (uncorrelated subqueries only).
+    Subquery(Box<crate::statement::Statement>),
+    /// `expr [NOT] IN (SELECT ...)`. Folded to an `IN`-list before planning.
+    InSubquery {
+        /// The value tested for membership.
+        expr: Box<Self>,
+        /// The subquery whose single column is the candidate set.
+        query: Box<crate::statement::Statement>,
+        /// `NOT IN` when true.
+        negated: bool,
+    },
 }
 
 impl Expr {
@@ -280,6 +292,15 @@ impl fmt::Display for Expr {
                     write!(f, " ELSE {e}")?;
                 }
                 f.write_str(" END")
+            }
+            Self::Subquery(q) => write!(f, "({q})"),
+            Self::InSubquery {
+                expr,
+                query,
+                negated,
+            } => {
+                let kw = if *negated { "NOT IN" } else { "IN" };
+                write!(f, "({expr} {kw} ({query}))")
             }
         }
     }
