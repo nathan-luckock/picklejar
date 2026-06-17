@@ -148,6 +148,16 @@ tour, see the [README](../README.md).
   begins once roles exist and a session runs as a non-superuser. The wire server
   runs each connection as the role it authenticated. Roles, grants, memberships,
   and ownership persist across a restart.
+- **Row-level security** - `ALTER TABLE t ENABLE` / `DISABLE` / `FORCE` /
+  `NO FORCE ROW LEVEL SECURITY` and `CREATE POLICY name ON t [FOR cmd]
+  [TO roles] [USING (expr)] [WITH CHECK (expr)]` / `DROP POLICY`. When RLS is on
+  and the role is not exempt (superuser / `BYPASSRLS`, or the owner unless the
+  table forces RLS), the engine folds the applicable policies' `USING`
+  predicates into every read (`SELECT`, and the affected-row scope of `UPDATE` /
+  `DELETE`) and enforces their `WITH CHECK` on every written row, so a policy
+  like `USING (owner = current_user)` gives per-tenant isolation. With RLS
+  enabled and no matching policy the default is deny. Policies persist across a
+  restart.
 - **Concurrency** - the wire server handles many client connections at once: the
   single-threaded engine runs as an actor on its own thread, and each connection
   gets its own thread and session handle. Transaction exclusivity keeps explicit

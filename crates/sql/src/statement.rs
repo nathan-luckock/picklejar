@@ -405,6 +405,14 @@ pub enum AlterAction {
         /// The new table name.
         to: String,
     },
+    /// `ENABLE ROW LEVEL SECURITY`: row-level security policies now apply.
+    EnableRls,
+    /// `DISABLE ROW LEVEL SECURITY`: policies are no longer applied.
+    DisableRls,
+    /// `FORCE ROW LEVEL SECURITY`: apply policies even to the table owner.
+    ForceRls,
+    /// `NO FORCE ROW LEVEL SECURITY`: the owner bypasses policies again.
+    NoForceRls,
 }
 
 impl fmt::Display for AlterAction {
@@ -417,6 +425,10 @@ impl fmt::Display for AlterAction {
             }
             Self::RenameColumn { from, to } => write!(f, "RENAME COLUMN {from} TO {to}"),
             Self::RenameTable { to } => write!(f, "RENAME TO {to}"),
+            Self::EnableRls => f.write_str("ENABLE ROW LEVEL SECURITY"),
+            Self::DisableRls => f.write_str("DISABLE ROW LEVEL SECURITY"),
+            Self::ForceRls => f.write_str("FORCE ROW LEVEL SECURITY"),
+            Self::NoForceRls => f.write_str("NO FORCE ROW LEVEL SECURITY"),
         }
     }
 }
@@ -702,6 +714,66 @@ pub enum Statement {
         /// The role to assume, or `None` for `NONE` / `RESET`.
         name: Option<String>,
     },
+    /// `CREATE POLICY name ON table [FOR cmd] [TO roles] [USING (expr)]
+    /// [WITH CHECK (expr)]`: a row-level security policy.
+    CreatePolicy {
+        /// Policy name (unique per table).
+        name: String,
+        /// The table the policy guards.
+        table: String,
+        /// Which commands it applies to (`ALL` by default).
+        command: PolicyCommand,
+        /// The roles it applies to (empty means `PUBLIC`).
+        roles: Vec<Grantee>,
+        /// `USING (expr)`: the visibility predicate for existing rows.
+        using: Option<Expr>,
+        /// `WITH CHECK (expr)`: the predicate new/updated rows must satisfy.
+        check: Option<Expr>,
+    },
+    /// `DROP POLICY [IF EXISTS] name ON table`.
+    DropPolicy {
+        /// `IF EXISTS`: a missing policy is not an error.
+        if_exists: bool,
+        /// Policy name.
+        name: String,
+        /// The table it was on.
+        table: String,
+    },
+}
+
+/// Which commands a row-level security policy applies to.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum PolicyCommand {
+    /// `FOR ALL` (the default): every command.
+    All,
+    /// `FOR SELECT`: reads.
+    Select,
+    /// `FOR INSERT`: new rows (uses `WITH CHECK`).
+    Insert,
+    /// `FOR UPDATE`: modified rows.
+    Update,
+    /// `FOR DELETE`: removed rows.
+    Delete,
+}
+
+impl PolicyCommand {
+    /// The SQL keyword for this command.
+    #[must_use]
+    pub const fn keyword(self) -> &'static str {
+        match self {
+            Self::All => "ALL",
+            Self::Select => "SELECT",
+            Self::Insert => "INSERT",
+            Self::Update => "UPDATE",
+            Self::Delete => "DELETE",
+        }
+    }
+}
+
+impl fmt::Display for PolicyCommand {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.keyword())
+    }
 }
 
 /// A table-level privilege that can be granted or revoked.
@@ -1144,6 +1216,37 @@ impl fmt::Display for Statement {
                 Some(name) => write!(f, "SET ROLE {name}"),
                 None => f.write_str("SET ROLE NONE"),
             },
+            Self::CreatePolicy {
+                name,
+                table,
+                command,
+                roles,
+                using,
+                check,
+            } => {
+                write!(f, "CREATE POLICY {name} ON {table}")?;
+                if !matches!(command, PolicyCommand::All) {
+                    write!(f, " FOR {command}")?;
+                }
+                if !roles.is_empty() {
+                    write!(f, " TO {}", join_display(roles))?;
+                }
+                if let Some(using) = using {
+                    write!(f, " USING ({using})")?;
+                }
+                if let Some(check) = check {
+                    write!(f, " WITH CHECK ({check})")?;
+                }
+                Ok(())
+            }
+            Self::DropPolicy {
+                if_exists,
+                name,
+                table,
+            } => {
+                let guard = if *if_exists { "IF EXISTS " } else { "" };
+                write!(f, "DROP POLICY {guard}{name} ON {table}")
+            }
         }
     }
 }
@@ -1687,10 +1790,12 @@ impl Parser {
             self.parse_create_role_tail(false)
         } else if self.eat_ident_kw("user") {
             self.parse_create_role_tail(true)
+        } else if self.eat_ident_kw("policy") {
+            self.parse_create_policy_tail()
         } else {
             Err(SqlError::parse(
                 format!(
-                    "expected TABLE, INDEX, VIEW, ROLE, or USER after CREATE, found {:?}",
+                    "expected TABLE, INDEX, VIEW, ROLE, USER, or POLICY after CREATE, found {:?}",
                     self.peek()
                 ),
                 self.span(),
@@ -2017,12 +2122,107 @@ impl Parser {
                 let to = self.parse_ident()?;
                 Ok(AlterAction::RenameColumn { from, to })
             }
+        } else if self.eat_ident_kw("enable") {
+            self.expect_row_level_security()?;
+            Ok(AlterAction::EnableRls)
+        } else if self.eat_ident_kw("disable") {
+            self.expect_row_level_security()?;
+            Ok(AlterAction::DisableRls)
+        } else if self.eat_ident_kw("force") {
+            self.expect_row_level_security()?;
+            Ok(AlterAction::ForceRls)
+        } else if self.eat_ident_kw("no") {
+            if !self.eat_ident_kw("force") {
+                return Err(SqlError::parse("expected FORCE after NO", self.span()));
+            }
+            self.expect_row_level_security()?;
+            Ok(AlterAction::NoForceRls)
         } else {
             Err(SqlError::parse(
-                "expected ADD, DROP, or RENAME after ALTER TABLE name",
+                "expected ADD, DROP, RENAME, ENABLE, DISABLE, FORCE, or NO after ALTER TABLE name",
                 self.span(),
             ))
         }
+    }
+
+    /// Consume the `ROW LEVEL SECURITY` keyword run (all three are
+    /// context-sensitive, not reserved).
+    fn expect_row_level_security(&mut self) -> Result<()> {
+        if self.eat_ident_kw("row") && self.eat_ident_kw("level") && self.eat_ident_kw("security") {
+            Ok(())
+        } else {
+            Err(SqlError::parse(
+                "expected ROW LEVEL SECURITY".to_string(),
+                self.span(),
+            ))
+        }
+    }
+
+    /// `CREATE POLICY name ON table [FOR cmd] [TO roles] [USING (e)]
+    /// [WITH CHECK (e)]` (the leading `CREATE POLICY` is already consumed).
+    fn parse_create_policy_tail(&mut self) -> Result<Statement> {
+        let name = self.parse_ident()?;
+        self.expect_keyword(Keyword::On)?;
+        let table = self.parse_ident()?;
+        let command = if self.eat_ident_kw("for") {
+            self.parse_policy_command()?
+        } else {
+            PolicyCommand::All
+        };
+        let roles = if self.eat_ident_kw("to") {
+            self.parse_grantees()?
+        } else {
+            Vec::new()
+        };
+        let using = if self.eat_ident_kw("using") {
+            Some(self.parse_paren_expr()?)
+        } else {
+            None
+        };
+        let check = if self.eat_keyword(Keyword::With) {
+            if !self.eat_keyword(Keyword::Check) {
+                return Err(SqlError::parse("expected CHECK after WITH", self.span()));
+            }
+            Some(self.parse_paren_expr()?)
+        } else {
+            None
+        };
+        Ok(Statement::CreatePolicy {
+            name,
+            table,
+            command,
+            roles,
+            using,
+            check,
+        })
+    }
+
+    /// Parse the command a policy applies to (`ALL` / `SELECT` / `INSERT` /
+    /// `UPDATE` / `DELETE`).
+    fn parse_policy_command(&mut self) -> Result<PolicyCommand> {
+        let cmd = match self.peek() {
+            TokenKind::Keyword(Keyword::All) => PolicyCommand::All,
+            TokenKind::Keyword(Keyword::Select) => PolicyCommand::Select,
+            TokenKind::Keyword(Keyword::Insert) => PolicyCommand::Insert,
+            TokenKind::Keyword(Keyword::Update) => PolicyCommand::Update,
+            TokenKind::Keyword(Keyword::Delete) => PolicyCommand::Delete,
+            other => {
+                return Err(SqlError::parse(
+                    format!("expected a policy command, found {other:?}"),
+                    self.span(),
+                ))
+            }
+        };
+        self.advance();
+        Ok(cmd)
+    }
+
+    /// Parse a parenthesized expression `( expr )`.
+    fn parse_paren_expr(&mut self) -> Result<Expr> {
+        self.expect(&TokenKind::LParen)?;
+        let expr = self.parse_expr()?;
+        self.expect(&TokenKind::RParen)?;
+        Ok(expr)
     }
 
     fn parse_drop(&mut self) -> Result<Statement> {
@@ -2036,6 +2236,17 @@ impl Parser {
             let if_exists = self.parse_if_exists()?;
             let name = self.parse_ident()?;
             return Ok(Statement::DropRole { if_exists, name });
+        }
+        if self.eat_ident_kw("policy") {
+            let if_exists = self.parse_if_exists()?;
+            let name = self.parse_ident()?;
+            self.expect_keyword(Keyword::On)?;
+            let table = self.parse_ident()?;
+            return Ok(Statement::DropPolicy {
+                if_exists,
+                name,
+                table,
+            });
         }
         self.expect_keyword(Keyword::Table)?;
         let if_exists = self.parse_if_exists()?;
@@ -2549,6 +2760,24 @@ mod tests {
         round_trip("SET ROLE NONE");
         // `role`, `user`, `public` stay usable as identifiers (non-reserved).
         round_trip("SELECT role, public FROM t");
+    }
+
+    #[test]
+    fn rls_and_policies_round_trip() {
+        round_trip("ALTER TABLE t ENABLE ROW LEVEL SECURITY");
+        round_trip("ALTER TABLE t DISABLE ROW LEVEL SECURITY");
+        round_trip("ALTER TABLE t FORCE ROW LEVEL SECURITY");
+        round_trip("ALTER TABLE t NO FORCE ROW LEVEL SECURITY");
+        round_trip("CREATE POLICY p ON t USING ((owner = current_user()))");
+        round_trip("CREATE POLICY p ON t FOR SELECT TO analyst USING ((tenant = 1))");
+        round_trip(
+            "CREATE POLICY p ON t FOR INSERT TO alice, bob WITH CHECK ((tenant = current_user()))",
+        );
+        round_trip("CREATE POLICY p ON t FOR ALL USING ((a = 1)) WITH CHECK ((a = 1))");
+        round_trip("DROP POLICY p ON t");
+        round_trip("DROP POLICY IF EXISTS p ON t");
+        // `policy`, `security`, `force` stay usable as identifiers.
+        round_trip("SELECT policy, security, force FROM t");
     }
 
     #[test]
