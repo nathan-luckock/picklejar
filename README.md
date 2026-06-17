@@ -129,7 +129,7 @@ cargo run --bin difftest -- --seed 42           # replay one exactly
 
 - **DDL**: `CREATE TABLE` (with `PRIMARY KEY` / `UNIQUE` / `NOT NULL` / `DEFAULT`, plus `CHECK` and single-column `FOREIGN KEY` constraints), `DROP TABLE`, `TRUNCATE TABLE`, `ALTER TABLE ... ADD COLUMN`, `CREATE INDEX`, and `CREATE VIEW` / `DROP VIEW`.
 - **Constraints**: `CHECK` predicates and `FOREIGN KEY` referential integrity, enforced on write (a foreign key is `RESTRICT` on the parent side) and persisted across restarts.
-- **DML**: `INSERT` (with or without a column list), `UPDATE`, `DELETE`.
+- **DML**: `INSERT` (with or without a column list), `UPDATE`, `DELETE`, each with an optional `RETURNING` projection over the affected rows.
 - **Queries**: projection and `*`, `WHERE` with SQL three-valued logic, `INNER` / `LEFT` / `CROSS JOIN`, `GROUP BY` with `COUNT` / `SUM` / `MIN` / `MAX` / `AVG` (and `DISTINCT` aggregates), `HAVING`, `DISTINCT`, `ORDER BY`, `LIMIT` / `OFFSET`, and `UNION` / `UNION ALL`.
 - **Subqueries**: scalar, `IN`, and `EXISTS`, both uncorrelated and correlated; derived tables (`FROM (SELECT ...)`); views expand to the same machinery.
 - **Expressions**: `INT` / `FLOAT` / `BOOL` / `TEXT`, arithmetic with int-to-float promotion, `IN` / `BETWEEN` / `LIKE` / `IS NULL`, `CASE`, string `||`, and a library of scalar functions.

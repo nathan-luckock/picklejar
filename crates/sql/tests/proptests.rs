@@ -185,7 +185,8 @@ fn statement() -> impl Strategy<Value = Statement> {
             .prop_map(|(table, columns, rows)| Statement::Insert {
                 table,
                 columns,
-                rows
+                rows,
+                returning: vec![],
             }),
         (
             ident(),
@@ -196,11 +197,13 @@ fn statement() -> impl Strategy<Value = Statement> {
                 table,
                 assignments,
                 where_clause,
+                returning: vec![],
             }),
         (ident(), proptest::option::of(expr())).prop_map(|(table, where_clause)| {
             Statement::Delete {
                 table,
                 where_clause,
+                returning: vec![],
             }
         }),
     ]

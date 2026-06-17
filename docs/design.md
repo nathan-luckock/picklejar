@@ -355,8 +355,9 @@ per column, plus table-level `CHECK (predicate)` and single-column
 column), `CREATE INDEX`, `DROP TABLE`, `TRUNCATE TABLE`,
 `ALTER TABLE ... ADD COLUMN`, and `CREATE VIEW` / `DROP VIEW`.
 DML is `INSERT` (multi-row, omitted columns take their default), `UPDATE`, and
-`DELETE`. Transaction control is `BEGIN` / `COMMIT` / `ROLLBACK`. `SELECT`
-covers:
+`DELETE`, each accepting a `RETURNING <projection>` that turns the write into a
+result set over the affected rows. Transaction control is `BEGIN` / `COMMIT` /
+`ROLLBACK`. `SELECT` covers:
 
 - Projections with `AS` aliases, `*`, and arbitrary expressions.
 - `WHERE` over the full expression grammar.

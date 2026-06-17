@@ -517,16 +517,19 @@ impl Database {
                 table,
                 columns,
                 rows,
-            } => self.insert(txn, table, columns, rows),
+                returning,
+            } => self.insert(txn, table, columns, rows, returning),
             Statement::Update {
                 table,
                 assignments,
                 where_clause,
-            } => self.run_update(txn, table, assignments, where_clause.as_ref()),
+                returning,
+            } => self.run_update(txn, table, assignments, where_clause.as_ref(), returning),
             Statement::Delete {
                 table,
                 where_clause,
-            } => self.run_delete(txn, table, where_clause.as_ref()),
+                returning,
+            } => self.run_delete(txn, table, where_clause.as_ref(), returning),
             Statement::Select(_) | Statement::Union { .. } => self.run_select(txn, stmt),
             other => Err(DbError::Unsupported(format!("cannot run: {other}"))),
         }
@@ -1024,6 +1027,7 @@ impl Database {
         table: &str,
         columns: &[String],
         rows: &[Vec<Expr>],
+        returning: &[SelectItem],
     ) -> Result<QueryOutcome> {
         // Resolve the schema, the column-to-position mapping, and the column
         // constraints from the catalog, then drop that borrow.
@@ -1127,7 +1131,7 @@ impl Database {
             }
         }
 
-        let mut affected = 0;
+        let mut inserted: Vec<Vec<Value>> = Vec::with_capacity(built.len());
         for values in built {
             // UNIQUE (NULLs do not conflict).
             for (slot, &col) in unique_cols.iter().enumerate() {
@@ -1151,8 +1155,9 @@ impl Database {
                 sec.root = index.root();
             }
             store.next_rowid += 1;
-            affected += 1;
+            inserted.push(values);
         }
+        let affected = inserted.len();
 
         // Persist the (possibly advanced) anchor pages.
         store.index_root = handle.index_root();
@@ -1175,6 +1180,9 @@ impl Database {
                     distinct: row_count.max(1),
                 },
             )?;
+        }
+        if !returning.is_empty() {
+            return project_returning(returning, &column_names, &inserted);
         }
         Ok(QueryOutcome::Mutation { affected })
     }
@@ -1474,6 +1482,7 @@ impl Database {
         table: &str,
         assignments: &[(String, Expr)],
         where_clause: Option<&Expr>,
+        returning: &[SelectItem],
     ) -> Result<QueryOutcome> {
         let (schema, columns, targets, not_null) = {
             let meta = self
@@ -1559,7 +1568,7 @@ impl Database {
             store.index_root,
             store.version_page,
         );
-        let mut affected = 0;
+        let mut new_rows: Vec<Vec<Value>> = Vec::with_capacity(updates.len());
         for (key, new_row) in updates {
             handle.update(txn, key, &encode_row(&new_row, &schema)?)?;
             // Point each indexed column's key at this rowid's new value. Old
@@ -1570,11 +1579,16 @@ impl Database {
                 index.put(&new_row[sec.column], key)?;
                 sec.root = index.root();
             }
-            affected += 1;
+            new_rows.push(new_row);
         }
         store.index_root = handle.index_root();
         store.version_page = handle.version_page();
-        Ok(QueryOutcome::Mutation { affected })
+        if !returning.is_empty() {
+            return project_returning(returning, &columns, &new_rows);
+        }
+        Ok(QueryOutcome::Mutation {
+            affected: new_rows.len(),
+        })
     }
 
     fn run_delete(
@@ -1582,6 +1596,7 @@ impl Database {
         txn: &Transaction,
         table: &str,
         where_clause: Option<&Expr>,
+        returning: &[SelectItem],
     ) -> Result<QueryOutcome> {
         let (schema, columns) = {
             let meta = self
@@ -1610,8 +1625,8 @@ impl Database {
         );
 
         // Pass 1: find matching rows; reject any deletion a child still
-        // references (foreign-key RESTRICT).
-        let mut keys: Vec<u64> = Vec::new();
+        // references (foreign-key RESTRICT). Keep each deleted row for RETURNING.
+        let mut victims: Vec<(u64, Vec<Value>)> = Vec::new();
         for (key, bytes) in read.scan(txn)? {
             let row = decode_row(&bytes, &schema)?;
             if let Some(pred) = where_clause {
@@ -1620,7 +1635,7 @@ impl Database {
                 }
             }
             self.enforce_fk_restrict(txn, table, &columns, &row)?;
-            keys.push(key);
+            victims.push((key, row));
         }
 
         // Pass 2: delete.
@@ -1635,14 +1650,19 @@ impl Database {
             store.index_root,
             store.version_page,
         );
-        let mut affected = 0;
-        for key in keys {
+        let mut deleted: Vec<Vec<Value>> = Vec::with_capacity(victims.len());
+        for (key, row) in victims {
             handle.delete(txn, key)?;
-            affected += 1;
+            deleted.push(row);
         }
         store.index_root = handle.index_root();
         store.version_page = handle.version_page();
-        Ok(QueryOutcome::Mutation { affected })
+        if !returning.is_empty() {
+            return project_returning(returning, &columns, &deleted);
+        }
+        Ok(QueryOutcome::Mutation {
+            affected: deleted.len(),
+        })
     }
 
     fn run_explain(&self, stmt: &Statement) -> Result<QueryOutcome> {
@@ -1795,6 +1815,52 @@ fn find_equality(predicate: &Expr, col: &str) -> Option<Value> {
 /// Desugar `lhs [NOT] IN (v1, v2, ...)` to a chain of equalities, the same
 /// shape the parser produces for a literal `IN`-list. An empty set is a
 /// constant: `IN ()` is false, `NOT IN ()` is true.
+/// Project a `RETURNING` list over the affected rows, producing a result set.
+/// `columns` are the table's column names, aligned with each row in `rows`.
+fn project_returning(
+    returning: &[SelectItem],
+    columns: &[String],
+    rows: &[Vec<Value>],
+) -> Result<QueryOutcome> {
+    let mut out_columns = Vec::new();
+    let mut exprs: Vec<Expr> = Vec::new();
+    for item in returning {
+        match item {
+            SelectItem::Star => {
+                for c in columns {
+                    out_columns.push(c.clone());
+                    exprs.push(Expr::Column(c.clone()));
+                }
+            }
+            SelectItem::Expr(e, alias) => {
+                out_columns.push(alias.clone().unwrap_or_else(|| returning_name(e)));
+                exprs.push(e.clone());
+            }
+        }
+    }
+    let mut out_rows = Vec::with_capacity(rows.len());
+    for row in rows {
+        let r = exprs
+            .iter()
+            .map(|e| eval(e, row, columns).map_err(DbError::from))
+            .collect::<Result<Vec<_>>>()?;
+        out_rows.push(r);
+    }
+    Ok(QueryOutcome::Rows {
+        columns: out_columns,
+        rows: out_rows,
+    })
+}
+
+/// The output column name for a `RETURNING` item: its column name, else its
+/// printed form.
+fn returning_name(e: &Expr) -> String {
+    match e {
+        Expr::Column(n) | Expr::QualifiedColumn(_, n) => n.clone(),
+        other => other.to_string(),
+    }
+}
+
 pub(crate) fn in_list_expr(lhs: &Expr, values: &[Value], negated: bool) -> Expr {
     if values.is_empty() {
         return Expr::Literal(Value::Bool(negated));
@@ -3271,6 +3337,43 @@ mod tests {
                 vec![Value::Int(2), Value::Int(5)],
             ]
         );
+    }
+
+    // --- RETURNING ---
+
+    #[test]
+    fn returning_on_insert_update_delete() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE t (id INT, name TEXT)").unwrap();
+        // INSERT ... RETURNING returns the inserted rows.
+        let (cols, rows) = query(
+            &mut db,
+            "INSERT INTO t VALUES (1, 'a'), (2, 'b') RETURNING id, name",
+        );
+        assert_eq!(names(&cols), ["id", "name"]);
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Int(1), Value::Text("a".into())],
+                vec![Value::Int(2), Value::Text("b".into())],
+            ]
+        );
+        // UPDATE ... RETURNING returns the new versions.
+        let (_c, u) = query(
+            &mut db,
+            "UPDATE t SET name = 'z' WHERE id = 1 RETURNING id, name",
+        );
+        assert_eq!(u, vec![vec![Value::Int(1), Value::Text("z".into())]]);
+        // DELETE ... RETURNING * returns the deleted rows.
+        let (_c, d) = query(&mut db, "DELETE FROM t WHERE id = 2 RETURNING *");
+        assert_eq!(d, vec![vec![Value::Int(2), Value::Text("b".into())]]);
+        // RETURNING can compute an expression with an alias.
+        let (cols2, r2) = query(
+            &mut db,
+            "INSERT INTO t VALUES (5, 'q') RETURNING id + 1 AS next",
+        );
+        assert_eq!(names(&cols2), ["next"]);
+        assert_eq!(r2, vec![vec![Value::Int(6)]]);
     }
 
     // --- CHECK constraints ---

@@ -341,6 +341,8 @@ pub enum Statement {
         columns: Vec<String>,
         /// One or more value rows; each row has one expression per column.
         rows: Vec<Vec<Expr>>,
+        /// `RETURNING` projection over the inserted rows (empty if absent).
+        returning: Vec<SelectItem>,
     },
     /// `UPDATE t SET c = e, ... [WHERE pred]`.
     Update {
@@ -350,6 +352,8 @@ pub enum Statement {
         assignments: Vec<(String, Expr)>,
         /// Optional WHERE predicate.
         where_clause: Option<Expr>,
+        /// `RETURNING` projection over the updated rows (empty if absent).
+        returning: Vec<SelectItem>,
     },
     /// `DELETE FROM t [WHERE pred]`.
     Delete {
@@ -357,6 +361,8 @@ pub enum Statement {
         table: String,
         /// Optional WHERE predicate.
         where_clause: Option<Expr>,
+        /// `RETURNING` projection over the deleted rows (empty if absent).
+        returning: Vec<SelectItem>,
     },
     /// `EXPLAIN <statement>`: plan the inner statement instead of running it.
     Explain(Box<Self>),
@@ -398,6 +404,21 @@ pub enum Statement {
     },
 }
 
+/// Write a `RETURNING <items>` clause, or nothing when `returning` is empty.
+fn write_returning(f: &mut fmt::Formatter<'_>, returning: &[SelectItem]) -> fmt::Result {
+    if returning.is_empty() {
+        return Ok(());
+    }
+    f.write_str(" RETURNING ")?;
+    for (i, item) in returning.iter().enumerate() {
+        if i > 0 {
+            f.write_str(", ")?;
+        }
+        write!(f, "{item}")?;
+    }
+    Ok(())
+}
+
 impl fmt::Display for Statement {
     #[allow(clippy::too_many_lines)]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -432,6 +453,7 @@ impl fmt::Display for Statement {
                 table,
                 columns,
                 rows,
+                returning,
             } => {
                 write!(f, "INSERT INTO {table}")?;
                 if !columns.is_empty() {
@@ -458,12 +480,13 @@ impl fmt::Display for Statement {
                     }
                     f.write_str(")")?;
                 }
-                Ok(())
+                write_returning(f, returning)
             }
             Self::Update {
                 table,
                 assignments,
                 where_clause,
+                returning,
             } => {
                 write!(f, "UPDATE {table} SET ")?;
                 for (i, (col, val)) in assignments.iter().enumerate() {
@@ -475,17 +498,18 @@ impl fmt::Display for Statement {
                 if let Some(w) = where_clause {
                     write!(f, " WHERE {w}")?;
                 }
-                Ok(())
+                write_returning(f, returning)
             }
             Self::Delete {
                 table,
                 where_clause,
+                returning,
             } => {
                 write!(f, "DELETE FROM {table}")?;
                 if let Some(w) = where_clause {
                     write!(f, " WHERE {w}")?;
                 }
-                Ok(())
+                write_returning(f, returning)
             }
             Self::Explain(inner) => write!(f, "EXPLAIN {inner}"),
             Self::Truncate { table } => write!(f, "TRUNCATE TABLE {table}"),
@@ -1080,11 +1104,22 @@ impl Parser {
                 break;
             }
         }
+        let returning = self.parse_returning()?;
         Ok(Statement::Insert {
             table,
             columns,
             rows,
+            returning,
         })
+    }
+
+    /// Parse an optional `RETURNING <projection>` clause (empty if absent).
+    fn parse_returning(&mut self) -> Result<Vec<SelectItem>> {
+        if self.eat_keyword(Keyword::Returning) {
+            self.parse_projections()
+        } else {
+            Ok(Vec::new())
+        }
     }
 
     fn parse_update(&mut self) -> Result<Statement> {
@@ -1106,10 +1141,12 @@ impl Parser {
         } else {
             None
         };
+        let returning = self.parse_returning()?;
         Ok(Statement::Update {
             table,
             assignments,
             where_clause,
+            returning,
         })
     }
 
@@ -1122,9 +1159,11 @@ impl Parser {
         } else {
             None
         };
+        let returning = self.parse_returning()?;
         Ok(Statement::Delete {
             table,
             where_clause,
+            returning,
         })
     }
 
@@ -1153,6 +1192,7 @@ impl Statement {
                 table,
                 columns,
                 rows,
+                returning,
             } => Self::Insert {
                 table: table.clone(),
                 columns: columns.clone(),
@@ -1160,11 +1200,13 @@ impl Statement {
                     .iter()
                     .map(|r| r.iter().map(|e| e.substitute_params(params)).collect())
                     .collect(),
+                returning: returning.clone(),
             },
             Self::Update {
                 table,
                 assignments,
                 where_clause,
+                returning,
             } => Self::Update {
                 table: table.clone(),
                 assignments: assignments
@@ -1172,13 +1214,16 @@ impl Statement {
                     .map(|(c, e)| (c.clone(), e.substitute_params(params)))
                     .collect(),
                 where_clause: where_clause.as_ref().map(|w| w.substitute_params(params)),
+                returning: returning.clone(),
             },
             Self::Delete {
                 table,
                 where_clause,
+                returning,
             } => Self::Delete {
                 table: table.clone(),
                 where_clause: where_clause.as_ref().map(|w| w.substitute_params(params)),
+                returning: returning.clone(),
             },
             Self::Union {
                 all,
@@ -1576,6 +1621,7 @@ mod tests {
                     Expr::Literal(crate::ast::Value::Int(1)),
                     Expr::Literal(crate::ast::Value::Text("x".into())),
                 ]],
+                returning: vec![],
             }
         );
     }
@@ -1596,6 +1642,7 @@ mod tests {
             table,
             assignments,
             where_clause,
+            ..
         } = s
         else {
             panic!("wrong variant");
@@ -1626,6 +1673,7 @@ mod tests {
                     Expr::Column("a".into()),
                     Expr::Literal(crate::ast::Value::Int(1))
                 )),
+                returning: vec![],
             }
         );
         assert_eq!(
@@ -1633,8 +1681,17 @@ mod tests {
             Statement::Delete {
                 table: "t".into(),
                 where_clause: None,
+                returning: vec![],
             }
         );
+    }
+
+    #[test]
+    fn returning_round_trips() {
+        round_trip("INSERT INTO t (a, b) VALUES (1, 2) RETURNING a");
+        round_trip("INSERT INTO t VALUES (1) RETURNING *");
+        round_trip("UPDATE t SET a = 1 WHERE id = 2 RETURNING a, b AS x");
+        round_trip("DELETE FROM t WHERE id = 1 RETURNING *");
     }
 
     #[test]
