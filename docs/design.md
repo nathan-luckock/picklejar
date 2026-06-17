@@ -398,13 +398,19 @@ Transaction control is `BEGIN` / `COMMIT` / `ROLLBACK`. `SELECT` covers:
 - Derived tables: a subquery as a `FROM` / `JOIN` relation,
   `(SELECT ...) AS x`, with its columns re-qualified under the alias. A view
   reference expands to the same machinery over its stored query.
-- Common table expressions: `WITH name AS (query), ... body`. The engine
-  inlines each CTE reference in the body (and in later CTEs) into a derived
-  table over its query before planning, so a CTE is just a named subquery and
-  reuses the derived-table machinery. CTEs are processed in declaration order,
-  so a later one may reference an earlier one. `WITH RECURSIVE` and a
-  self-referencing CTE are rejected for now (recursion is future work), as is
-  a `WITH` column-rename list.
+- Common table expressions: `WITH [RECURSIVE] name AS (query), ... body`. A
+  non-recursive CTE is inlined: each reference in the body (and in later CTEs)
+  is rewritten into a derived table over its query before planning, so a CTE is
+  just a named subquery and reuses the derived-table machinery. A `RECURSIVE`
+  CTE is evaluated at run time instead: its `anchor UNION [ALL] recursive`
+  shape is iterated to a fixpoint (run the anchor once, then repeatedly run the
+  recursive term with the CTE bound to the rows found so far, until a round
+  adds nothing new), materializing the result into an in-memory relation that
+  the body then reads. Each CTE relation is registered in a scratch catalog and
+  served through the same in-memory `MaterializedSource` the correlated-subquery
+  path uses. A safety cap aborts a recursion that would exceed a million rows. A
+  self-reference without `RECURSIVE`, a recursive CTE that is not a `UNION`, and
+  a `WITH` column-rename list are each rejected.
 - `EXPLAIN` of any of the above.
 
 The expression grammar has four column types (`INT`, `FLOAT`, `BOOL`, `TEXT`),

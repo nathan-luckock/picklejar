@@ -39,7 +39,7 @@ use rustdb_sql::statement::{
     ColumnDef, ConflictAction, Cte, DataType, Join, OnConflict, OrderItem, Select, SelectItem,
     TableConstraint, TableRef,
 };
-use rustdb_sql::{BinOp, Expr, Parser, Statement, UnOp, Value};
+use rustdb_sql::{BinOp, Expr, Parser, SetOp, Statement, UnOp, Value};
 use rustdb_storage::{BufferPool, FileManager, PageId};
 use rustdb_txn::{MvccTable, Transaction, TransactionManager};
 use rustdb_wal::{WalSyncHandle, WalWriter};
@@ -481,13 +481,11 @@ impl Database {
             } => self.alter_add_column(table, column),
             // EXPLAIN only plans; it touches no data.
             Statement::Explain(_) => self.run_explain(&stmt),
-            // `expand_ctes` above rewrote any WITH into a plain query.
-            Statement::With { .. } => {
-                unreachable!("WITH is expanded into its body before dispatch")
-            }
             // DML and SELECT run inside the open transaction, or a fresh
-            // auto-commit one.
-            Statement::Insert { .. }
+            // auto-commit one. `expand_ctes` inlined any non-recursive WITH;
+            // only a recursive WITH reaches here, evaluated against a snapshot.
+            Statement::With { .. }
+            | Statement::Insert { .. }
             | Statement::Update { .. }
             | Statement::Delete { .. }
             | Statement::Select(_)
@@ -572,6 +570,7 @@ impl Database {
                 returning,
             } => self.run_delete(txn, table, where_clause.as_ref(), returning),
             Statement::Select(_) | Statement::Union { .. } => self.run_select(txn, stmt),
+            Statement::With { ctes, body, .. } => self.run_with_ctes(txn, ctes, body),
             other => Err(DbError::Unsupported(format!("cannot run: {other}"))),
         }
     }
@@ -1465,6 +1464,136 @@ impl Database {
         Ok(QueryOutcome::Rows { columns, rows })
     }
 
+    /// Run a `WITH RECURSIVE` query. Each CTE is materialized into an in-memory
+    /// relation (a self-referencing one by fixpoint iteration), registered in a
+    /// scratch catalog, then the body is bound and run against those relations
+    /// plus a snapshot of the base tables.
+    ///
+    /// Scope: the CTE and body terms read base tables and earlier CTEs only;
+    /// nested subqueries inside them are not folded, and a `WITH` column-rename
+    /// list is unsupported.
+    fn run_with_ctes(
+        &self,
+        txn: &Transaction,
+        ctes: &[Cte],
+        body: &Statement,
+    ) -> Result<QueryOutcome> {
+        let source = EngineSource {
+            pool: &self.pool,
+            wal: self.wal.clone(),
+            mgr: &self.mgr,
+            catalog: &self.catalog,
+            tables: &self.tables,
+            txn,
+        };
+        // Start from a snapshot of every base table plus a scratch catalog we
+        // can extend with each CTE's schema.
+        let mut rels = self.materialize_tables(txn, &source)?;
+        let mut cat = self.catalog.clone();
+
+        for cte in ctes {
+            if !cte.columns.is_empty() {
+                return Err(DbError::Unsupported(
+                    "a column list on a WITH query is not yet supported".into(),
+                ));
+            }
+            let rel = if references_table(&cte.query, &cte.name) {
+                Self::evaluate_recursive_cte(&cat, &rels, cte)?
+            } else {
+                let (columns, rows) = eval_in_catalog(&cat, &rels, &cte.query)?;
+                Relation { columns, rows }
+            };
+            register_relation(&mut cat, &cte.name, &rel);
+            rels.insert(cte.name.clone(), rel);
+        }
+
+        let (columns, rows) = eval_in_catalog(&cat, &rels, body)?;
+        Ok(QueryOutcome::Rows { columns, rows })
+    }
+
+    /// Fixpoint-evaluate a self-referencing CTE: run the anchor term once, then
+    /// repeatedly run the recursive term with the CTE bound to the rows found so
+    /// far, until a round adds nothing new.
+    fn evaluate_recursive_cte(
+        cat: &Catalog,
+        rels: &HashMap<String, Relation>,
+        cte: &Cte,
+    ) -> Result<Relation> {
+        // A safety cap so a non-terminating recursion fails loudly instead of
+        // hanging or exhausting memory.
+        const MAX_ROWS: usize = 1_000_000;
+        // A recursive CTE must be `anchor UNION [ALL] recursive`.
+        let (anchor, recursive, all) = match cte.query.as_ref() {
+            Statement::Union {
+                op: SetOp::Union,
+                all,
+                left,
+                right,
+                ..
+            } => (left.as_ref(), right.as_ref(), *all),
+            _ => {
+                return Err(DbError::Unsupported(
+                    "a recursive CTE must be a UNION of an anchor term and a recursive term".into(),
+                ))
+            }
+        };
+        if references_table(anchor, &cte.name) {
+            return Err(DbError::Unsupported(
+                "the anchor term of a recursive CTE must not reference the CTE".into(),
+            ));
+        }
+
+        // The column names come from the anchor; register the CTE so the
+        // recursive term can bind against it.
+        let (columns, anchor_rows) = eval_in_catalog(cat, rels, anchor)?;
+        let mut cat = cat.clone();
+        let mut rels = rels.clone();
+        register_relation(
+            &mut cat,
+            &cte.name,
+            &Relation {
+                columns: columns.clone(),
+                rows: Vec::new(),
+            },
+        );
+
+        let mut all_rows = anchor_rows.clone();
+        let mut working = anchor_rows;
+        while !working.is_empty() {
+            rels.insert(
+                cte.name.clone(),
+                Relation {
+                    columns: columns.clone(),
+                    rows: working.clone(),
+                },
+            );
+            let (_c, produced) = eval_in_catalog(&cat, &rels, recursive)?;
+            let mut fresh: Vec<Vec<Value>> = Vec::new();
+            for row in produced {
+                // UNION ALL keeps every produced row; UNION keeps only rows not
+                // already in the result or this round.
+                if all || (!all_rows.contains(&row) && !fresh.contains(&row)) {
+                    fresh.push(row);
+                }
+            }
+            if fresh.is_empty() {
+                break;
+            }
+            all_rows.extend(fresh.iter().cloned());
+            if all_rows.len() > MAX_ROWS {
+                return Err(DbError::Unsupported(format!(
+                    "recursive CTE {} exceeded {MAX_ROWS} rows (it may not terminate)",
+                    cte.name
+                )));
+            }
+            working = fresh;
+        }
+        Ok(Relation {
+            columns,
+            rows: all_rows,
+        })
+    }
+
     /// Bind, plan, and run a query, returning its columns and rows. Base tables
     /// are read through `EngineSource` under `txn`'s snapshot.
     fn execute_query(
@@ -2112,16 +2241,82 @@ fn find_equality(predicate: &Expr, col: &str) -> Option<Value> {
     }
 }
 
-/// Inline a top-level `WITH` (or `EXPLAIN WITH`) into a plain query, leaving
-/// every other statement untouched. After this the engine only ever routes
-/// `Select` / `Union` / DML, never a `With`.
+/// Bind, plan, and run `stmt` against a scratch catalog and a set of in-memory
+/// relations (base tables plus already-evaluated CTEs). Used by the recursive
+/// `WITH` evaluator, which works with relations rather than the live store.
+fn eval_in_catalog(
+    cat: &Catalog,
+    rels: &HashMap<String, Relation>,
+    stmt: &Statement,
+) -> Result<(Vec<String>, Vec<Vec<Value>>)> {
+    let logical = bind(cat, stmt)?;
+    let physical = plan(&logical, cat)?;
+    let source = MaterializedSource::new(rels.clone());
+    Ok(run(&physical, &source)?)
+}
+
+/// Register `rel` as a table named `name` in `cat`, shadowing any existing
+/// table of that name (a CTE shadows a base table). Column types are inferred
+/// from the relation's data; they only steer name resolution and costing, since
+/// the rows are served directly.
+fn register_relation(cat: &mut Catalog, name: &str, rel: &Relation) {
+    let _ = cat.apply(&Statement::DropTable {
+        name: name.to_string(),
+    });
+    let create = Statement::CreateTable {
+        name: name.to_string(),
+        columns: infer_columns(rel),
+        constraints: Vec::new(),
+    };
+    let _ = cat.apply(&create);
+}
+
+/// Infer a `ColumnDef` per relation column, taking each column's type from its
+/// first non-NULL value (defaulting to `INT` for an all-NULL or empty column).
+fn infer_columns(rel: &Relation) -> Vec<ColumnDef> {
+    rel.columns
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            let ty = rel
+                .rows
+                .iter()
+                .find_map(|r| match r.get(i) {
+                    Some(Value::Int(_)) => Some(DataType::Int),
+                    Some(Value::Float(_)) => Some(DataType::Float),
+                    Some(Value::Text(_)) => Some(DataType::Text),
+                    Some(Value::Bool(_)) => Some(DataType::Bool),
+                    _ => None,
+                })
+                .unwrap_or(DataType::Int);
+            ColumnDef {
+                name: name.clone(),
+                ty,
+                primary_key: false,
+                not_null: false,
+                unique: false,
+                default: None,
+                serial: false,
+            }
+        })
+        .collect()
+}
+
+/// Inline a top-level non-recursive `WITH` (or `EXPLAIN WITH`) into a plain
+/// query. A `WITH RECURSIVE` is left intact for the runtime evaluator
+/// ([`Database::run_with_ctes`]); every other statement is untouched.
 fn expand_ctes(stmt: Statement) -> Result<Statement> {
     match stmt {
+        // A recursive WITH can't be a static rewrite; the engine evaluates it
+        // at run time and routes it through `run_with_ctes`.
         Statement::With {
-            recursive,
+            recursive: true, ..
+        } => Ok(stmt),
+        Statement::With {
+            recursive: false,
             ctes,
             body,
-        } => inline_with(recursive, &ctes, &body),
+        } => inline_with(&ctes, &body),
         Statement::Explain(inner) => Ok(Statement::Explain(Box::new(expand_ctes(*inner)?))),
         other => Ok(other),
     }
@@ -2129,13 +2324,9 @@ fn expand_ctes(stmt: Statement) -> Result<Statement> {
 
 /// Rewrite every reference to a CTE in `body` (and in later CTEs) into a derived
 /// table over the CTE's query. CTEs are processed in order so a later one may
-/// reference an earlier one. Recursion is not supported yet and is rejected.
-fn inline_with(recursive: bool, ctes: &[Cte], body: &Statement) -> Result<Statement> {
-    if recursive {
-        return Err(DbError::Unsupported(
-            "WITH RECURSIVE is not yet supported".into(),
-        ));
-    }
+/// reference an earlier one. A self-reference here means `RECURSIVE` was
+/// omitted, which is rejected.
+fn inline_with(ctes: &[Cte], body: &Statement) -> Result<Statement> {
     let mut resolved: HashMap<String, Statement> = HashMap::new();
     for cte in ctes {
         if !cte.columns.is_empty() {
@@ -3454,11 +3645,42 @@ mod tests {
     }
 
     #[test]
-    fn with_recursive_is_rejected_for_now() {
+    fn with_recursive_counts_up() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE seed (n INT)").unwrap();
+        db.execute("INSERT INTO seed VALUES (1)").unwrap();
+        // Classic counter: the anchor seeds 1, the recursive term adds one until
+        // the guard stops it.
+        let (cols, rows) = query(
+            &mut db,
+            "WITH RECURSIVE c AS (SELECT n FROM seed UNION ALL SELECT n + 1 FROM c WHERE n < 5) SELECT n FROM c",
+        );
+        assert_eq!(names(&cols), ["n"]);
+        assert_eq!(int_col_sorted(&rows), vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn with_recursive_computes_transitive_closure() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE edges (src INT, dst INT)").unwrap();
+        db.execute("INSERT INTO edges VALUES (1, 2), (2, 3), (3, 4)")
+            .unwrap();
+        // Everything reachable from node 1, with UNION dedup ending the walk.
+        let (_c, rows) = query(
+            &mut db,
+            "WITH RECURSIVE reach AS (SELECT dst FROM edges WHERE src = 1 UNION SELECT e.dst FROM edges AS e INNER JOIN reach AS r ON e.src = r.dst) SELECT dst FROM reach",
+        );
+        assert_eq!(int_col_sorted(&rows), vec![2, 3, 4]);
+    }
+
+    #[test]
+    fn with_recursive_non_union_body_is_rejected() {
         let (_d, mut db) = db();
         db.execute("CREATE TABLE t (id INT)").unwrap();
+        db.execute("INSERT INTO t VALUES (1)").unwrap();
+        // A self-referencing CTE that is not a UNION cannot be a fixpoint.
         let err = db
-            .execute("WITH RECURSIVE c AS (SELECT id FROM t) SELECT id FROM c")
+            .execute("WITH RECURSIVE c AS (SELECT id FROM c) SELECT id FROM c")
             .unwrap_err();
         assert!(matches!(err, DbError::Unsupported(_)), "got {err:?}");
     }

@@ -136,7 +136,7 @@ cargo run --bin difftest -- --seed 42           # replay one exactly
 - **Set operations**: `UNION`, `INTERSECT`, and `EXCEPT`, each with optional `ALL` (multiset) semantics.
 - **Window functions**: `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `LAG` / `LEAD`, and aggregates `OVER (PARTITION BY ... ORDER BY ...)`.
 - **Subqueries**: scalar, `IN`, and `EXISTS`, both uncorrelated and correlated; derived tables (`FROM (SELECT ...)`); views expand to the same machinery.
-- **CTEs**: `WITH name AS (query), ... SELECT ...`, inlined as derived tables (non-recursive).
+- **CTEs**: `WITH name AS (query), ... SELECT ...`, inlined as derived tables; `WITH RECURSIVE` evaluated to a fixpoint (e.g. transitive closure).
 - **Expressions**: `INT` / `FLOAT` / `BOOL` / `TEXT`, arithmetic with int-to-float promotion, `IN` / `BETWEEN` / `LIKE` / `IS NULL`, `CASE`, string `||`, and a library of scalar functions.
 - **Transactions**: `BEGIN` / `COMMIT` / `ROLLBACK` over MVCC snapshots; auto-commit otherwise.
 - **`EXPLAIN`**: the cost-annotated physical plan, showing the planner's scan and join choices.
