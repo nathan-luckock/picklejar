@@ -92,6 +92,18 @@ impl Parser {
         }
     }
 
+    /// Consume a bareword that matches `word` case-insensitively, for
+    /// context-sensitive keywords (e.g. `TO` / `HEADER` in `COPY`) that are not
+    /// reserved and so stay usable as ordinary identifiers.
+    pub(crate) fn eat_ident_kw(&mut self, word: &str) -> bool {
+        if matches!(self.peek(), TokenKind::Ident(s) if s.eq_ignore_ascii_case(word)) {
+            self.advance();
+            true
+        } else {
+            false
+        }
+    }
+
     /// Require the current token to equal `kind`, consuming it.
     pub fn expect(&mut self, kind: &TokenKind) -> Result<Token> {
         if self.peek() == kind {
@@ -125,6 +137,20 @@ impl Parser {
             }
             other => Err(SqlError::parse(
                 format!("expected identifier, found {other:?}"),
+                self.span(),
+            )),
+        }
+    }
+
+    /// Parse a single-quoted string literal, returning its (unescaped) text.
+    pub(crate) fn parse_string(&mut self) -> Result<String> {
+        match self.peek().clone() {
+            TokenKind::Str(s) => {
+                self.advance();
+                Ok(s)
+            }
+            other => Err(SqlError::parse(
+                format!("expected a string literal, found {other:?}"),
                 self.span(),
             )),
         }

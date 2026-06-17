@@ -19,6 +19,10 @@ The complete engine and SQL surface. For the *why* behind each decision, see
   persisted across restarts.
 - **DML** — `INSERT` (with or without a column list), `UPDATE`, `DELETE`, each
   with an optional `RETURNING` projection over the affected rows.
+- **Bulk CSV** — `COPY table FROM 'file.csv' [HEADER]` loads rows (through the
+  normal insert path, so all constraints apply), and `COPY table TO 'file.csv'
+  [HEADER]` writes the table out as RFC-4180 CSV (quoting fields with commas or
+  quotes, NULL as an empty field).
 - **Upserts** — `INSERT ... ON CONFLICT [(cols)] DO NOTHING | DO UPDATE SET ...
   [WHERE ...]`, with `excluded.col` referring to the rejected row's proposed
   value.

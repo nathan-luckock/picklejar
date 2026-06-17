@@ -454,6 +454,18 @@ pub enum Statement {
         /// Target table, or `None` for all tables.
         table: Option<String>,
     },
+    /// `COPY table {FROM | TO} 'path' [HEADER]`: bulk-load a table from a CSV
+    /// file, or write its rows out to one.
+    Copy {
+        /// The table to load into or read from.
+        table: String,
+        /// `true` for `TO` (export), `false` for `FROM` (import).
+        to: bool,
+        /// The CSV file path.
+        path: String,
+        /// Whether the file has (import) or should get (export) a header row.
+        header: bool,
+    },
     /// `ALTER TABLE t ADD COLUMN c TYPE ...`: append a column.
     AlterTableAddColumn {
         /// Target table.
@@ -716,6 +728,20 @@ impl fmt::Display for Statement {
                 Some(t) => write!(f, "VACUUM {t}"),
                 None => f.write_str("VACUUM"),
             },
+            Self::Copy {
+                table,
+                to,
+                path,
+                header,
+            } => {
+                let dir = if *to { "TO" } else { "FROM" };
+                let quoted = path.replace('\'', "''");
+                write!(f, "COPY {table} {dir} '{quoted}'")?;
+                if *header {
+                    f.write_str(" HEADER")?;
+                }
+                Ok(())
+            }
             Self::AlterTableAddColumn { table, column } => {
                 write!(f, "ALTER TABLE {table} ADD COLUMN {column}")
             }
@@ -805,6 +831,30 @@ impl Parser {
                     None
                 };
                 Statement::Vacuum { table }
+            }
+            TokenKind::Keyword(Keyword::Copy) => {
+                self.advance();
+                let table = self.parse_ident()?;
+                // FROM imports, TO exports. TO and HEADER are context-sensitive
+                // words (not reserved), so they stay usable as identifiers.
+                let to = if self.eat_keyword(Keyword::From) {
+                    false
+                } else if self.eat_ident_kw("to") {
+                    true
+                } else {
+                    return Err(SqlError::parse(
+                        "expected FROM or TO after COPY <table>".to_string(),
+                        self.span(),
+                    ));
+                };
+                let path = self.parse_string()?;
+                let header = self.eat_ident_kw("header");
+                Statement::Copy {
+                    table,
+                    to,
+                    path,
+                    header,
+                }
             }
             TokenKind::Keyword(Keyword::Alter) => {
                 self.advance();
@@ -1768,6 +1818,28 @@ mod tests {
         assert!(matches!(
             parse("ANALYZE"),
             Statement::Analyze { table: None }
+        ));
+    }
+
+    #[test]
+    fn copy_round_trips() {
+        round_trip("COPY t FROM 'data.csv'");
+        round_trip("COPY t TO 'out.csv' HEADER");
+        assert!(matches!(
+            parse("COPY t FROM 'f.csv'"),
+            Statement::Copy {
+                to: false,
+                header: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse("COPY t TO 'f.csv' HEADER"),
+            Statement::Copy {
+                to: true,
+                header: true,
+                ..
+            }
         ));
     }
 

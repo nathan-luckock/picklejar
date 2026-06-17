@@ -531,7 +531,8 @@ impl Database {
             | Statement::Update { .. }
             | Statement::Delete { .. }
             | Statement::Select(_)
-            | Statement::Union { .. } => self.run_in_txn(&stmt),
+            | Statement::Union { .. }
+            | Statement::Copy { .. } => self.run_in_txn(&stmt),
         }
     }
 
@@ -613,6 +614,12 @@ impl Database {
             } => self.run_delete(txn, table, where_clause.as_ref(), returning),
             Statement::Select(_) | Statement::Union { .. } => self.run_select(txn, stmt),
             Statement::With { ctes, body, .. } => self.run_with_ctes(txn, ctes, body),
+            Statement::Copy {
+                table,
+                to,
+                path,
+                header,
+            } => self.run_copy(txn, table, *to, path, *header),
             other => Err(DbError::Unsupported(format!("cannot run: {other}"))),
         }
     }
@@ -1032,6 +1039,101 @@ impl Database {
         store.secondary = secondary;
         self.catalog.set_row_count(name, rowid)?;
         Ok(())
+    }
+
+    /// `COPY`: bulk-import a table from a CSV file, or export its rows to one.
+    fn run_copy(
+        &mut self,
+        txn: &Transaction,
+        table: &str,
+        to: bool,
+        path: &str,
+        header: bool,
+    ) -> Result<QueryOutcome> {
+        if to {
+            self.copy_to(txn, table, path, header)
+        } else {
+            self.copy_from(txn, table, path, header)
+        }
+    }
+
+    /// `COPY table TO 'path'`: write the table's visible rows out as CSV. A
+    /// NULL is written as an empty field.
+    fn copy_to(
+        &self,
+        txn: &Transaction,
+        table: &str,
+        path: &str,
+        header: bool,
+    ) -> Result<QueryOutcome> {
+        let source = EngineSource {
+            pool: &self.pool,
+            wal: self.wal.clone(),
+            mgr: &self.mgr,
+            catalog: &self.catalog,
+            tables: &self.tables,
+            txn,
+        };
+        let relation = source.scan(table)?;
+        let mut out = String::new();
+        if header {
+            out.push_str(&csv_record(&relation.columns));
+            out.push('\n');
+        }
+        for row in &relation.rows {
+            let fields: Vec<String> = row.iter().map(csv_field_from_value).collect();
+            out.push_str(&csv_record(&fields));
+            out.push('\n');
+        }
+        std::fs::write(path, out)?;
+        Ok(QueryOutcome::Mutation {
+            affected: relation.rows.len(),
+        })
+    }
+
+    /// `COPY table FROM 'path'`: read CSV rows and insert them through the
+    /// normal insert path (so NOT NULL / CHECK / FOREIGN KEY / UNIQUE all
+    /// apply). Each record must supply every column, in order. An empty field
+    /// is read as NULL.
+    fn copy_from(
+        &mut self,
+        txn: &Transaction,
+        table: &str,
+        path: &str,
+        header: bool,
+    ) -> Result<QueryOutcome> {
+        let schema: Vec<DataType> = self
+            .catalog
+            .get_table(table)
+            .ok_or_else(|| DbError::UnknownTable(table.to_string()))?
+            .columns
+            .iter()
+            .map(|c| c.ty)
+            .collect();
+        let content = std::fs::read_to_string(path)?;
+        let mut records = parse_csv(&content);
+        if header && !records.is_empty() {
+            records.remove(0);
+        }
+        let mut rows: Vec<Vec<Expr>> = Vec::with_capacity(records.len());
+        for record in records {
+            if record.len() != schema.len() {
+                return Err(DbError::ValueCount {
+                    expected: schema.len(),
+                    got: record.len(),
+                });
+            }
+            let exprs = record
+                .iter()
+                .zip(&schema)
+                .map(|(field, ty)| Ok(Expr::Literal(value_from_csv_field(field, *ty)?)))
+                .collect::<Result<Vec<_>>>()?;
+            rows.push(exprs);
+        }
+        if rows.is_empty() {
+            return Ok(QueryOutcome::Mutation { affected: 0 });
+        }
+        self.insert(txn, table, &[], &rows, None, &[])
     }
 
     /// Append a column to a table, rewriting every existing row into fresh
@@ -2593,6 +2695,105 @@ fn find_equality(predicate: &Expr, col: &str) -> Option<Value> {
 /// (after any qualifier), so `t.id` becomes `id`.
 fn ctas_column_name(col: &str) -> String {
     col.rsplit('.').next().unwrap_or(col).to_string()
+}
+
+/// Parse a CSV file body into records of string fields (RFC-4180 style: fields
+/// are comma-separated; a `"`-quoted field may contain commas, newlines, and
+/// `""`-escaped quotes). A trailing newline does not add an empty record.
+fn parse_csv(content: &str) -> Vec<Vec<String>> {
+    let mut records: Vec<Vec<String>> = Vec::new();
+    let mut record: Vec<String> = Vec::new();
+    let mut field = String::new();
+    let mut in_quotes = false;
+    let mut chars = content.chars().peekable();
+    while let Some(c) = chars.next() {
+        if in_quotes {
+            if c == '"' {
+                if chars.peek() == Some(&'"') {
+                    chars.next();
+                    field.push('"');
+                } else {
+                    in_quotes = false;
+                }
+            } else {
+                field.push(c);
+            }
+        } else {
+            match c {
+                '"' => in_quotes = true,
+                ',' => record.push(std::mem::take(&mut field)),
+                '\r' => {}
+                '\n' => {
+                    record.push(std::mem::take(&mut field));
+                    records.push(std::mem::take(&mut record));
+                }
+                _ => field.push(c),
+            }
+        }
+    }
+    // Flush a final record that did not end in a newline.
+    if !field.is_empty() || !record.is_empty() {
+        record.push(field);
+        records.push(record);
+    }
+    records
+}
+
+/// Render one CSV record: each field comma-joined, quoting only those that need
+/// it (containing a comma, quote, or newline).
+fn csv_record(fields: &[String]) -> String {
+    fields
+        .iter()
+        .map(|f| {
+            if f.contains([',', '"', '\n', '\r']) {
+                format!("\"{}\"", f.replace('"', "\"\""))
+            } else {
+                f.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// The raw (unquoted) CSV text for a value; NULL becomes an empty field.
+fn csv_field_from_value(value: &Value) -> String {
+    match value {
+        Value::Null => String::new(),
+        Value::Int(n) => n.to_string(),
+        Value::Float(x) => format!("{x}"),
+        Value::Bool(b) => if *b { "true" } else { "false" }.to_string(),
+        Value::Text(s) => s.clone(),
+    }
+}
+
+/// Convert one CSV field to a value of the column's type; an empty field is
+/// NULL.
+fn value_from_csv_field(field: &str, ty: DataType) -> Result<Value> {
+    if field.is_empty() {
+        return Ok(Value::Null);
+    }
+    Ok(match ty {
+        DataType::Int => Value::Int(
+            field
+                .parse()
+                .map_err(|_| DbError::Constraint(format!("invalid integer in CSV: {field:?}")))?,
+        ),
+        DataType::Float => Value::Float(
+            field
+                .parse()
+                .map_err(|_| DbError::Constraint(format!("invalid float in CSV: {field:?}")))?,
+        ),
+        DataType::Bool => match field.to_ascii_lowercase().as_str() {
+            "true" | "t" | "1" => Value::Bool(true),
+            "false" | "f" | "0" => Value::Bool(false),
+            _ => {
+                return Err(DbError::Constraint(format!(
+                    "invalid boolean in CSV: {field:?}"
+                )))
+            }
+        },
+        DataType::Text => Value::Text(field.to_string()),
+    })
 }
 
 /// Infer a column's type from the first non-NULL value in `rows` at index `i`,
@@ -4406,16 +4607,84 @@ mod tests {
             let mut db = Database::open(&path).expect("open");
             db.execute("CREATE TABLE src (id INT)").unwrap();
             db.execute("INSERT INTO src VALUES (7), (8)").unwrap();
-            db.execute("CREATE TABLE copy AS SELECT id FROM src")
+            db.execute("CREATE TABLE mirror AS SELECT id FROM src")
                 .unwrap();
             // A second CREATE of the same name is rejected.
             assert!(db
-                .execute("CREATE TABLE copy AS SELECT id FROM src")
+                .execute("CREATE TABLE mirror AS SELECT id FROM src")
                 .is_err());
         }
         let mut db = Database::open(&path).expect("reopen");
-        let (_c, rows) = query(&mut db, "SELECT id FROM copy ORDER BY id");
+        let (_c, rows) = query(&mut db, "SELECT id FROM mirror ORDER BY id");
         assert_eq!(rows, vec![vec![Value::Int(7)], vec![Value::Int(8)]]);
+    }
+
+    // --- COPY (CSV import/export) ---
+
+    #[test]
+    fn copy_to_then_from_round_trips() {
+        let csv_dir = tempfile::tempdir().expect("csv dir");
+        let csv = csv_dir.path().join("t.csv");
+        let csv_path = csv.to_str().unwrap().replace('\\', "/");
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE src (id INT, name TEXT, active BOOL)")
+            .unwrap();
+        db.execute(
+            "INSERT INTO src VALUES (1, 'alice', TRUE), (2, 'bob, jr', FALSE), (3, NULL, TRUE)",
+        )
+        .unwrap();
+        // Export with a header row.
+        assert_eq!(
+            db.execute(&format!("COPY src TO '{csv_path}' HEADER"))
+                .unwrap(),
+            QueryOutcome::Mutation { affected: 3 }
+        );
+        // The file is real CSV: header, a quoted field with a comma, an empty
+        // field for NULL.
+        let text = std::fs::read_to_string(&csv).unwrap();
+        assert!(text.starts_with("id,name,active\n"), "got:\n{text}");
+        assert!(text.contains("\"bob, jr\""), "comma field quoted:\n{text}");
+
+        // Import into a fresh table of the same shape; values round-trip.
+        db.execute("CREATE TABLE dst (id INT, name TEXT, active BOOL)")
+            .unwrap();
+        assert_eq!(
+            db.execute(&format!("COPY dst FROM '{csv_path}' HEADER"))
+                .unwrap(),
+            QueryOutcome::Mutation { affected: 3 }
+        );
+        let (_c, rows) = query(&mut db, "SELECT id, name, active FROM dst ORDER BY id");
+        assert_eq!(
+            rows,
+            vec![
+                vec![
+                    Value::Int(1),
+                    Value::Text("alice".into()),
+                    Value::Bool(true)
+                ],
+                vec![
+                    Value::Int(2),
+                    Value::Text("bob, jr".into()),
+                    Value::Bool(false)
+                ],
+                vec![Value::Int(3), Value::Null, Value::Bool(true)],
+            ]
+        );
+    }
+
+    #[test]
+    fn copy_from_enforces_arity_and_constraints() {
+        let csv_dir = tempfile::tempdir().expect("csv dir");
+        let csv = csv_dir.path().join("bad.csv");
+        std::fs::write(&csv, "1,2,3\n").unwrap();
+        let csv_path = csv.to_str().unwrap().replace('\\', "/");
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE t (a INT, b INT)").unwrap();
+        // Three fields into a two-column table is an arity error.
+        let err = db
+            .execute(&format!("COPY t FROM '{csv_path}'"))
+            .unwrap_err();
+        assert!(matches!(err, DbError::ValueCount { .. }), "got {err:?}");
     }
 
     // --- subqueries (uncorrelated scalar and IN) ---
