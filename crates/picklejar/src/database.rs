@@ -2662,6 +2662,8 @@ impl Database {
                     kind: j.kind,
                     table: self.fold_table_ref(txn, &j.table)?,
                     on: self.fold_expr(txn, &j.on)?,
+                    using: j.using.clone(),
+                    natural: j.natural,
                 })
             })
             .collect::<Result<_>>()?;
@@ -3720,6 +3722,8 @@ fn rewrite_cte_select(s: &Select, ctes: &HashMap<String, Statement>) -> Select {
             kind: j.kind,
             table: rewrite_cte_table_ref(&j.table, ctes),
             on: j.on.clone(),
+            using: j.using.clone(),
+            natural: j.natural,
         })
         .collect();
     out
@@ -6766,6 +6770,47 @@ mod tests {
             vec![
                 vec![Value::Int(1), Value::Int(10)],
                 vec![Value::Int(2), Value::Int(20)],
+            ]
+        );
+    }
+
+    #[test]
+    fn using_and_natural_joins() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE a (id INT, x TEXT)").unwrap();
+        db.execute("CREATE TABLE b (id INT, y TEXT)").unwrap();
+        db.execute("INSERT INTO a VALUES (1, 'a1'), (2, 'a2')")
+            .unwrap();
+        db.execute("INSERT INTO b VALUES (1, 'b1'), (3, 'b3')")
+            .unwrap();
+        // USING (id) equates a.id and b.id.
+        let (_c, u) = query(
+            &mut db,
+            "SELECT a.x, b.y FROM a JOIN b USING (id) ORDER BY a.id",
+        );
+        assert_eq!(
+            u,
+            vec![vec![Value::Text("a1".into()), Value::Text("b1".into())]]
+        );
+        // NATURAL JOIN finds the common column (id) automatically.
+        let (_c, n) = query(
+            &mut db,
+            "SELECT a.x, b.y FROM a NATURAL JOIN b ORDER BY a.id",
+        );
+        assert_eq!(
+            n,
+            vec![vec![Value::Text("a1".into()), Value::Text("b1".into())]]
+        );
+        // USING on a LEFT join keeps the unmatched left row.
+        let (_c, l) = query(
+            &mut db,
+            "SELECT a.id, b.y FROM a LEFT JOIN b USING (id) ORDER BY a.id",
+        );
+        assert_eq!(
+            l,
+            vec![
+                vec![Value::Int(1), Value::Text("b1".into())],
+                vec![Value::Int(2), Value::Null],
             ]
         );
     }

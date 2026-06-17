@@ -319,6 +319,8 @@ fn substitute_select(
                 kind: j.kind,
                 table: j.table.clone(),
                 on: sub(&j.on),
+                using: j.using.clone(),
+                natural: j.natural,
             })
             .collect(),
         where_clause: s.where_clause.as_ref().map(&sub),

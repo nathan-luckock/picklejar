@@ -115,7 +115,13 @@ fn column_def() -> impl Strategy<Value = ColumnDef> {
 
 fn join() -> impl Strategy<Value = Join> {
     let kind = prop_oneof![Just(JoinKind::Inner), Just(JoinKind::Left)];
-    (kind, table_ref(), expr()).prop_map(|(kind, table, on)| Join { kind, table, on })
+    (kind, table_ref(), expr()).prop_map(|(kind, table, on)| Join {
+        kind,
+        table,
+        on,
+        using: Vec::new(),
+        natural: false,
+    })
 }
 
 fn order_item() -> impl Strategy<Value = OrderItem> {

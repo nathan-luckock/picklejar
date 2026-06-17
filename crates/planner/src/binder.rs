@@ -6,7 +6,8 @@
 //! table and column exists. A single-table WHERE is placed directly above
 //! the Scan (predicate pushdown); with joins it sits above the join tree.
 
-use picklejar_sql::{Expr, Select, SelectItem, Statement, TableRef, Value};
+use picklejar_sql::statement::Join;
+use picklejar_sql::{BinOp, Expr, Select, SelectItem, Statement, TableRef, Value};
 
 use crate::catalog::Catalog;
 use crate::error::{PlanError, Result};
@@ -72,12 +73,15 @@ fn bind_select(catalog: &Catalog, select: &Select) -> Result<LogicalPlan> {
     let mut plan = scan_table(catalog, &select.from, &mut scope)?;
     for join in &select.joins {
         let right = scan_table(catalog, &join.table, &mut scope)?;
-        resolve_expr(&join.on, &scope)?;
+        // USING / NATURAL resolve to an ON predicate from the column names the
+        // two sides share; a plain join uses its ON predicate directly.
+        let on = join_predicate(join, &scope)?;
+        resolve_expr(&on, &scope)?;
         plan = LogicalPlan::Join {
             kind: join.kind,
             left: Box::new(plan),
             right: Box::new(right),
-            on: join.on.clone(),
+            on,
         };
     }
 
@@ -187,6 +191,70 @@ fn bind_select(catalog: &Catalog, select: &Select) -> Result<LogicalPlan> {
     }
 
     Ok(plan)
+}
+
+/// Resolve a join's `ON` predicate. A plain join uses its own predicate; a
+/// `USING (cols)` or `NATURAL` join builds one by equating each shared column
+/// on the left side (the joined-so-far scope) with the same column on the right
+/// (the table just added, which is `scope`'s last entry).
+fn join_predicate(join: &Join, scope: &[ScopeEntry]) -> Result<Expr> {
+    if !join.natural && join.using.is_empty() {
+        return Ok(join.on.clone());
+    }
+    let (right, left) = scope
+        .split_last()
+        .expect("the right table's scope entry was just pushed");
+
+    // The columns to equate: NATURAL takes every name the right shares with the
+    // left (in the right's order); USING takes the listed names.
+    let cols: Vec<String> = if join.natural {
+        right
+            .columns
+            .iter()
+            .filter(|c| left.iter().any(|e| e.columns.iter().any(|lc| lc == *c)))
+            .cloned()
+            .collect()
+    } else {
+        join.using.clone()
+    };
+
+    let mut predicate: Option<Expr> = None;
+    for col in cols {
+        // The right side must have the column; the left side must have it on
+        // some table (the nearest one wins for the equality's left operand).
+        if !right.columns.iter().any(|c| c == &col) {
+            return Err(PlanError::UnknownColumn {
+                table: right.qualifier.clone(),
+                column: col,
+            });
+        }
+        let left_qual = left
+            .iter()
+            .rev()
+            .find(|e| e.columns.iter().any(|c| c == &col))
+            .ok_or_else(|| PlanError::UnknownColumn {
+                table: "left side of join".to_string(),
+                column: col.clone(),
+            })?;
+        let eq = Expr::Binary {
+            op: BinOp::Eq,
+            left: Box::new(Expr::QualifiedColumn(
+                left_qual.qualifier.clone(),
+                col.clone(),
+            )),
+            right: Box::new(Expr::QualifiedColumn(right.qualifier.clone(), col)),
+        };
+        predicate = Some(match predicate {
+            None => eq,
+            Some(p) => Expr::Binary {
+                op: BinOp::And,
+                left: Box::new(p),
+                right: Box::new(eq),
+            },
+        });
+    }
+    // NATURAL with no shared column degenerates to a cross join.
+    Ok(predicate.unwrap_or(Expr::Literal(Value::Bool(true))))
 }
 
 /// Build a scan for `table_ref` (a base table or a derived table), checking it

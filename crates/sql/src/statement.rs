@@ -87,17 +87,31 @@ impl fmt::Display for JoinKind {
 /// A join clause: `<kind> <table> ON <predicate>`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Join {
-    /// Inner or left.
+    /// Inner, left, right, or full.
     pub kind: JoinKind,
     /// The joined table.
     pub table: TableRef,
-    /// The ON predicate.
+    /// The `ON` predicate. For a `USING` or `NATURAL` join this is a placeholder
+    /// (`TRUE`) until the binder resolves the join columns into a real predicate.
     pub on: Expr,
+    /// `USING (cols)`: the shared column names to equate. Empty otherwise.
+    pub using: Vec<String>,
+    /// `NATURAL`: join on every column the two sides share by name.
+    pub natural: bool,
 }
 
 impl fmt::Display for Join {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} {} ON {}", self.kind, self.table, self.on)
+        if self.natural {
+            f.write_str("NATURAL ")?;
+        }
+        write!(f, "{} {}", self.kind, self.table)?;
+        if !self.using.is_empty() {
+            write!(f, " USING ({})", self.using.join(", "))?;
+        } else if !self.natural {
+            write!(f, " ON {}", self.on)?;
+        }
+        Ok(())
     }
 }
 
@@ -1175,6 +1189,8 @@ impl Parser {
                 subquery: None,
             },
             on: Expr::Literal(crate::ast::Value::Bool(true)),
+            using: Vec::new(),
+            natural: false,
         };
         let mut joins = Vec::new();
         loop {
@@ -1189,9 +1205,10 @@ impl Parser {
                 joins.push(Join { table, ..cross() });
                 continue;
             }
-            // RIGHT / FULL / OUTER are matched context-sensitively (not reserved
-            // words), so `RIGHT(s, n)` stays usable as a function. The optional
-            // OUTER keyword is accepted and dropped on LEFT / RIGHT / FULL.
+            // NATURAL / RIGHT / FULL / OUTER / USING are matched
+            // context-sensitively (not reserved words), so `RIGHT(s, n)` and a
+            // column named `using` stay usable. The optional OUTER is dropped.
+            let natural = self.eat_ident_kw("natural");
             let kind = if self.eat_keyword(Keyword::Inner) {
                 self.expect_keyword(Keyword::Join)?;
                 JoinKind::Inner
@@ -1209,13 +1226,39 @@ impl Parser {
                 JoinKind::Full
             } else if self.eat_keyword(Keyword::Join) {
                 JoinKind::Inner
+            } else if natural {
+                return Err(SqlError::parse(
+                    "expected a JOIN after NATURAL",
+                    self.span(),
+                ));
             } else {
                 break;
             };
             let table = self.parse_table_ref()?;
-            self.expect_keyword(Keyword::On)?;
-            let on = self.parse_expr()?;
-            joins.push(Join { kind, table, on });
+            // A NATURAL join has no ON / USING; otherwise the join takes either
+            // `ON <predicate>` or `USING (col, ...)`.
+            let true_lit = Expr::Literal(crate::ast::Value::Bool(true));
+            let (on, using) = if natural {
+                (true_lit, Vec::new())
+            } else if self.eat_ident_kw("using") {
+                self.expect(&TokenKind::LParen)?;
+                let mut cols = vec![self.parse_ident()?];
+                while self.eat(&TokenKind::Comma) {
+                    cols.push(self.parse_ident()?);
+                }
+                self.expect(&TokenKind::RParen)?;
+                (true_lit, cols)
+            } else {
+                self.expect_keyword(Keyword::On)?;
+                (self.parse_expr()?, Vec::new())
+            };
+            joins.push(Join {
+                kind,
+                table,
+                on,
+                using,
+                natural,
+            });
         }
         Ok(joins)
     }
@@ -1367,12 +1410,13 @@ impl Parser {
             return None;
         }
         if let TokenKind::Ident(name) = self.peek().clone() {
-            // RIGHT / FULL / OUTER are not reserved words, but as a bare trailing
-            // identifier after a table they introduce a join, not an alias, so
-            // leave them for the join parser. (An explicit `AS right` still works.)
+            // RIGHT / FULL / OUTER / NATURAL / USING are not reserved words, but as
+            // a bare trailing identifier after a table they introduce or continue a
+            // join, not an alias, so leave them for the join parser. (An explicit
+            // `AS right` still works.)
             if matches!(
                 name.to_ascii_lowercase().as_str(),
-                "right" | "full" | "outer"
+                "right" | "full" | "outer" | "natural" | "using"
             ) {
                 return None;
             }
@@ -1994,6 +2038,8 @@ impl Select {
                     kind: j.kind,
                     table: j.table.substitute_params(params),
                     on: j.on.substitute_params(params),
+                    using: j.using.clone(),
+                    natural: j.natural,
                 })
                 .collect(),
             where_clause: self
@@ -2829,6 +2875,20 @@ mod tests {
         assert_eq!(s.joins.len(), 2);
         assert_eq!(s.joins[0].kind, JoinKind::Left);
         assert_eq!(s.joins[1].kind, JoinKind::Inner);
+    }
+
+    #[test]
+    fn using_and_natural_joins_parse() {
+        round_trip("SELECT * FROM a JOIN b USING (id)");
+        round_trip("SELECT * FROM a LEFT JOIN b USING (id, k)");
+        round_trip("SELECT * FROM a NATURAL JOIN b");
+        round_trip("SELECT * FROM a NATURAL LEFT JOIN b");
+        let s = as_select("SELECT * FROM a JOIN b USING (id)");
+        assert_eq!(s.joins[0].using, vec!["id".to_string()]);
+        let n = as_select("SELECT * FROM a NATURAL JOIN b");
+        assert!(n.joins[0].natural);
+        // `using` is still usable as a column name (not reserved).
+        round_trip("SELECT using FROM t");
     }
 
     #[test]
