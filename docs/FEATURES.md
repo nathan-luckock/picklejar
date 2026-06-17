@@ -48,8 +48,8 @@ tour, see the [README](../README.md).
 - **Queries** - projection and `*`, `WHERE` with SQL three-valued logic,
   `INNER` / `LEFT` / `RIGHT` / `FULL` / `CROSS JOIN` (the `OUTER` keyword
   optional), `GROUP BY` with `COUNT` / `SUM` / `MIN` /
-  `MAX` / `AVG` (and `DISTINCT` aggregates), `HAVING`, `DISTINCT`, `ORDER BY`,
-  `LIMIT` / `OFFSET`.
+  `MAX` / `AVG` (and `DISTINCT` aggregates), `HAVING`, `DISTINCT`, `ORDER BY`
+  (with `ASC` / `DESC` and `NULLS FIRST` / `NULLS LAST`), `LIMIT` / `OFFSET`.
 - **Set operations** - `UNION`, `INTERSECT`, and `EXCEPT`, each with optional
   `ALL` (multiset) semantics.
 - **Window functions** - `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `LAG` / `LEAD`, and

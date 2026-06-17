@@ -85,12 +85,18 @@ fn render(plan: &PhysicalPlan, depth: usize, out: &mut String) {
         PhysicalPlan::Sort { keys, input, .. } => {
             let ks = keys
                 .iter()
-                .map(|(e, desc)| {
-                    if *desc {
+                .map(|(e, desc, nulls_first)| {
+                    let mut s = if *desc {
                         format!("{e} DESC")
                     } else {
                         e.to_string()
+                    };
+                    match nulls_first {
+                        Some(true) => s.push_str(" NULLS FIRST"),
+                        Some(false) => s.push_str(" NULLS LAST"),
+                        None => {}
                     }
+                    s
                 })
                 .collect::<Vec<_>>()
                 .join(", ");

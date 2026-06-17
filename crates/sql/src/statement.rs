@@ -108,6 +108,9 @@ pub struct OrderItem {
     pub expr: Expr,
     /// True for descending.
     pub desc: bool,
+    /// `NULLS FIRST` (`Some(true)`) / `NULLS LAST` (`Some(false)`), or `None`
+    /// for the default (nulls sort last under `ASC`, first under `DESC`).
+    pub nulls_first: Option<bool>,
 }
 
 impl fmt::Display for OrderItem {
@@ -115,6 +118,11 @@ impl fmt::Display for OrderItem {
         write!(f, "{}", self.expr)?;
         if self.desc {
             f.write_str(" DESC")?;
+        }
+        match self.nulls_first {
+            Some(true) => f.write_str(" NULLS FIRST")?,
+            Some(false) => f.write_str(" NULLS LAST")?,
+            None => {}
         }
         Ok(())
     }
@@ -1242,7 +1250,26 @@ impl Parser {
                 self.eat_keyword(Keyword::Asc);
                 false
             };
-            items.push(OrderItem { expr, desc });
+            // Optional `NULLS FIRST` / `NULLS LAST` (not reserved words).
+            let nulls_first = if self.eat_ident_kw("nulls") {
+                if self.eat_ident_kw("first") {
+                    Some(true)
+                } else if self.eat_ident_kw("last") {
+                    Some(false)
+                } else {
+                    return Err(SqlError::parse(
+                        "expected FIRST or LAST after NULLS",
+                        self.span(),
+                    ));
+                }
+            } else {
+                None
+            };
+            items.push(OrderItem {
+                expr,
+                desc,
+                nulls_first,
+            });
             if !self.eat(&TokenKind::Comma) {
                 break;
             }
@@ -1921,6 +1948,7 @@ impl Statement {
                     .map(|o| OrderItem {
                         expr: o.expr.substitute_params(params),
                         desc: o.desc,
+                        nulls_first: o.nulls_first,
                     })
                     .collect(),
                 limit: *limit,
@@ -1984,6 +2012,7 @@ impl Select {
                 .map(|o| OrderItem {
                     expr: o.expr.substitute_params(params),
                     desc: o.desc,
+                    nulls_first: o.nulls_first,
                 })
                 .collect(),
             limit: self.limit,
@@ -2844,6 +2873,15 @@ mod tests {
             Statement::Select(Box::new(s)).to_string(),
             "SELECT a FROM t ORDER BY a"
         );
+    }
+
+    #[test]
+    fn order_by_nulls_placement_round_trips() {
+        round_trip("SELECT a FROM t ORDER BY a NULLS FIRST");
+        round_trip("SELECT a FROM t ORDER BY a DESC NULLS LAST");
+        round_trip("SELECT a FROM t ORDER BY a, b DESC NULLS FIRST");
+        let s = as_select("SELECT a FROM t ORDER BY a NULLS FIRST");
+        assert_eq!(s.order_by[0].nulls_first, Some(true));
     }
 
     #[test]

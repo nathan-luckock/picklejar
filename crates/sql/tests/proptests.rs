@@ -119,7 +119,13 @@ fn join() -> impl Strategy<Value = Join> {
 }
 
 fn order_item() -> impl Strategy<Value = OrderItem> {
-    (expr(), any::<bool>()).prop_map(|(expr, desc)| OrderItem { expr, desc })
+    (expr(), any::<bool>(), proptest::option::of(any::<bool>())).prop_map(
+        |(expr, desc, nulls_first)| OrderItem {
+            expr,
+            desc,
+            nulls_first,
+        },
+    )
 }
 
 fn select() -> impl Strategy<Value = Select> {

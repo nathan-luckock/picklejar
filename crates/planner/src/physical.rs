@@ -73,7 +73,7 @@ pub enum PhysicalPlan {
     /// Sort.
     Sort {
         /// Sort keys with direction.
-        keys: Vec<(Expr, bool)>,
+        keys: Vec<(Expr, bool, Option<bool>)>,
         /// Child plan.
         input: Box<Self>,
         /// Estimated output rows.

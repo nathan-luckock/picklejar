@@ -367,6 +367,7 @@ impl Expr {
                     .map(|o| crate::statement::OrderItem {
                         expr: o.expr.substitute_params(params),
                         desc: o.desc,
+                        nulls_first: o.nulls_first,
                     })
                     .collect(),
             },

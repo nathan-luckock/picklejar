@@ -2729,6 +2729,7 @@ impl Database {
                 Ok(OrderItem {
                     expr: self.fold_expr(txn, &o.expr)?,
                     desc: o.desc,
+                    nulls_first: o.nulls_first,
                 })
             })
             .collect()
@@ -2843,6 +2844,7 @@ impl Database {
                         Ok(picklejar_sql::statement::OrderItem {
                             expr: self.fold_expr(txn, &o.expr)?,
                             desc: o.desc,
+                            nulls_first: o.nulls_first,
                         })
                     })
                     .collect::<Result<_>>()?,
@@ -6765,6 +6767,31 @@ mod tests {
                 vec![Value::Int(1), Value::Int(10)],
                 vec![Value::Int(2), Value::Int(20)],
             ]
+        );
+    }
+
+    #[test]
+    fn order_by_nulls_first_and_last() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE t (a INT)").unwrap();
+        db.execute("INSERT INTO t VALUES (2), (NULL), (1)").unwrap();
+        // Default ASC: NULLs last.
+        let (_c, def) = query(&mut db, "SELECT a FROM t ORDER BY a");
+        assert_eq!(
+            def,
+            vec![vec![Value::Int(1)], vec![Value::Int(2)], vec![Value::Null]]
+        );
+        // NULLS FIRST overrides the default.
+        let (_c, first) = query(&mut db, "SELECT a FROM t ORDER BY a NULLS FIRST");
+        assert_eq!(
+            first,
+            vec![vec![Value::Null], vec![Value::Int(1)], vec![Value::Int(2)]]
+        );
+        // DESC defaults to NULLs first; NULLS LAST overrides it.
+        let (_c, desc_last) = query(&mut db, "SELECT a FROM t ORDER BY a DESC NULLS LAST");
+        assert_eq!(
+            desc_last,
+            vec![vec![Value::Int(2)], vec![Value::Int(1)], vec![Value::Null]]
         );
     }
 

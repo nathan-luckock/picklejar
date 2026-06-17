@@ -46,7 +46,10 @@ pub fn bind(catalog: &Catalog, stmt: &Statement) -> Result<LogicalPlan> {
             // resolves by name, so there is no table scope to validate against.
             if !order_by.is_empty() {
                 plan = LogicalPlan::Sort {
-                    keys: order_by.iter().map(|i| (i.expr.clone(), i.desc)).collect(),
+                    keys: order_by
+                        .iter()
+                        .map(|i| (i.expr.clone(), i.desc, i.nulls_first))
+                        .collect(),
                     input: Box::new(plan),
                 };
             }
@@ -147,7 +150,7 @@ fn bind_select(catalog: &Catalog, select: &Select) -> Result<LogicalPlan> {
             // matching projection expression; anything else is a plain column.
             let key = resolve_order_key(&item.expr, &select.projections);
             resolve_expr(&key, &scope)?;
-            keys.push((key, item.desc));
+            keys.push((key, item.desc, item.nulls_first));
         }
         plan = LogicalPlan::Sort {
             keys,

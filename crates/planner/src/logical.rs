@@ -70,7 +70,7 @@ pub enum LogicalPlan {
     /// Sort rows by the given keys (`(expr, descending)`).
     Sort {
         /// Sort keys with their direction.
-        keys: Vec<(Expr, bool)>,
+        keys: Vec<(Expr, bool, Option<bool>)>,
         /// Child plan.
         input: Box<Self>,
     },
@@ -169,7 +169,7 @@ impl LogicalPlan {
             Self::Sort { keys, input } => {
                 let ks = keys
                     .iter()
-                    .map(|(e, desc)| {
+                    .map(|(e, desc, _nulls)| {
                         if *desc {
                             format!("{e} DESC")
                         } else {

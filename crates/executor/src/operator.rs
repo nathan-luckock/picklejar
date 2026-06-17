@@ -203,7 +203,7 @@ fn output_name(expr: &Expr, alias: Option<&str>) -> String {
 /// Sort all input rows by the given keys (a blocking operator).
 struct Sort {
     input: Box<dyn Executor>,
-    keys: Vec<(Expr, bool)>,
+    keys: Vec<(Expr, bool, Option<bool>)>,
     buffered: Option<std::vec::IntoIter<Row>>,
 }
 
@@ -216,7 +216,7 @@ impl Sort {
             let key = self
                 .keys
                 .iter()
-                .map(|(e, _)| eval(e, &row, &cols))
+                .map(|(e, _, _)| eval(e, &row, &cols))
                 .collect::<Result<Vec<_>>>()?;
             keyed.push((key, row));
         }
@@ -242,16 +242,40 @@ impl Executor for Sort {
     }
 }
 
-/// Compare two key vectors honoring each key's descending flag.
-fn cmp_keys(a: &[Value], b: &[Value], keys: &[(Expr, bool)]) -> Ordering {
-    for (i, (_, desc)) in keys.iter().enumerate() {
-        let ord = sort_cmp(&a[i], &b[i]);
-        let ord = if *desc { ord.reverse() } else { ord };
+/// Compare two key vectors honoring each key's descending flag and NULLS
+/// placement.
+fn cmp_keys(a: &[Value], b: &[Value], keys: &[(Expr, bool, Option<bool>)]) -> Ordering {
+    for (i, (_, desc, nulls_first)) in keys.iter().enumerate() {
+        let ord = key_cmp(&a[i], &b[i], *desc, *nulls_first);
         if ord != Ordering::Equal {
             return ord;
         }
     }
     Ordering::Equal
+}
+
+/// Compare two sort-key values under a descending flag and a NULLS placement.
+/// NULL placement is resolved independently of `desc`: `nulls_first` overrides,
+/// else the default is NULLS LAST under ASC and NULLS FIRST under DESC.
+fn key_cmp(x: &Value, y: &Value, desc: bool, nulls_first: Option<bool>) -> Ordering {
+    let (x_null, y_null) = (matches!(x, Value::Null), matches!(y, Value::Null));
+    if x_null || y_null {
+        let nulls_first = nulls_first.unwrap_or(desc);
+        return match (x_null, y_null) {
+            (true, false) if nulls_first => Ordering::Less,
+            (true, false) => Ordering::Greater,
+            (false, true) if nulls_first => Ordering::Greater,
+            (false, true) => Ordering::Less,
+            // Both NULL (or, unreachably, both non-NULL).
+            _ => Ordering::Equal,
+        };
+    }
+    let ord = sort_cmp(x, y);
+    if desc {
+        ord.reverse()
+    } else {
+        ord
+    }
 }
 
 /// Total order over values for sorting, with NULLs last (ascending).

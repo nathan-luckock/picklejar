@@ -330,6 +330,7 @@ fn substitute_select(
             .map(|o| picklejar_sql::statement::OrderItem {
                 expr: sub(&o.expr),
                 desc: o.desc,
+                nulls_first: o.nulls_first,
             })
             .collect(),
         limit: s.limit,
