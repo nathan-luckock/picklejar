@@ -26,6 +26,7 @@
 //! table and its rows survive closing and reopening the database.
 
 use std::collections::HashMap;
+use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -890,14 +891,16 @@ impl Database {
         self.catalog.apply(stmt)?;
         let table = MvccTable::create(&self.pool, self.wal.clone(), &self.mgr)?;
 
-        // Build a physical secondary index for every unique INT column, so an
-        // equality lookup on it becomes a point get. Register each in the
-        // catalog as well, so the planner can cost and choose an index scan.
-        // Uniqueness guarantees the index keys never collide, which is what
-        // lets the plain unique-keyed B+ tree serve as the index.
+        // Build a physical secondary index for every unique column of an
+        // indexable type, so an equality lookup becomes a point get and a range
+        // predicate becomes a range scan. Register each in the catalog as well,
+        // so the planner can cost and choose an index scan. Uniqueness plus the
+        // order-preserving, bijective key map (see `index::index_key`) guarantees
+        // the keys never collide, which is what lets the plain unique-keyed B+
+        // tree serve as the index.
         let mut secondary = Vec::new();
         for (i, col) in columns.iter().enumerate() {
-            if col.ty == DataType::Int && (col.primary_key || col.unique) {
+            if is_indexable_type(col.ty) && (col.primary_key || col.unique) {
                 let index = Index::create(&self.pool)?;
                 secondary.push(SecondaryIndex {
                     column: i,
@@ -3285,9 +3288,174 @@ impl TableSource for EngineSource<'_> {
             return Ok(Relation { columns, rows });
         }
 
+        // No equality matched. Try a range: an order-preserving index turns
+        // `col > x` / `col BETWEEN a AND b` into a single B+ tree range scan over
+        // the candidate rowids. Each candidate is still resolved through MVCC and
+        // re-filtered by the executor, so stale or out-of-snapshot entries drop.
+        for sec in &store.secondary {
+            let col_name = &meta.columns[sec.column].name;
+            let Some((lo, hi)) = find_range(predicate, col_name) else {
+                continue;
+            };
+            let index = Index::open(self.pool, sec.root);
+            let candidates = index
+                .range_lookup(lo.as_ref(), hi.as_ref())
+                .map_err(|e| ExecError::Source(e.to_string()))?;
+            let mvcc = MvccTable::open(
+                self.pool,
+                self.wal.clone(),
+                self.mgr,
+                store.index_root,
+                store.version_page,
+            );
+            // The index is upsert-only, so a rowid can appear under several keys
+            // (an updated value leaves its old key behind). Resolve each rowid at
+            // most once, or a row would be returned more than once.
+            let mut seen = std::collections::HashSet::new();
+            let mut rows = Vec::new();
+            for rowid in candidates {
+                if !seen.insert(rowid) {
+                    continue;
+                }
+                if let Some(bytes) = mvcc
+                    .get(self.txn, rowid)
+                    .map_err(|e| ExecError::Source(e.to_string()))?
+                {
+                    rows.push(decode_row(&bytes, &schema)?);
+                }
+            }
+            return Ok(Relation { columns, rows });
+        }
+
         // No physical index matched this predicate: a full scan is still
         // correct (the executor's residual filter does the rest).
         self.scan(table)
+    }
+}
+
+/// Whether a column type gets a physical secondary index. These are exactly the
+/// types `index::index_key` maps bijectively and order-preservingly into `u64`.
+const fn is_indexable_type(ty: DataType) -> bool {
+    matches!(
+        ty,
+        DataType::Int | DataType::Date | DataType::Timestamp | DataType::Bool
+    )
+}
+
+/// Extract the tightest `[lo, hi]` value bounds a predicate places on `col`
+/// through its top-level `AND` conjuncts, or `None` if it constrains `col` with
+/// no range comparison.
+///
+/// Only `AND` is descended, so every bound returned is a necessary condition on
+/// `col`: the index range scan it drives can never miss a qualifying row (`OR`,
+/// `NOT`, and the like are left for the residual filter). On a conflicting pair
+/// (`col > 5 AND col > 8`) the looser bound is kept, which only widens the scan.
+fn find_range(predicate: &Expr, col: &str) -> Option<(Bound<Value>, Bound<Value>)> {
+    let mut lo = Bound::Unbounded;
+    let mut hi = Bound::Unbounded;
+    collect_bounds(predicate, col, &mut lo, &mut hi);
+    if matches!(lo, Bound::Unbounded) && matches!(hi, Bound::Unbounded) {
+        None
+    } else {
+        Some((lo, hi))
+    }
+}
+
+/// Accumulate the value bounds `predicate` places on `col` into `lo` / `hi`,
+/// descending `AND` only.
+fn collect_bounds(predicate: &Expr, col: &str, lo: &mut Bound<Value>, hi: &mut Bound<Value>) {
+    match predicate {
+        Expr::Binary {
+            op: BinOp::And,
+            left,
+            right,
+        } => {
+            collect_bounds(left, col, lo, hi);
+            collect_bounds(right, col, lo, hi);
+        }
+        Expr::Binary { op, left, right }
+            if matches!(op, BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge) =>
+        {
+            // Orient the comparison so the column is on the left.
+            let (op, value) = if expr_is_column(left, col) {
+                (*op, const_eval(right))
+            } else if expr_is_column(right, col) {
+                (flip_comparison(*op), const_eval(left))
+            } else {
+                return;
+            };
+            let Ok(value) = value else {
+                return;
+            };
+            match op {
+                BinOp::Gt => widen_lower(lo, Bound::Excluded(value)),
+                BinOp::Ge => widen_lower(lo, Bound::Included(value)),
+                BinOp::Lt => widen_upper(hi, Bound::Excluded(value)),
+                BinOp::Le => widen_upper(hi, Bound::Included(value)),
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Keep the looser of two lower bounds (so the scan never under-covers).
+fn widen_lower(current: &mut Bound<Value>, candidate: Bound<Value>) {
+    let looser = match (&*current, &candidate) {
+        (Bound::Unbounded, _) => candidate,
+        (cur, cand) => {
+            if bound_value(cand).is_some_and(|c| bound_value(cur).is_some_and(|v| compare_lt(c, v)))
+            {
+                candidate
+            } else {
+                return;
+            }
+        }
+    };
+    *current = looser;
+}
+
+/// Keep the looser of two upper bounds.
+fn widen_upper(current: &mut Bound<Value>, candidate: Bound<Value>) {
+    let looser = match (&*current, &candidate) {
+        (Bound::Unbounded, _) => candidate,
+        (cur, cand) => {
+            if bound_value(cand).is_some_and(|c| bound_value(cur).is_some_and(|v| compare_lt(v, c)))
+            {
+                candidate
+            } else {
+                return;
+            }
+        }
+    };
+    *current = looser;
+}
+
+/// The value carried by a bound, if any.
+const fn bound_value(bound: &Bound<Value>) -> Option<&Value> {
+    match bound {
+        Bound::Included(v) | Bound::Excluded(v) => Some(v),
+        Bound::Unbounded => None,
+    }
+}
+
+/// True if `a` orders strictly before `b` under the index key map (so it is only
+/// meaningful for the indexable, order-preserving types).
+const fn compare_lt(a: &Value, b: &Value) -> bool {
+    match (crate::index::index_key(a), crate::index::index_key(b)) {
+        (Some(ka), Some(kb)) => ka < kb,
+        _ => false,
+    }
+}
+
+/// Flip a comparison operator's sense (for `const <op> column`).
+const fn flip_comparison(op: BinOp) -> BinOp {
+    match op {
+        BinOp::Lt => BinOp::Gt,
+        BinOp::Le => BinOp::Ge,
+        BinOp::Gt => BinOp::Lt,
+        BinOp::Ge => BinOp::Le,
+        other => other,
     }
 }
 
@@ -4345,6 +4513,88 @@ mod tests {
         assert!(plan.contains("IndexScan"), "plan was:\n{plan}");
         let (_c, rows) = query(&mut db, "SELECT name FROM t WHERE id = 42");
         assert_eq!(rows, vec![vec![Value::Text("n42".into())]]);
+    }
+
+    #[test]
+    fn range_predicate_uses_the_index_and_returns_all_rows() {
+        let (_dir, mut db) = db();
+        seed_indexed(&mut db, 300);
+        // A range on the indexed key is sargable: the planner picks the index.
+        let plan = explain(&mut db, "SELECT id FROM t WHERE id >= 10 AND id < 15");
+        assert!(plan.contains("IndexScan"), "plan was:\n{plan}");
+        // The range scan returns every qualifying row, sorted for comparison.
+        let (_c, rows) = query(
+            &mut db,
+            "SELECT id FROM t WHERE id >= 10 AND id < 15 ORDER BY id",
+        );
+        assert_eq!(
+            rows,
+            (10..15).map(|i| vec![Value::Int(i)]).collect::<Vec<_>>()
+        );
+        // BETWEEN desugars to `>= AND <=`, so it also drives the index.
+        let (_c, between) = query(
+            &mut db,
+            "SELECT id FROM t WHERE id BETWEEN 297 AND 305 ORDER BY id",
+        );
+        assert_eq!(
+            between,
+            (297..300).map(|i| vec![Value::Int(i)]).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn range_index_does_not_double_count_updated_rows() {
+        let (_dir, mut db) = db();
+        seed_indexed(&mut db, 20);
+        // Move a row up and back down: its old keys linger in the upsert-only
+        // index, so the row sits under several keys in the scanned range.
+        db.execute("UPDATE t SET id = 100 WHERE id = 5").unwrap();
+        db.execute("UPDATE t SET id = 5 WHERE id = 100").unwrap();
+        // A wide range covers all of those stale keys; the row must appear once.
+        let (_c, rows) = query(
+            &mut db,
+            "SELECT id FROM t WHERE id >= 0 AND id <= 100 ORDER BY id",
+        );
+        assert_eq!(rows.len(), 20, "each row exactly once, got {rows:?}");
+        let fives = rows.iter().filter(|r| r == &&vec![Value::Int(5)]).count();
+        assert_eq!(fives, 1, "the moved row should not be double-counted");
+    }
+
+    #[test]
+    fn date_column_is_indexed_for_equality_and_range() {
+        let (_dir, mut db) = db();
+        db.execute("CREATE TABLE e (d DATE PRIMARY KEY, label TEXT)")
+            .unwrap();
+        for (d, l) in [
+            ("2024-01-01", "a"),
+            ("2024-02-01", "b"),
+            ("2024-03-01", "c"),
+            ("2024-04-01", "d"),
+        ] {
+            db.execute(&format!("INSERT INTO e VALUES (DATE '{d}', '{l}')"))
+                .unwrap();
+        }
+        // A DATE key is i64-backed, so it is indexable: equality is a point get.
+        assert!(
+            explain(&mut db, "SELECT label FROM e WHERE d = DATE '2024-02-01'")
+                .contains("IndexScan")
+        );
+        let (_c, one) = query(&mut db, "SELECT label FROM e WHERE d = DATE '2024-02-01'");
+        assert_eq!(one, vec![vec![Value::Text("b".into())]]);
+        // And a date range scans in chronological order via the index.
+        let plan = explain(
+            &mut db,
+            "SELECT label FROM e WHERE d > DATE '2024-01-15' AND d < DATE '2024-03-15'",
+        );
+        assert!(plan.contains("IndexScan"), "plan was:\n{plan}");
+        let (_c, rows) = query(
+            &mut db,
+            "SELECT label FROM e WHERE d > DATE '2024-01-15' AND d < DATE '2024-03-15' ORDER BY d",
+        );
+        assert_eq!(
+            rows,
+            vec![vec![Value::Text("b".into())], vec![Value::Text("c".into())],]
+        );
     }
 
     // --- transaction durability across reopen ---

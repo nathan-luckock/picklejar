@@ -118,6 +118,13 @@ tour, see the [README](../README.md).
   data that survive a restart.
 - **Storage** - 8 KiB slotted pages, an LRU-K buffer pool, a B+ tree primary
   index, secondary indexes, and CRC32 page checksums.
+- **Indexes** - a unique column of an order-preserving fixed type (`INT`,
+  `DATE`, `TIMESTAMP`, `BOOL`) gets a physical secondary B+ tree. Because the
+  key map is bijective and order-preserving, the planner can drive both a point
+  get (`col = x`) and a range scan (`col > x`, `col BETWEEN a AND b`) off it, and
+  the cost model chooses the index whenever it beats a full scan. Every index
+  hit is a candidate that the executor re-checks against the predicate, so a
+  stale or out-of-snapshot entry is filtered, never returned.
 - **Concurrency control** - MVCC with snapshot isolation and version chains.
 - **Interfaces** - an embeddable library, a `psql`-style CLI, and a
   PostgreSQL-wire-protocol server (simple + extended, with `$N` parameters).
