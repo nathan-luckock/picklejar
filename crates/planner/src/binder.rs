@@ -265,7 +265,6 @@ fn projected_name(expr: &Expr, alias: Option<&str>) -> String {
 /// Validate that every column reference in `expr` resolves against `scope`.
 fn resolve_expr(expr: &Expr, scope: &[ScopeEntry]) -> Result<()> {
     match expr {
-        Expr::Literal(_) | Expr::Star => Ok(()),
         Expr::Column(name) => resolve_bare_column(name, scope),
         Expr::QualifiedColumn(qualifier, column) => {
             resolve_qualified_column(qualifier, column, scope)
@@ -274,7 +273,9 @@ fn resolve_expr(expr: &Expr, scope: &[ScopeEntry]) -> Result<()> {
             resolve_expr(left, scope)?;
             resolve_expr(right, scope)
         }
-        Expr::Unary { expr, .. } => resolve_expr(expr, scope),
+        // A unary operand, and the outer left-hand side of an `IN (subquery)`,
+        // are both ordinary expressions resolved against the current scope.
+        Expr::Unary { expr, .. } | Expr::InSubquery { expr, .. } => resolve_expr(expr, scope),
         Expr::Func { args, .. } => {
             for arg in args {
                 resolve_expr(arg, scope)?;
@@ -298,11 +299,11 @@ fn resolve_expr(expr: &Expr, scope: &[ScopeEntry]) -> Result<()> {
             }
             Ok(())
         }
-        // Subqueries are folded to literals by the engine before binding; one
-        // reaching here is correlated or in an unsupported position.
-        Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists(_) => Err(
-            PlanError::Unsupported("correlated subqueries are not supported".to_string()),
-        ),
+        // Literals and `*` need no resolution. A `Subquery` or `Exists` node
+        // reaching here is correlated (uncorrelated ones are folded to literals
+        // by the engine before binding); its body is validated when it runs per
+        // row in the executor's subquery runner.
+        Expr::Literal(_) | Expr::Star | Expr::Subquery(_) | Expr::Exists(_) => Ok(()),
     }
 }
 

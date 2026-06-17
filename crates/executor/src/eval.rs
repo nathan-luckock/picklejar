@@ -12,9 +12,48 @@ use rustdb_sql::{BinOp, Expr, UnOp, Value};
 
 use crate::error::{ExecError, Result};
 
+/// Evaluates a subquery expression (`Expr::Subquery`, `Expr::InSubquery`, or
+/// `Expr::Exists`) against the row currently being evaluated, so a correlated
+/// subquery can see the outer query's columns.
+///
+/// The engine implements this. The executor invokes it only when such a node
+/// survives to evaluation, which happens exactly when the subquery is
+/// correlated: an uncorrelated subquery is folded to a literal before the plan
+/// is built, so it never reaches here.
+pub trait SubqueryRunner {
+    /// Evaluate `expr` (a subquery node) with `outer_row` bound positionally to
+    /// `outer_columns`. Returns a scalar for a scalar subquery and a boolean
+    /// for `IN` / `EXISTS`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subquery cannot be planned or run, or if a
+    /// scalar subquery yields more than one row.
+    fn eval_subquery(
+        &self,
+        expr: &Expr,
+        outer_columns: &[String],
+        outer_row: &[Value],
+    ) -> Result<Value>;
+}
+
 /// Evaluate `expr` against `row`, resolving column references against
 /// `columns` (positionally aligned with `row`).
+///
+/// Subquery nodes are rejected; use [`eval_with`] to supply a
+/// [`SubqueryRunner`] for correlated subqueries.
 pub fn eval(expr: &Expr, row: &[Value], columns: &[String]) -> Result<Value> {
+    eval_with(expr, row, columns, None)
+}
+
+/// Like [`eval`], but `runner` evaluates any correlated subquery node against
+/// the current `row`. A `None` runner rejects subquery nodes.
+pub fn eval_with(
+    expr: &Expr,
+    row: &[Value],
+    columns: &[String],
+    runner: Option<&dyn SubqueryRunner>,
+) -> Result<Value> {
     match expr {
         Expr::Literal(v) => Ok(v.clone()),
         Expr::Column(name) => resolve(name, row, columns),
@@ -24,12 +63,12 @@ pub fn eval(expr: &Expr, row: &[Value], columns: &[String]) -> Result<Value> {
             resolve(&format!("{qualifier}.{name}"), row, columns)
         }
         Expr::Star => Err(ExecError::Unsupported("`*` used as a value".into())),
-        Expr::Unary { op, expr } => eval_unary(*op, expr, row, columns),
-        Expr::Binary { op, left, right } => eval_binary(*op, left, right, row, columns),
+        Expr::Unary { op, expr } => eval_unary(*op, expr, row, columns, runner),
+        Expr::Binary { op, left, right } => eval_binary(*op, left, right, row, columns, runner),
         // A scalar function is computed here; anything else (an aggregate call,
         // computed by the Aggregate operator below) resolves to that operator's
         // output column by its rendered name.
-        Expr::Func { name, args, .. } => eval_scalar_func(name, args, row, columns)?
+        Expr::Func { name, args, .. } => eval_scalar_func(name, args, row, columns, runner)?
             .map_or_else(|| resolve(&expr.to_string(), row, columns), Ok),
         Expr::Case {
             operand,
@@ -41,13 +80,19 @@ pub fn eval(expr: &Expr, row: &[Value], columns: &[String]) -> Result<Value> {
             else_result.as_deref(),
             row,
             columns,
+            runner,
         ),
-        // The engine folds subqueries to literals before execution.
-        Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists(_) => {
-            Err(ExecError::Unsupported(
-                "subquery reached the evaluator (should have been folded)".into(),
-            ))
-        }
+        // A correlated subquery: evaluate it against the outer row via the
+        // runner. Without a runner (e.g. an operator that does not support
+        // correlation), this is an error.
+        Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists(_) => runner.map_or_else(
+            || {
+                Err(ExecError::Unsupported(
+                    "subquery reached the evaluator (should have been folded)".into(),
+                ))
+            },
+            |r| r.eval_subquery(expr, columns, row),
+        ),
     }
 }
 
@@ -60,13 +105,14 @@ fn eval_case(
     else_result: Option<&Expr>,
     row: &[Value],
     columns: &[String],
+    runner: Option<&dyn SubqueryRunner>,
 ) -> Result<Value> {
     let target = match operand {
-        Some(op) => Some(eval(op, row, columns)?),
+        Some(op) => Some(eval_with(op, row, columns, runner)?),
         None => None,
     };
     for (when, then) in whens {
-        let when_val = eval(when, row, columns)?;
+        let when_val = eval_with(when, row, columns, runner)?;
         let matched = match &target {
             // Simple form: equal, with NULL never matching (SQL semantics).
             Some(t) => {
@@ -78,10 +124,10 @@ fn eval_case(
             None => is_truthy(&when_val),
         };
         if matched {
-            return eval(then, row, columns);
+            return eval_with(then, row, columns, runner);
         }
     }
-    else_result.map_or(Ok(Value::Null), |e| eval(e, row, columns))
+    else_result.map_or(Ok(Value::Null), |e| eval_with(e, row, columns, runner))
 }
 
 /// Evaluate a scalar (non-aggregate) function call, or `Ok(None)` if `name` is
@@ -92,12 +138,13 @@ fn eval_scalar_func(
     args: &[Expr],
     row: &[Value],
     columns: &[String],
+    runner: Option<&dyn SubqueryRunner>,
 ) -> Result<Option<Value>> {
     match name {
         // COALESCE returns the first non-NULL argument; it evaluates lazily.
         "COALESCE" => {
             for a in args {
-                let v = eval(a, row, columns)?;
+                let v = eval_with(a, row, columns, runner)?;
                 if !matches!(v, Value::Null) {
                     return Ok(Some(v));
                 }
@@ -109,7 +156,7 @@ fn eval_scalar_func(
         | "SQRT" | "FLOOR" | "CEIL" | "CEILING" => {
             let vals = args
                 .iter()
-                .map(|a| eval(a, row, columns))
+                .map(|a| eval_with(a, row, columns, runner))
                 .collect::<Result<Vec<_>>>()?;
             Ok(Some(apply_scalar(name, &vals)?))
         }
@@ -210,8 +257,14 @@ fn resolve(name: &str, row: &[Value], columns: &[String]) -> Result<Value> {
     Err(ExecError::UnknownColumn(name.to_string()))
 }
 
-fn eval_unary(op: UnOp, expr: &Expr, row: &[Value], columns: &[String]) -> Result<Value> {
-    let v = eval(expr, row, columns)?;
+fn eval_unary(
+    op: UnOp,
+    expr: &Expr,
+    row: &[Value],
+    columns: &[String],
+    runner: Option<&dyn SubqueryRunner>,
+) -> Result<Value> {
+    let v = eval_with(expr, row, columns, runner)?;
     match (op, v) {
         // IS [NOT] NULL is a total predicate: it never returns NULL, so it is
         // checked before the NULL-propagating arm below.
@@ -231,17 +284,18 @@ fn eval_binary(
     right: &Expr,
     row: &[Value],
     columns: &[String],
+    runner: Option<&dyn SubqueryRunner>,
 ) -> Result<Value> {
     // AND / OR short-circuit and use three-valued logic, so they evaluate
     // their operands lazily rather than through the NULL-propagating path.
     match op {
-        BinOp::And => return eval_and(left, right, row, columns),
-        BinOp::Or => return eval_or(left, right, row, columns),
+        BinOp::And => return eval_and(left, right, row, columns, runner),
+        BinOp::Or => return eval_or(left, right, row, columns, runner),
         _ => {}
     }
 
-    let l = eval(left, row, columns)?;
-    let r = eval(right, row, columns)?;
+    let l = eval_with(left, row, columns, runner)?;
+    let r = eval_with(right, row, columns, runner)?;
     // NULL propagates through comparisons and arithmetic.
     if l == Value::Null || r == Value::Null {
         return Ok(Value::Null);
@@ -315,12 +369,18 @@ fn like_match(text: &str, pattern: &str) -> bool {
 }
 
 /// SQL three-valued AND: false dominates, then NULL, then true.
-fn eval_and(left: &Expr, right: &Expr, row: &[Value], columns: &[String]) -> Result<Value> {
-    let l = truth(&eval(left, row, columns)?)?;
+fn eval_and(
+    left: &Expr,
+    right: &Expr,
+    row: &[Value],
+    columns: &[String],
+    runner: Option<&dyn SubqueryRunner>,
+) -> Result<Value> {
+    let l = truth(&eval_with(left, row, columns, runner)?)?;
     if l == Some(false) {
         return Ok(Value::Bool(false));
     }
-    let r = truth(&eval(right, row, columns)?)?;
+    let r = truth(&eval_with(right, row, columns, runner)?)?;
     if r == Some(false) {
         return Ok(Value::Bool(false));
     }
@@ -331,12 +391,18 @@ fn eval_and(left: &Expr, right: &Expr, row: &[Value], columns: &[String]) -> Res
 }
 
 /// SQL three-valued OR: true dominates, then NULL, then false.
-fn eval_or(left: &Expr, right: &Expr, row: &[Value], columns: &[String]) -> Result<Value> {
-    let l = truth(&eval(left, row, columns)?)?;
+fn eval_or(
+    left: &Expr,
+    right: &Expr,
+    row: &[Value],
+    columns: &[String],
+    runner: Option<&dyn SubqueryRunner>,
+) -> Result<Value> {
+    let l = truth(&eval_with(left, row, columns, runner)?)?;
     if l == Some(true) {
         return Ok(Value::Bool(true));
     }
-    let r = truth(&eval(right, row, columns)?)?;
+    let r = truth(&eval_with(right, row, columns, runner)?)?;
     if r == Some(true) {
         return Ok(Value::Bool(true));
     }

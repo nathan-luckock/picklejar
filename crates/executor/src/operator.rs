@@ -12,13 +12,20 @@
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 use rustdb_planner::PhysicalPlan;
 use rustdb_sql::statement::SelectItem;
 use rustdb_sql::{Expr, JoinKind, Value};
 
 use crate::error::{ExecError, Result};
-use crate::eval::{eval, is_truthy};
+use crate::eval::{eval, eval_with, is_truthy, SubqueryRunner};
+
+/// A shared, correlated-subquery evaluator passed down the operator tree. The
+/// operators that evaluate expressions (`Filter`, `Project`) call it when a
+/// subquery node survives to evaluation. `None` for a plan with no correlated
+/// subqueries.
+type Runner = Option<Rc<dyn SubqueryRunner>>;
 
 /// Qualify a scan's bare column names with a table qualifier, so joins can
 /// disambiguate columns and `q.col` references resolve.
@@ -102,6 +109,7 @@ impl Executor for Values {
 struct Filter {
     input: Box<dyn Executor>,
     predicate: Expr,
+    runner: Runner,
 }
 
 impl Executor for Filter {
@@ -110,8 +118,13 @@ impl Executor for Filter {
     }
     fn next(&mut self) -> Result<Option<Row>> {
         while let Some(row) = self.input.next()? {
-            let keep = is_truthy(&eval(&self.predicate, &row, self.input.columns())?);
-            if keep {
+            let value = eval_with(
+                &self.predicate,
+                &row,
+                self.input.columns(),
+                self.runner.as_deref(),
+            )?;
+            if is_truthy(&value) {
                 return Ok(Some(row));
             }
         }
@@ -124,11 +137,12 @@ struct Project {
     input: Box<dyn Executor>,
     exprs: Vec<Expr>,
     out_columns: Vec<String>,
+    runner: Runner,
 }
 
 impl Project {
     /// Build a projection from `items`, expanding `*` to the child's columns.
-    fn new(input: Box<dyn Executor>, items: &[SelectItem]) -> Self {
+    fn new(input: Box<dyn Executor>, items: &[SelectItem], runner: Runner) -> Self {
         let mut exprs = Vec::new();
         let mut out_columns = Vec::new();
         for item in items {
@@ -151,6 +165,7 @@ impl Project {
             input,
             exprs,
             out_columns,
+            runner,
         }
     }
 }
@@ -167,7 +182,7 @@ impl Executor for Project {
         let out = self
             .exprs
             .iter()
-            .map(|e| eval(e, &row, cols))
+            .map(|e| eval_with(e, &row, cols, self.runner.as_deref()))
             .collect::<Result<Row>>()?;
         Ok(Some(out))
     }
@@ -736,8 +751,18 @@ impl Executor for Aggregate {
 ///
 /// Returns an error for plan nodes or expressions the executor does not run
 /// yet, or if a base table cannot be read.
-#[allow(clippy::too_many_lines)]
 pub fn build(plan: &PhysicalPlan, source: &dyn TableSource) -> Result<Box<dyn Executor>> {
+    build_with(plan, source, &None)
+}
+
+/// Like [`build`], but `runner` is threaded into the expression-evaluating
+/// operators (`Filter`, `Project`) so they can resolve correlated subqueries.
+#[allow(clippy::too_many_lines)]
+fn build_with(
+    plan: &PhysicalPlan,
+    source: &dyn TableSource,
+    runner: &Runner,
+) -> Result<Box<dyn Executor>> {
     match plan {
         PhysicalPlan::SeqScan {
             table,
@@ -750,6 +775,7 @@ pub fn build(plan: &PhysicalPlan, source: &dyn TableSource) -> Result<Box<dyn Ex
                 Some(p) => Box::new(Filter {
                     input: base,
                     predicate: p.clone(),
+                    runner: runner.clone(),
                 }),
                 None => base,
             })
@@ -772,35 +798,39 @@ pub fn build(plan: &PhysicalPlan, source: &dyn TableSource) -> Result<Box<dyn Ex
                     rows: rel.rows.into_iter(),
                 }),
                 predicate: predicate.clone(),
+                runner: runner.clone(),
             }))
         }
         PhysicalPlan::Filter {
             predicate, input, ..
         } => Ok(Box::new(Filter {
-            input: build(input, source)?,
+            input: build_with(input, source, runner)?,
             predicate: predicate.clone(),
+            runner: runner.clone(),
         })),
-        PhysicalPlan::Project { items, input, .. } => {
-            Ok(Box::new(Project::new(build(input, source)?, items)))
-        }
+        PhysicalPlan::Project { items, input, .. } => Ok(Box::new(Project::new(
+            build_with(input, source, runner)?,
+            items,
+            runner.clone(),
+        ))),
         PhysicalPlan::Sort { keys, input, .. } => Ok(Box::new(Sort {
-            input: build(input, source)?,
+            input: build_with(input, source, runner)?,
             keys: keys.clone(),
             buffered: None,
         })),
         PhysicalPlan::Limit {
             n, offset, input, ..
         } => Ok(Box::new(Limit {
-            input: build(input, source)?,
+            input: build_with(input, source, runner)?,
             to_skip: *offset,
             remaining: *n,
         })),
         PhysicalPlan::Distinct { input, .. } => Ok(Box::new(Distinct {
-            input: build(input, source)?,
+            input: build_with(input, source, runner)?,
             seen: HashSet::new(),
         })),
         PhysicalPlan::DerivedScan { plan, alias, .. } => {
-            let input = build(plan, source)?;
+            let input = build_with(plan, source, runner)?;
             let columns = input
                 .columns()
                 .iter()
@@ -811,8 +841,8 @@ pub fn build(plan: &PhysicalPlan, source: &dyn TableSource) -> Result<Box<dyn Ex
         PhysicalPlan::Union {
             all, left, right, ..
         } => {
-            let left = build(left, source)?;
-            let right = build(right, source)?;
+            let left = build_with(left, source, runner)?;
+            let right = build_with(right, source, runner)?;
             let columns = left.columns().to_vec();
             if right.columns().len() != columns.len() {
                 return Err(ExecError::Unsupported(format!(
@@ -847,8 +877,8 @@ pub fn build(plan: &PhysicalPlan, source: &dyn TableSource) -> Result<Box<dyn Ex
             on,
             ..
         } => Ok(Box::new(NestedLoopJoin::new(
-            build(left, source)?,
-            build(right, source)?,
+            build_with(left, source, runner)?,
+            build_with(right, source, runner)?,
             *kind,
             on.clone(),
         )?)),
@@ -858,7 +888,7 @@ pub fn build(plan: &PhysicalPlan, source: &dyn TableSource) -> Result<Box<dyn Ex
             input,
             ..
         } => Ok(Box::new(Aggregate::new(
-            build(input, source)?,
+            build_with(input, source, runner)?,
             group_by.clone(),
             aggregates,
         )?)),
@@ -880,7 +910,25 @@ fn scan(table: &str, qualifier: &str, source: &dyn TableSource) -> Result<Box<dy
 ///
 /// Propagates any build or evaluation error.
 pub fn run(plan: &PhysicalPlan, source: &dyn TableSource) -> Result<(Vec<String>, Vec<Row>)> {
-    let mut op = build(plan, source)?;
+    drain(build(plan, source)?)
+}
+
+/// Like [`run`], but `runner` resolves correlated subqueries against the row
+/// being evaluated. Use this when the plan may contain correlated subqueries.
+///
+/// # Errors
+///
+/// Propagates any build or evaluation error.
+pub fn run_with(
+    plan: &PhysicalPlan,
+    source: &dyn TableSource,
+    runner: Rc<dyn SubqueryRunner>,
+) -> Result<(Vec<String>, Vec<Row>)> {
+    drain(build_with(plan, source, &Some(runner))?)
+}
+
+/// Drain an operator to its end, collecting the output columns and all rows.
+fn drain(mut op: Box<dyn Executor>) -> Result<(Vec<String>, Vec<Row>)> {
     let columns = op.columns().to_vec();
     let mut rows = Vec::new();
     while let Some(row) = op.next()? {

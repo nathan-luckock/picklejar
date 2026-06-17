@@ -361,8 +361,11 @@ covers:
 - `DISTINCT`, `ORDER BY` (multi-key, `ASC` / `DESC`, and by output ordinal or
   alias), `LIMIT`, and `OFFSET`.
 - `UNION` and `UNION ALL`, with a trailing `ORDER BY` / `LIMIT` over the union.
-- Uncorrelated scalar subqueries `(SELECT ...)`, `expr [NOT] IN (SELECT ...)`,
-  and `EXISTS (SELECT ...)`.
+- Scalar subqueries `(SELECT ...)`, `expr [NOT] IN (SELECT ...)`, and
+  `EXISTS (SELECT ...)`, both uncorrelated and correlated. An uncorrelated one
+  is folded to a literal before planning; a correlated one (it references an
+  outer column) is evaluated per outer row by a subquery runner over a
+  consistent snapshot of the base tables.
 - Derived tables: a subquery as a `FROM` / `JOIN` relation,
   `(SELECT ...) AS x`, with its columns re-qualified under the alias. A view
   reference expands to the same machinery over its stored query.
@@ -379,7 +382,7 @@ three-valued NULL handling, the predicates `IN` / `BETWEEN` / `LIKE` /
 ### Scope and deferrals
 
 - The parser is **schema-free**: it enforces grammar only. Semantic checks (INSERT column/value arity, unknown columns, type errors) are the planner's job, since they need the catalog.
-- Correlated subqueries, `INTERSECT` / `EXCEPT`, window functions, CTEs, and right/full outer joins are deferred. They are additive: each is a new node or expression form on the same parse/bind/plan/execute pipeline the features above already use. The supported (uncorrelated) subqueries and views are constant-folded or expanded to derived tables before planning; correlated subqueries need the outer row in scope, a larger change.
+- `INTERSECT` / `EXCEPT`, window functions, CTEs, and right/full outer joins are deferred. They are additive: each is a new node or expression form on the same parse/bind/plan/execute pipeline the features above already use. Uncorrelated subqueries and views are constant-folded or expanded to derived tables before planning; a correlated subquery is left in the plan and evaluated per outer row, where its `FROM` must be plain base tables (a correlated subquery whose own `FROM` is a view, derived table, or further subquery is not yet handled).
 
 ---
 

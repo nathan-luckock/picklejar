@@ -27,10 +27,14 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use rustdb_executor::eval::{eval, is_truthy};
-use rustdb_executor::{decode_row, encode_row, run, Relation, TableSource};
+use rustdb_executor::{decode_row, encode_row, run, run_with, Relation, TableSource};
 use rustdb_planner::{bind, explain, plan, Catalog, ColumnStats};
+
+use crate::correlated;
+use crate::correlated::{CorrelatedRunner, MaterializedSource};
 use rustdb_sql::statement::{ColumnDef, DataType, Join, OrderItem, Select, SelectItem, TableRef};
 use rustdb_sql::{BinOp, Expr, Parser, Statement, UnOp, Value};
 use rustdb_storage::{BufferPool, FileManager, PageId};
@@ -862,7 +866,32 @@ impl Database {
             tables: &self.tables,
             txn,
         };
+        // A correlated subquery survives folding as a node in the plan. When one
+        // is present, build a per-row runner over a consistent snapshot of the
+        // base tables and let the executor call back into it.
+        if correlated::has_subquery(stmt) {
+            let snapshot = self.materialize_tables(txn, &source)?;
+            let runner = Rc::new(CorrelatedRunner::new(
+                self.catalog.clone(),
+                MaterializedSource::new(snapshot),
+            ));
+            return Ok(run_with(&physical, &source, runner)?);
+        }
         Ok(run(&physical, &source)?)
+    }
+
+    /// Materialize every base table's visible rows under `txn`, for correlated
+    /// subqueries to read repeatedly from a fixed snapshot.
+    fn materialize_tables(
+        &self,
+        _txn: &Transaction,
+        source: &EngineSource<'_>,
+    ) -> Result<HashMap<String, Relation>> {
+        let mut snapshot = HashMap::new();
+        for name in self.tables.keys() {
+            snapshot.insert(name.clone(), source.scan(name)?);
+        }
+        Ok(snapshot)
     }
 
     /// Rewrite a query, replacing every uncorrelated subquery with its result
@@ -981,22 +1010,46 @@ impl Database {
     }
 
     /// Recursively rewrite subqueries inside an expression.
+    ///
+    /// An uncorrelated subquery is run now and replaced with its result (a
+    /// literal, or an `IN`-list). A correlated one (it references an outer
+    /// column) is left in place for the executor to evaluate per row via the
+    /// [`crate::correlated::CorrelatedRunner`].
     fn fold_expr(&self, txn: &Transaction, expr: &Expr) -> Result<Expr> {
         match expr {
-            Expr::Subquery(q) => Ok(Expr::Literal(self.scalar_subquery(txn, q)?)),
+            Expr::Subquery(q) => {
+                if correlated::is_correlated(&self.catalog, q) {
+                    Ok(expr.clone())
+                } else {
+                    Ok(Expr::Literal(self.scalar_subquery(txn, q)?))
+                }
+            }
             Expr::InSubquery {
                 expr,
                 query,
                 negated,
             } => {
-                let lhs = self.fold_expr(txn, expr)?;
-                let values = self.column_subquery(txn, query)?;
-                Ok(in_list_expr(&lhs, &values, *negated))
+                if correlated::is_correlated(&self.catalog, query) {
+                    // Keep the node, but fold any subqueries in the outer LHS.
+                    Ok(Expr::InSubquery {
+                        expr: Box::new(self.fold_expr(txn, expr)?),
+                        query: query.clone(),
+                        negated: *negated,
+                    })
+                } else {
+                    let lhs = self.fold_expr(txn, expr)?;
+                    let values = self.column_subquery(txn, query)?;
+                    Ok(in_list_expr(&lhs, &values, *negated))
+                }
             }
             Expr::Exists(query) => {
-                let folded = self.fold_query(txn, query)?;
-                let (_cols, rows) = self.execute_query(txn, &folded)?;
-                Ok(Expr::Literal(Value::Bool(!rows.is_empty())))
+                if correlated::is_correlated(&self.catalog, query) {
+                    Ok(expr.clone())
+                } else {
+                    let folded = self.fold_query(txn, query)?;
+                    let (_cols, rows) = self.execute_query(txn, &folded)?;
+                    Ok(Expr::Literal(Value::Bool(!rows.is_empty())))
+                }
             }
             Expr::Binary { op, left, right } => Ok(Expr::Binary {
                 op: *op,
@@ -1350,7 +1403,7 @@ fn find_equality(predicate: &Expr, col: &str) -> Option<Value> {
 /// Desugar `lhs [NOT] IN (v1, v2, ...)` to a chain of equalities, the same
 /// shape the parser produces for a literal `IN`-list. An empty set is a
 /// constant: `IN ()` is false, `NOT IN ()` is true.
-fn in_list_expr(lhs: &Expr, values: &[Value], negated: bool) -> Expr {
+pub(crate) fn in_list_expr(lhs: &Expr, values: &[Value], negated: bool) -> Expr {
     if values.is_empty() {
         return Expr::Literal(Value::Bool(negated));
     }
@@ -2438,14 +2491,83 @@ mod tests {
     }
 
     #[test]
-    fn correlated_subquery_is_rejected() {
+    fn correlated_scalar_subquery_per_group() {
         let (_d, mut db) = db();
         seed_emp(&mut db);
-        // The inner query references the outer `dept`, which it cannot see.
-        let err = db.execute(
-            "SELECT name FROM emp WHERE salary > (SELECT AVG(salary) FROM dept WHERE dept = region)",
+        // Each employee earning above their own department's average.
+        // eng avg = 80 (a passes, b not); sales avg = 60 (c passes, d not).
+        let (_c, rows) = query(
+            &mut db,
+            "SELECT name FROM emp AS e WHERE salary > (SELECT AVG(salary) FROM emp WHERE dept = e.dept) ORDER BY name",
         );
-        assert!(err.is_err());
+        assert_eq!(name_set(&rows), vec!["a", "c"]);
+    }
+
+    #[test]
+    fn correlated_scalar_subquery_in_projection() {
+        let (_d, mut db) = db();
+        seed_emp(&mut db);
+        // The per-department average alongside each employee.
+        let (_c, rows) = query(
+            &mut db,
+            "SELECT name, (SELECT AVG(salary) FROM emp WHERE dept = e.dept) FROM emp AS e ORDER BY name",
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Text("a".into()), Value::Int(80)],
+                vec![Value::Text("b".into()), Value::Int(80)],
+                vec![Value::Text("c".into()), Value::Int(60)],
+                vec![Value::Text("d".into()), Value::Int(60)],
+            ]
+        );
+    }
+
+    #[test]
+    fn correlated_exists_and_not_exists() {
+        let (_d, mut db) = db();
+        seed_emp(&mut db);
+        // EXISTS a higher-paid colleague in the same department: everyone but
+        // the top earner of each department.
+        let (_c, not_top) = query(
+            &mut db,
+            "SELECT name FROM emp AS e WHERE EXISTS (SELECT 1 FROM emp AS x WHERE x.dept = e.dept AND x.salary > e.salary) ORDER BY name",
+        );
+        assert_eq!(name_set(&not_top), vec!["b", "d"]);
+        // NOT EXISTS the same: the top earner of each department.
+        let (_c, top) = query(
+            &mut db,
+            "SELECT name FROM emp AS e WHERE NOT EXISTS (SELECT 1 FROM emp AS x WHERE x.dept = e.dept AND x.salary > e.salary) ORDER BY name",
+        );
+        assert_eq!(name_set(&top), vec!["a", "c"]);
+    }
+
+    #[test]
+    fn correlated_in_subquery() {
+        let (_d, mut db) = db();
+        seed_emp(&mut db);
+        // Departments having an employee paid over 90 (only eng, via a=100).
+        let (_c, rows) = query(
+            &mut db,
+            "SELECT name FROM dept AS d WHERE d.name IN (SELECT dept FROM emp WHERE salary > 90 AND emp.dept = d.name) ORDER BY name",
+        );
+        assert_eq!(name_set(&rows), vec!["eng"]);
+    }
+
+    #[test]
+    fn correlated_subquery_explains() {
+        let (_d, mut db) = db();
+        seed_emp(&mut db);
+        // The correlated subquery survives folding, so the plan still filters on
+        // the EXISTS predicate rather than a constant.
+        let plan = match db
+            .execute("EXPLAIN SELECT name FROM emp AS e WHERE EXISTS (SELECT 1 FROM emp AS x WHERE x.dept = e.dept AND x.salary > e.salary)")
+            .unwrap()
+        {
+            QueryOutcome::Explain(p) => p,
+            other => panic!("expected explain, got {other:?}"),
+        };
+        assert!(plan.contains("EXISTS"), "plan was:\n{plan}");
     }
 
     #[test]

@@ -14,6 +14,6 @@ pub mod operator;
 pub mod row;
 
 pub use error::{ExecError, Result};
-pub use eval::eval;
-pub use operator::{build, run, Executor, Relation, Row, TableSource};
+pub use eval::{eval, eval_with, SubqueryRunner};
+pub use operator::{build, run, run_with, Executor, Relation, Row, TableSource};
 pub use row::{decode_row, encode_row};
