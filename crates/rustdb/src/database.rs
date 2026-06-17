@@ -2190,6 +2190,38 @@ mod tests {
         assert_eq!(name_set(&empty_ok), vec!["a"]);
     }
 
+    // --- CROSS JOIN and comma joins ---
+
+    #[test]
+    fn cross_join_and_comma_join() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE a (x INT)").unwrap();
+        db.execute("CREATE TABLE b (y INT)").unwrap();
+        db.execute("INSERT INTO a VALUES (1), (2)").unwrap();
+        db.execute("INSERT INTO b VALUES (10), (20)").unwrap();
+        // CROSS JOIN: 2 x 2 = 4 rows.
+        let (_c, rows) = query(&mut db, "SELECT x, y FROM a CROSS JOIN b ORDER BY x, y");
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Int(1), Value::Int(10)],
+                vec![Value::Int(1), Value::Int(20)],
+                vec![Value::Int(2), Value::Int(10)],
+                vec![Value::Int(2), Value::Int(20)],
+            ]
+        );
+        // Comma join is the same cartesian product; a WHERE makes it an
+        // old-style equi-join.
+        let (_c, filtered) = query(&mut db, "SELECT x, y FROM a, b WHERE x * 10 = y ORDER BY x");
+        assert_eq!(
+            filtered,
+            vec![
+                vec![Value::Int(1), Value::Int(10)],
+                vec![Value::Int(2), Value::Int(20)],
+            ]
+        );
+    }
+
     // --- more built-in functions ---
 
     #[test]

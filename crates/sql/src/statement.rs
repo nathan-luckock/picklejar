@@ -552,8 +552,29 @@ impl Parser {
 
     /// Parse zero or more JOIN clauses. A bare `JOIN` means `INNER JOIN`.
     fn parse_joins(&mut self) -> Result<Vec<Join>> {
+        // A cross join (`CROSS JOIN` or a comma in FROM) is an inner join with
+        // an always-true predicate, i.e. the cartesian product.
+        let cross = || Join {
+            kind: JoinKind::Inner,
+            table: TableRef {
+                name: String::new(),
+                alias: None,
+            },
+            on: Expr::Literal(crate::ast::Value::Bool(true)),
+        };
         let mut joins = Vec::new();
         loop {
+            if self.eat(&TokenKind::Comma) {
+                let table = self.parse_table_ref()?;
+                joins.push(Join { table, ..cross() });
+                continue;
+            }
+            if self.eat_keyword(Keyword::Cross) {
+                self.expect_keyword(Keyword::Join)?;
+                let table = self.parse_table_ref()?;
+                joins.push(Join { table, ..cross() });
+                continue;
+            }
             let kind = if self.eat_keyword(Keyword::Inner) {
                 self.expect_keyword(Keyword::Join)?;
                 JoinKind::Inner
