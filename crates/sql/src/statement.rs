@@ -220,6 +220,8 @@ pub struct ColumnDef {
     pub not_null: bool,
     /// Whether values must be unique across rows.
     pub unique: bool,
+    /// `DEFAULT <expr>` value for omitted columns (a constant expression).
+    pub default: Option<Expr>,
 }
 
 impl fmt::Display for ColumnDef {
@@ -233,6 +235,9 @@ impl fmt::Display for ColumnDef {
         }
         if self.unique {
             f.write_str(" UNIQUE")?;
+        }
+        if let Some(d) = &self.default {
+            write!(f, " DEFAULT {d}")?;
         }
         Ok(())
     }
@@ -774,6 +779,7 @@ impl Parser {
         let mut primary_key = false;
         let mut not_null = false;
         let mut unique = false;
+        let mut default = None;
         loop {
             if self.eat_keyword(Keyword::Primary) {
                 self.expect_keyword(Keyword::Key)?;
@@ -783,6 +789,8 @@ impl Parser {
                 not_null = true;
             } else if self.eat_keyword(Keyword::Unique) {
                 unique = true;
+            } else if self.eat_keyword(Keyword::Default) {
+                default = Some(self.parse_expr()?);
             } else {
                 break;
             }
@@ -793,6 +801,7 @@ impl Parser {
             primary_key,
             not_null,
             unique,
+            default,
         })
     }
 
@@ -929,6 +938,12 @@ mod tests {
     }
 
     #[test]
+    fn default_column_round_trips() {
+        round_trip("CREATE TABLE t (id INT, status TEXT DEFAULT 'new', n INT DEFAULT 0)");
+        round_trip("CREATE TABLE t (a INT NOT NULL DEFAULT 1, b BOOL DEFAULT TRUE)");
+    }
+
+    #[test]
     fn subquery_round_trips() {
         round_trip("SELECT a FROM t WHERE x > (SELECT MAX(y) FROM u)");
         round_trip("SELECT (SELECT COUNT(*) FROM u) FROM t");
@@ -982,6 +997,7 @@ mod tests {
                     primary_key: false,
                     not_null: false,
                     unique: false,
+                    default: None,
                 }],
             }
         );

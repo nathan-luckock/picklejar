@@ -104,6 +104,7 @@ fn column_def() -> impl Strategy<Value = ColumnDef> {
             primary_key,
             not_null,
             unique,
+            default: None,
         })
 }
 

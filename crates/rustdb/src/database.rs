@@ -57,6 +57,9 @@ struct TableStore {
     next_rowid: u64,
     /// Physical secondary indexes, one per indexed column (unique INT columns).
     secondary: Vec<SecondaryIndex>,
+    /// Per-column DEFAULT value (in schema order), used to fill omitted columns
+    /// on INSERT. `None` for a column with no default.
+    defaults: Vec<Option<Value>>,
 }
 
 /// A physical secondary index: the indexed column's position and the root page
@@ -160,13 +163,18 @@ impl Database {
             let columns: Vec<ColumnDef> = r
                 .columns
                 .iter()
-                .map(|(name, ty, primary_key, not_null, unique)| ColumnDef {
-                    name: name.clone(),
-                    ty: *ty,
-                    primary_key: *primary_key,
-                    not_null: *not_null,
-                    unique: *unique,
-                })
+                .map(
+                    |(name, ty, primary_key, not_null, unique, _default)| ColumnDef {
+                        name: name.clone(),
+                        ty: *ty,
+                        primary_key: *primary_key,
+                        not_null: *not_null,
+                        unique: *unique,
+                        // The catalog does not use defaults; the engine restores
+                        // them into the table's descriptor from the sidecar.
+                        default: None,
+                    },
+                )
                 .collect();
             self.catalog.apply(&Statement::CreateTable {
                 name: r.name.clone(),
@@ -204,6 +212,7 @@ impl Database {
                     )?;
                 }
             }
+            let defaults = r.columns.iter().map(|c| c.5.clone()).collect();
             self.tables.insert(
                 r.name.clone(),
                 TableStore {
@@ -211,6 +220,7 @@ impl Database {
                     version_page: PageId(r.version_page),
                     next_rowid: r.next_rowid,
                     secondary,
+                    defaults,
                 },
             );
         }
@@ -232,7 +242,18 @@ impl Database {
                     columns: meta
                         .columns
                         .iter()
-                        .map(|c| (c.name.clone(), c.ty, c.primary_key, c.not_null, c.unique))
+                        .enumerate()
+                        .map(|(i, c)| {
+                            let default = store.defaults.get(i).cloned().flatten();
+                            (
+                                c.name.clone(),
+                                c.ty,
+                                c.primary_key,
+                                c.not_null,
+                                c.unique,
+                                default,
+                            )
+                        })
                         .collect(),
                     indexes: meta
                         .indexes
@@ -431,11 +452,19 @@ impl Database {
             }
         }
 
+        // Const-evaluate each column's DEFAULT now, so INSERT just substitutes
+        // the value. A non-constant default (e.g. a function call) is rejected.
+        let defaults = columns
+            .iter()
+            .map(|c| c.default.as_ref().map(const_eval).transpose())
+            .collect::<Result<Vec<_>>>()?;
+
         let store = TableStore {
             index_root: table.index_root(),
             version_page: table.version_page(),
             next_rowid: 0,
             secondary,
+            defaults,
         };
         self.tables.insert(name.clone(), store);
         self.persist()?;
@@ -526,8 +555,18 @@ impl Database {
                     got: row.len(),
                 });
             }
-            // Build a full row, NULL-filling any column not named.
-            let mut values = vec![Value::Null; schema.len()];
+            // Build a full row: each column starts at its DEFAULT (NULL when it
+            // has none), then the named columns are overwritten.
+            let mut values: Vec<Value> = (0..schema.len())
+                .map(|i| {
+                    store
+                        .defaults
+                        .get(i)
+                        .cloned()
+                        .flatten()
+                        .unwrap_or(Value::Null)
+                })
+                .collect();
             for (expr, &pos) in row.iter().zip(&positions) {
                 values[pos] = const_eval(expr)?;
             }
@@ -2188,6 +2227,63 @@ mod tests {
             "SELECT name FROM emp WHERE NOT EXISTS (SELECT 1 FROM dept WHERE region = 'north') ORDER BY name LIMIT 1",
         );
         assert_eq!(name_set(&empty_ok), vec!["a"]);
+    }
+
+    // --- DEFAULT column values ---
+
+    #[test]
+    fn default_values_fill_omitted_columns() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE t (id INT, status TEXT DEFAULT 'new', n INT DEFAULT 7, active BOOL DEFAULT TRUE)")
+            .unwrap();
+        // Only id is provided; the rest take their defaults.
+        db.execute("INSERT INTO t (id) VALUES (1)").unwrap();
+        // An explicit value overrides the default.
+        db.execute("INSERT INTO t (id, status) VALUES (2, 'done')")
+            .unwrap();
+        let (cols, rows) = query(&mut db, "SELECT id, status, n, active FROM t ORDER BY id");
+        assert_eq!(names(&cols), ["id", "status", "n", "active"]);
+        assert_eq!(
+            rows,
+            vec![
+                vec![
+                    Value::Int(1),
+                    Value::Text("new".into()),
+                    Value::Int(7),
+                    Value::Bool(true)
+                ],
+                vec![
+                    Value::Int(2),
+                    Value::Text("done".into()),
+                    Value::Int(7),
+                    Value::Bool(true)
+                ],
+            ]
+        );
+    }
+
+    #[test]
+    fn default_satisfies_not_null_and_survives_reopen() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("def.db");
+        {
+            let mut db = Database::open(&path).expect("open");
+            db.execute("CREATE TABLE t (id INT, tag TEXT NOT NULL DEFAULT 'x with space')")
+                .unwrap();
+            // NOT NULL is satisfied by the default even though tag is omitted.
+            db.execute("INSERT INTO t (id) VALUES (1)").unwrap();
+        }
+        // The default persists (note the embedded space round-trips).
+        let mut db = Database::open(&path).expect("reopen");
+        db.execute("INSERT INTO t (id) VALUES (2)").unwrap();
+        let (_c, rows) = query(&mut db, "SELECT id, tag FROM t ORDER BY id");
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Int(1), Value::Text("x with space".into())],
+                vec![Value::Int(2), Value::Text("x with space".into())],
+            ]
+        );
     }
 
     // --- CROSS JOIN and comma joins ---

@@ -17,14 +17,15 @@ use std::io;
 use std::path::Path;
 
 use rustdb_sql::statement::DataType;
+use rustdb_sql::Value;
 
 /// One table's persisted metadata.
 #[derive(Debug, Clone)]
 pub struct TableRecord {
     /// Table name.
     pub name: String,
-    /// Columns as `(name, type, primary_key, not_null, unique)`.
-    pub columns: Vec<(String, DataType, bool, bool, bool)>,
+    /// Columns as `(name, type, primary_key, not_null, unique, default)`.
+    pub columns: Vec<(String, DataType, bool, bool, bool, Option<Value>)>,
     /// Indexes as `(index_name, column)`.
     pub indexes: Vec<(String, String)>,
     /// Physical secondary indexes as `(column, root_page)`: the B+ tree root
@@ -58,6 +59,51 @@ fn parse_type(s: &str) -> Option<DataType> {
     }
 }
 
+/// Encode a column DEFAULT as a single whitespace-free token. Text is
+/// hex-encoded so values with spaces survive the space-delimited format.
+fn encode_default(default: Option<&Value>) -> String {
+    match default {
+        None => "-".to_string(),
+        Some(Value::Null) => "N".to_string(),
+        Some(Value::Int(n)) => format!("i{n}"),
+        Some(Value::Float(x)) => format!("f{}", x.to_bits()),
+        Some(Value::Bool(b)) => format!("B{}", u8::from(*b)),
+        Some(Value::Text(s)) => {
+            let mut out = String::from("s");
+            for b in s.bytes() {
+                let _ = write!(out, "{b:02x}");
+            }
+            out
+        }
+    }
+}
+
+/// Inverse of [`encode_default`].
+fn decode_default(tok: &str) -> io::Result<Option<Value>> {
+    let mut chars = tok.chars();
+    let tag = chars.next().ok_or_else(invalid)?;
+    let rest = &tok[tag.len_utf8()..];
+    let v = match tag {
+        '-' => return Ok(None),
+        'N' => Value::Null,
+        'i' => Value::Int(rest.parse().map_err(|_| invalid())?),
+        'f' => Value::Float(f64::from_bits(rest.parse().map_err(|_| invalid())?)),
+        'B' => Value::Bool(rest == "1"),
+        's' => {
+            if rest.len() % 2 != 0 {
+                return Err(invalid());
+            }
+            let bytes = (0..rest.len())
+                .step_by(2)
+                .map(|j| u8::from_str_radix(&rest[j..j + 2], 16).map_err(|_| invalid()))
+                .collect::<io::Result<Vec<u8>>>()?;
+            Value::Text(String::from_utf8(bytes).map_err(|_| invalid())?)
+        }
+        _ => return Err(invalid()),
+    };
+    Ok(Some(v))
+}
+
 /// Write `records` to `path` atomically: write a temp file, then rename it
 /// over the target so a crash never leaves a half-written catalog.
 ///
@@ -76,14 +122,15 @@ pub fn save(path: &Path, records: &[TableRecord]) -> io::Result<()> {
             r.next_rowid,
             r.columns.len()
         );
-        for (name, ty, pk, not_null, unique) in &r.columns {
+        for (name, ty, pk, not_null, unique, default) in &r.columns {
             let _ = write!(
                 out,
-                " {name} {} {} {} {}",
+                " {name} {} {} {} {} {}",
                 type_tag(*ty),
                 u8::from(*pk),
                 u8::from(*not_null),
                 u8::from(*unique),
+                encode_default(default.as_ref()),
             );
         }
         let _ = write!(out, " {}", r.indexes.len());
@@ -135,7 +182,8 @@ pub fn load(path: &Path) -> io::Result<Vec<TableRecord>> {
             let pk = field(&toks, &mut i)? == "1";
             let not_null = field(&toks, &mut i)? == "1";
             let unique = field(&toks, &mut i)? == "1";
-            columns.push((cname, ty, pk, not_null, unique));
+            let default = decode_default(field(&toks, &mut i)?)?;
+            columns.push((cname, ty, pk, not_null, unique, default));
         }
 
         let nidx = parse_usize(field(&toks, &mut i)?)?;
