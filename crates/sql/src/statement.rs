@@ -1422,51 +1422,15 @@ impl Parser {
     /// constraints normalized from inline `CHECK` / `REFERENCES` clauses.
     fn parse_column_def(&mut self) -> Result<(ColumnDef, Vec<TableConstraint>)> {
         let name = self.parse_ident()?;
-        // SERIAL is an auto-incrementing integer column.
+        // SERIAL is an auto-incrementing integer column; every other type word
+        // goes through the shared type parser (also used by CAST).
         let mut serial = false;
-        let ty = match self.peek() {
-            TokenKind::Keyword(Keyword::Int) => {
-                self.advance();
-                DataType::Int
-            }
-            TokenKind::Keyword(Keyword::Serial) => {
-                self.advance();
-                serial = true;
-                DataType::Int
-            }
-            TokenKind::Keyword(Keyword::Float) => {
-                self.advance();
-                DataType::Float
-            }
-            TokenKind::Keyword(Keyword::Bool) => {
-                self.advance();
-                DataType::Bool
-            }
-            TokenKind::Keyword(Keyword::Text) => {
-                self.advance();
-                DataType::Text
-            }
-            // DATE / TIMESTAMP are not reserved words (so `date` stays usable as
-            // a column name), so they are matched here as plain identifiers.
-            TokenKind::Ident(s) if s.eq_ignore_ascii_case("date") => {
-                self.advance();
-                DataType::Date
-            }
-            TokenKind::Ident(s)
-                if s.eq_ignore_ascii_case("timestamp") || s.eq_ignore_ascii_case("datetime") =>
-            {
-                self.advance();
-                DataType::Timestamp
-            }
-            other => {
-                return Err(SqlError::parse(
-                    format!(
-                        "expected a column type (INT, SERIAL, FLOAT, BOOL, TEXT, DATE, or \
-                         TIMESTAMP), found {other:?}"
-                    ),
-                    self.span(),
-                ));
-            }
+        let ty = if matches!(self.peek(), TokenKind::Keyword(Keyword::Serial)) {
+            self.advance();
+            serial = true;
+            DataType::Int
+        } else {
+            self.parse_data_type()?
         };
         // Optional column constraints, in any order: PRIMARY KEY, NOT NULL,
         // UNIQUE.
@@ -1984,6 +1948,22 @@ mod tests {
                 from: "a".into(),
                 to: "b".into(),
             }
+        );
+    }
+
+    #[test]
+    fn cast_round_trips() {
+        // Both spellings parse; both print in the canonical CAST(...) form.
+        round_trip("SELECT CAST(x AS INT) FROM t");
+        round_trip("SELECT CAST((a + b) AS FLOAT) FROM t");
+        round_trip("SELECT CAST(s AS DATE) FROM t");
+        assert_eq!(
+            parse("SELECT x::int FROM t"),
+            parse("SELECT CAST(x AS INT) FROM t")
+        );
+        assert_eq!(
+            parse("SELECT n::text FROM t"),
+            parse("SELECT CAST(n AS TEXT) FROM t")
         );
     }
 

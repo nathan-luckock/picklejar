@@ -292,7 +292,9 @@ fn resolve_expr(expr: &Expr, scope: &[ScopeEntry]) -> Result<()> {
         }
         // A unary operand, and the outer left-hand side of an `IN (subquery)`,
         // are both ordinary expressions resolved against the current scope.
-        Expr::Unary { expr, .. } | Expr::InSubquery { expr, .. } => resolve_expr(expr, scope),
+        Expr::Unary { expr, .. } | Expr::InSubquery { expr, .. } | Expr::Cast { expr, .. } => {
+            resolve_expr(expr, scope)
+        }
         Expr::Func { args, .. } => {
             for arg in args {
                 resolve_expr(arg, scope)?;
@@ -410,7 +412,7 @@ fn collect_aggs_in(expr: &Expr, out: &mut Vec<Expr>) {
             collect_aggs_in(left, out);
             collect_aggs_in(right, out);
         }
-        Expr::Unary { expr, .. } => collect_aggs_in(expr, out),
+        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } => collect_aggs_in(expr, out),
         Expr::Case {
             operand,
             whens,
@@ -457,7 +459,7 @@ fn collect_windows_in(expr: &Expr, out: &mut Vec<Expr>) {
             collect_windows_in(left, out);
             collect_windows_in(right, out);
         }
-        Expr::Unary { expr, .. } => collect_windows_in(expr, out),
+        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } => collect_windows_in(expr, out),
         Expr::Case {
             operand,
             whens,

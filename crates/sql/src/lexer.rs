@@ -51,6 +51,7 @@ impl<'a> Lexer<'a> {
                 b'*' => self.single(TokenKind::Star),
                 b'/' => self.single(TokenKind::Slash),
                 b'=' => self.single(TokenKind::Eq),
+                b':' => self.colon()?,
                 b'<' => self.less(),
                 b'>' => self.greater(),
                 b'!' => self.bang()?,
@@ -108,6 +109,21 @@ impl<'a> Lexer<'a> {
     }
 
     // --- token scanners ---
+
+    /// `::` is the cast operator; a lone `:` is not valid in this dialect.
+    fn colon(&mut self) -> Result<TokenKind> {
+        let start = self.pos;
+        self.bump();
+        if self.peek() == Some(b':') {
+            self.bump();
+            Ok(TokenKind::ColonColon)
+        } else {
+            Err(SqlError::UnexpectedChar {
+                ch: ':',
+                pos: start,
+            })
+        }
+    }
 
     fn less(&mut self) -> TokenKind {
         self.bump();
