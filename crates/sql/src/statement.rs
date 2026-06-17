@@ -301,6 +301,13 @@ pub enum Statement {
         /// Target table.
         table: String,
     },
+    /// `ALTER TABLE t ADD COLUMN c TYPE ...`: append a column.
+    AlterTableAddColumn {
+        /// Target table.
+        table: String,
+        /// The new column's definition.
+        column: ColumnDef,
+    },
     /// `BEGIN`: start an explicit transaction.
     Begin,
     /// `COMMIT`: commit the current transaction.
@@ -409,6 +416,9 @@ impl fmt::Display for Statement {
             }
             Self::Explain(inner) => write!(f, "EXPLAIN {inner}"),
             Self::Truncate { table } => write!(f, "TRUNCATE TABLE {table}"),
+            Self::AlterTableAddColumn { table, column } => {
+                write!(f, "ALTER TABLE {table} ADD COLUMN {column}")
+            }
             Self::Begin => f.write_str("BEGIN"),
             Self::Commit => f.write_str("COMMIT"),
             Self::Rollback => f.write_str("ROLLBACK"),
@@ -454,6 +464,15 @@ impl Parser {
                 self.eat_keyword(Keyword::Table); // optional TABLE keyword
                 let table = self.parse_ident()?;
                 Statement::Truncate { table }
+            }
+            TokenKind::Keyword(Keyword::Alter) => {
+                self.advance();
+                self.expect_keyword(Keyword::Table)?;
+                let table = self.parse_ident()?;
+                self.expect_keyword(Keyword::Add)?;
+                self.eat_keyword(Keyword::Column); // optional COLUMN keyword
+                let column = self.parse_column_def()?;
+                Statement::AlterTableAddColumn { table, column }
             }
             TokenKind::Keyword(Keyword::Select) => self.parse_query()?,
             TokenKind::Keyword(Keyword::Insert) => self.parse_insert()?,
@@ -947,6 +966,13 @@ mod tests {
         let second = parse(&printed);
         assert_eq!(first, second, "round-trip mismatch: {src:?} -> {printed:?}");
         first
+    }
+
+    #[test]
+    fn alter_and_truncate_round_trip() {
+        round_trip("ALTER TABLE t ADD COLUMN c INT DEFAULT 0");
+        round_trip("ALTER TABLE t ADD COLUMN flag BOOL NOT NULL DEFAULT TRUE");
+        round_trip("TRUNCATE TABLE t");
     }
 
     #[test]
