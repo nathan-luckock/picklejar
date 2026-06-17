@@ -102,6 +102,9 @@ pub struct Database {
     mgr: TransactionManager,
     catalog: Catalog,
     tables: HashMap<String, TableStore>,
+    /// Stored views by name: the defining query, normalized. A view reference
+    /// in a FROM/JOIN clause is expanded to this query as a derived table.
+    views: HashMap<String, Statement>,
     /// The open explicit transaction, if the session ran `BEGIN`. In
     /// auto-commit mode (no explicit transaction) this is `None` and each
     /// statement runs in its own transaction.
@@ -111,6 +114,8 @@ pub struct Database {
     /// Sidecar file recording the transaction watermark and aborted xids, so
     /// committed data stays visible across a reopen.
     txn_path: PathBuf,
+    /// Sidecar file recording the views as `(name, sql)` pairs.
+    view_path: PathBuf,
 }
 
 impl std::fmt::Debug for Database {
@@ -134,6 +139,7 @@ impl Database {
         let wal_path = base.with_extension("wal");
         let meta_path = base.with_extension("meta");
         let txn_path = base.with_extension("txn");
+        let view_path = base.with_extension("view");
         let writer = WalWriter::open(&wal_path)?;
         let wal = WalSyncHandle::new(writer);
         let file = FileManager::open(base)?;
@@ -144,11 +150,14 @@ impl Database {
             mgr: TransactionManager::new(),
             catalog: Catalog::new(),
             tables: HashMap::new(),
+            views: HashMap::new(),
             current_txn: None,
             meta_path,
             txn_path,
+            view_path,
         };
         db.load_catalog()?;
+        db.load_views()?;
         // Restore the transaction watermark so data committed in a previous
         // session stays visible (its xids would otherwise read as aborted).
         let (next_xid, aborted) = persist::load_txn(&db.txn_path)?;
@@ -224,6 +233,29 @@ impl Database {
                 },
             );
         }
+        Ok(())
+    }
+
+    /// Rebuild the view registry from its sidecar by re-parsing each stored
+    /// query. A malformed entry is skipped rather than failing the open.
+    fn load_views(&mut self) -> Result<()> {
+        for (name, sql) in persist::load_views(&self.view_path)? {
+            if let Ok(stmt) = Parser::from_sql(&sql).and_then(|mut p| p.parse_statement()) {
+                self.views.insert(name, stmt);
+            }
+        }
+        Ok(())
+    }
+
+    /// Write the view registry to its sidecar as `(name, canonical SQL)` pairs.
+    fn save_views(&self) -> Result<()> {
+        let mut views: Vec<(String, String)> = self
+            .views
+            .iter()
+            .map(|(name, query)| (name.clone(), query.to_string()))
+            .collect();
+        views.sort();
+        persist::save_views(&self.view_path, &views)?;
         Ok(())
     }
 
@@ -309,6 +341,11 @@ impl Database {
                 Ok(QueryOutcome::Ddl)
             }
             Statement::DropTable { ref name } => self.drop_table(&stmt, name),
+            Statement::CreateView {
+                ref name,
+                ref query,
+            } => self.create_view(name, query),
+            Statement::DropView { ref name } => self.drop_view(name),
             Statement::Truncate { ref table } => self.truncate_table(table),
             Statement::AlterTableAddColumn {
                 ref table,
@@ -617,6 +654,41 @@ impl Database {
         Ok(QueryOutcome::Ddl)
     }
 
+    /// Register a view: store its defining query under `name`.
+    ///
+    /// The query is validated (expanded against existing views, subqueries
+    /// folded, then bound) before it is stored, so a broken definition is
+    /// rejected at creation time as in Postgres. The raw query is kept, not the
+    /// folded one, so the view re-evaluates against current data on every
+    /// reference.
+    fn create_view(&mut self, name: &str, query: &Statement) -> Result<QueryOutcome> {
+        if self.tables.contains_key(name) || self.views.contains_key(name) {
+            return Err(DbError::Constraint(format!(
+                "a table or view named {name} already exists"
+            )));
+        }
+        // Bind the query (with views expanded and subqueries folded) in a
+        // throwaway read transaction to surface unknown tables or columns now.
+        let txn = self.mgr.begin();
+        let validated = self
+            .fold_query(&txn, query)
+            .and_then(|folded| bind(&self.catalog, &folded).map_err(DbError::from));
+        self.mgr.abort(&txn);
+        validated?;
+        self.views.insert(name.to_string(), query.clone());
+        self.save_views()?;
+        Ok(QueryOutcome::Ddl)
+    }
+
+    /// Remove a view. Errors if no view by that name exists.
+    fn drop_view(&mut self, name: &str) -> Result<QueryOutcome> {
+        if self.views.remove(name).is_none() {
+            return Err(DbError::Constraint(format!("view {name} does not exist")));
+        }
+        self.save_views()?;
+        Ok(QueryOutcome::Ddl)
+    }
+
     #[allow(clippy::too_many_lines)]
     fn insert(
         &mut self,
@@ -865,20 +937,36 @@ impl Database {
         })
     }
 
-    /// Fold any subqueries nested inside a `FROM`/join relation. A derived table
-    /// `(SELECT ...) AS x` has its inner query folded so its own uncorrelated
-    /// subqueries are resolved before binding.
+    /// Fold any subqueries nested inside a `FROM`/join relation, and expand a
+    /// view reference to a derived table over the view's defining query.
+    ///
+    /// A derived table `(SELECT ...) AS x` has its inner query folded so its own
+    /// uncorrelated subqueries are resolved before binding. A bare name that
+    /// matches a view is rewritten as `(<view query>) AS <alias>`, where the
+    /// alias is the one written in the query or, failing that, the view name.
+    /// The view's query is itself folded, so views may reference other views
+    /// and contain their own uncorrelated subqueries.
     fn fold_table_ref(&self, txn: &Transaction, table: &TableRef) -> Result<TableRef> {
-        let subquery = table
-            .subquery
-            .as_ref()
-            .map(|q| self.fold_query(txn, q).map(Box::new))
-            .transpose()?;
-        Ok(TableRef {
-            name: table.name.clone(),
-            alias: table.alias.clone(),
-            subquery,
-        })
+        // An explicit derived table: fold its inner query.
+        if let Some(q) = &table.subquery {
+            return Ok(TableRef {
+                name: table.name.clone(),
+                alias: table.alias.clone(),
+                subquery: Some(Box::new(self.fold_query(txn, q)?)),
+            });
+        }
+        // A view reference expands to a derived table over the view's query.
+        if let Some(view) = self.views.get(&table.name) {
+            let expanded = self.fold_query(txn, view)?;
+            let alias = table.alias.clone().unwrap_or_else(|| table.name.clone());
+            return Ok(TableRef {
+                name: String::new(),
+                alias: Some(alias),
+                subquery: Some(Box::new(expanded)),
+            });
+        }
+        // A plain base table.
+        Ok(table.clone())
     }
 
     fn fold_order_keys(&self, txn: &Transaction, keys: &[OrderItem]) -> Result<Vec<OrderItem>> {
@@ -2457,6 +2545,156 @@ mod tests {
             other => panic!("expected explain, got {other:?}"),
         };
         assert!(plan.contains("DerivedScan AS e"), "plan was:\n{plan}");
+    }
+
+    // --- CREATE VIEW / DROP VIEW ---
+
+    #[test]
+    fn view_select_filters_and_projects() {
+        let (_d, mut db) = db();
+        seed_emp(&mut db);
+        assert_eq!(
+            db.execute("CREATE VIEW well_paid AS SELECT name, salary FROM emp WHERE salary >= 80")
+                .unwrap(),
+            QueryOutcome::Ddl
+        );
+        // Plain select from the view.
+        let (cols, rows) = query(&mut db, "SELECT name, salary FROM well_paid ORDER BY name");
+        assert_eq!(names(&cols), ["name", "salary"]);
+        assert_eq!(name_set(&rows), vec!["a", "c"]);
+        // The view can be filtered and its columns qualified by the view name.
+        let (_c, r2) = query(
+            &mut db,
+            "SELECT well_paid.name FROM well_paid WHERE well_paid.salary < 100 ORDER BY name",
+        );
+        assert_eq!(name_set(&r2), vec!["c"]);
+    }
+
+    #[test]
+    fn view_select_star_and_alias() {
+        let (_d, mut db) = db();
+        seed_emp(&mut db);
+        db.execute("CREATE VIEW eng AS SELECT name, salary FROM emp WHERE dept = 'eng'")
+            .unwrap();
+        // SELECT * over a view yields its bare column names.
+        let (cols, rows) = query(&mut db, "SELECT * FROM eng ORDER BY name");
+        assert_eq!(names(&cols), ["name", "salary"]);
+        assert_eq!(name_set(&rows), vec!["a", "b"]);
+        // An explicit alias on the view reference qualifies its columns.
+        let (_c, r2) = query(
+            &mut db,
+            "SELECT e.salary FROM eng AS e ORDER BY e.salary DESC",
+        );
+        assert_eq!(r2, vec![vec![Value::Int(100)], vec![Value::Int(60)]]);
+    }
+
+    #[test]
+    fn view_joins_base_table() {
+        let (_d, mut db) = db();
+        seed_emp(&mut db);
+        db.execute("CREATE VIEW earners AS SELECT name, dept FROM emp WHERE salary > 50")
+            .unwrap();
+        let (_c, rows) = query(
+            &mut db,
+            "SELECT earners.name, d.region FROM earners INNER JOIN dept AS d ON earners.dept = d.name ORDER BY earners.name",
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Text("a".into()), Value::Text("west".into())],
+                vec![Value::Text("b".into()), Value::Text("west".into())],
+                vec![Value::Text("c".into()), Value::Text("east".into())],
+            ]
+        );
+    }
+
+    #[test]
+    fn view_references_another_view() {
+        let (_d, mut db) = db();
+        seed_emp(&mut db);
+        db.execute("CREATE VIEW base AS SELECT name, salary FROM emp")
+            .unwrap();
+        // A view built on top of another view.
+        db.execute("CREATE VIEW top AS SELECT name FROM base WHERE salary >= 80")
+            .unwrap();
+        let (_c, rows) = query(&mut db, "SELECT name FROM top ORDER BY name");
+        assert_eq!(name_set(&rows), vec!["a", "c"]);
+    }
+
+    #[test]
+    fn view_reflects_later_writes() {
+        let (_d, mut db) = db();
+        seed_emp(&mut db);
+        db.execute("CREATE VIEW all_names AS SELECT name FROM emp")
+            .unwrap();
+        db.execute("INSERT INTO emp VALUES ('e','eng',120)")
+            .unwrap();
+        // The view re-evaluates against current data, so the new row appears.
+        let (_c, rows) = query(&mut db, "SELECT name FROM all_names ORDER BY name");
+        assert_eq!(name_set(&rows), vec!["a", "b", "c", "d", "e"]);
+    }
+
+    #[test]
+    fn view_explains_as_derived_scan() {
+        let (_d, mut db) = db();
+        seed_emp(&mut db);
+        db.execute("CREATE VIEW v AS SELECT name FROM emp").unwrap();
+        let plan = match db.execute("EXPLAIN SELECT name FROM v").unwrap() {
+            QueryOutcome::Explain(p) => p,
+            other => panic!("expected explain, got {other:?}"),
+        };
+        assert!(plan.contains("DerivedScan AS v"), "plan was:\n{plan}");
+    }
+
+    #[test]
+    fn create_view_rejects_name_in_use_and_broken_definition() {
+        let (_d, mut db) = db();
+        seed_emp(&mut db);
+        // A name already taken by a table is rejected.
+        assert!(db
+            .execute("CREATE VIEW emp AS SELECT name FROM emp")
+            .is_err());
+        db.execute("CREATE VIEW v AS SELECT name FROM emp").unwrap();
+        // A duplicate view name is rejected.
+        assert!(db
+            .execute("CREATE VIEW v AS SELECT name FROM dept")
+            .is_err());
+        // A definition over a missing table is rejected at creation time.
+        assert!(db
+            .execute("CREATE VIEW bad AS SELECT x FROM ghost")
+            .is_err());
+        // A definition over a missing column is rejected at creation time.
+        assert!(db
+            .execute("CREATE VIEW bad AS SELECT nope FROM emp")
+            .is_err());
+    }
+
+    #[test]
+    fn drop_view_removes_it() {
+        let (_d, mut db) = db();
+        seed_emp(&mut db);
+        db.execute("CREATE VIEW v AS SELECT name FROM emp").unwrap();
+        query(&mut db, "SELECT name FROM v");
+        db.execute("DROP VIEW v").unwrap();
+        // Once dropped, the name no longer resolves.
+        assert!(db.execute("SELECT name FROM v").is_err());
+        // Dropping a view that does not exist errors.
+        assert!(db.execute("DROP VIEW ghost").is_err());
+    }
+
+    #[test]
+    fn views_survive_reopen() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("view.db");
+        {
+            let mut db = Database::open(&path).expect("open");
+            seed_emp(&mut db);
+            db.execute("CREATE VIEW well_paid AS SELECT name FROM emp WHERE salary >= 80")
+                .unwrap();
+        }
+        let mut db = Database::open(&path).expect("reopen");
+        let (_c, rows) = query(&mut db, "SELECT name FROM well_paid ORDER BY name");
+        assert_eq!(name_set(&rows), vec!["a", "c"]);
     }
 
     // --- ALTER TABLE ADD COLUMN ---

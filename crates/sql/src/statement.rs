@@ -273,6 +273,19 @@ pub enum Statement {
         /// Indexed column.
         column: String,
     },
+    /// `CREATE VIEW name AS <query>`: a named, stored query expanded as a
+    /// derived table wherever the view name appears in a FROM or JOIN.
+    CreateView {
+        /// View name.
+        name: String,
+        /// The defining query (a `Select` or a `Union`).
+        query: Box<Self>,
+    },
+    /// `DROP VIEW name`.
+    DropView {
+        /// View name.
+        name: String,
+    },
     /// A `SELECT` query.
     Select(Box<Select>),
     /// `INSERT INTO t (cols) VALUES (...), (...)`.
@@ -360,6 +373,8 @@ impl fmt::Display for Statement {
                 table,
                 column,
             } => write!(f, "CREATE INDEX {name} ON {table} ({column})"),
+            Self::CreateView { name, query } => write!(f, "CREATE VIEW {name} AS {query}"),
+            Self::DropView { name } => write!(f, "DROP VIEW {name}"),
             Self::Select(s) => write!(f, "{s}"),
             Self::Insert {
                 table,
@@ -770,15 +785,33 @@ impl Parser {
             self.parse_create_table_tail()
         } else if self.eat_keyword(Keyword::Index) {
             self.parse_create_index_tail()
+        } else if self.eat_keyword(Keyword::View) {
+            self.parse_create_view_tail()
         } else {
             Err(SqlError::parse(
                 format!(
-                    "expected TABLE or INDEX after CREATE, found {:?}",
+                    "expected TABLE, INDEX, or VIEW after CREATE, found {:?}",
                     self.peek()
                 ),
                 self.span(),
             ))
         }
+    }
+
+    fn parse_create_view_tail(&mut self) -> Result<Statement> {
+        let name = self.parse_ident()?;
+        self.expect_keyword(Keyword::As)?;
+        let query = self.parse_query()?;
+        if !matches!(query, Statement::Select(_) | Statement::Union { .. }) {
+            return Err(SqlError::parse(
+                "CREATE VIEW requires a SELECT or UNION query",
+                self.span(),
+            ));
+        }
+        Ok(Statement::CreateView {
+            name,
+            query: Box::new(query),
+        })
     }
 
     fn parse_create_table_tail(&mut self) -> Result<Statement> {
@@ -874,6 +907,10 @@ impl Parser {
 
     fn parse_drop(&mut self) -> Result<Statement> {
         self.expect_keyword(Keyword::Drop)?;
+        if self.eat_keyword(Keyword::View) {
+            let name = self.parse_ident()?;
+            return Ok(Statement::DropView { name });
+        }
         self.expect_keyword(Keyword::Table)?;
         let name = self.parse_ident()?;
         Ok(Statement::DropTable { name })
@@ -1025,6 +1062,14 @@ mod tests {
     fn count_distinct_round_trips() {
         round_trip("SELECT COUNT(DISTINCT col) FROM t");
         round_trip("SELECT g, SUM(DISTINCT n) FROM t GROUP BY g");
+    }
+
+    #[test]
+    fn view_round_trips() {
+        round_trip("CREATE VIEW v AS SELECT a, b FROM t");
+        round_trip("CREATE VIEW v AS SELECT a FROM t WHERE x > 0 ORDER BY a LIMIT 5");
+        round_trip("CREATE VIEW v AS SELECT a FROM t UNION ALL SELECT b FROM u");
+        round_trip("DROP VIEW v");
     }
 
     #[test]

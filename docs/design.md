@@ -347,10 +347,11 @@ Every AST node has a `Display` that prints canonical SQL, fully parenthesizing e
 ### Supported SQL surface
 
 DDL is `CREATE TABLE` (with `PRIMARY KEY` / `UNIQUE` / `NOT NULL` constraints
-and `DEFAULT <constant>` per column), `CREATE INDEX`, `DROP TABLE`, and
-`TRUNCATE TABLE`. DML is `INSERT` (multi-row, omitted columns take their
-default), `UPDATE`, and `DELETE`. Transaction control is `BEGIN` / `COMMIT` /
-`ROLLBACK`. `SELECT` covers:
+and `DEFAULT <constant>` per column), `CREATE INDEX`, `DROP TABLE`,
+`TRUNCATE TABLE`, `ALTER TABLE ... ADD COLUMN`, and `CREATE VIEW` / `DROP VIEW`.
+DML is `INSERT` (multi-row, omitted columns take their default), `UPDATE`, and
+`DELETE`. Transaction control is `BEGIN` / `COMMIT` / `ROLLBACK`. `SELECT`
+covers:
 
 - Projections with `AS` aliases, `*`, and arbitrary expressions.
 - `WHERE` over the full expression grammar.
@@ -362,6 +363,9 @@ default), `UPDATE`, and `DELETE`. Transaction control is `BEGIN` / `COMMIT` /
 - `UNION` and `UNION ALL`, with a trailing `ORDER BY` / `LIMIT` over the union.
 - Uncorrelated scalar subqueries `(SELECT ...)`, `expr [NOT] IN (SELECT ...)`,
   and `EXISTS (SELECT ...)`.
+- Derived tables: a subquery as a `FROM` / `JOIN` relation,
+  `(SELECT ...) AS x`, with its columns re-qualified under the alias. A view
+  reference expands to the same machinery over its stored query.
 - `EXPLAIN` of any of the above.
 
 The expression grammar has four column types (`INT`, `FLOAT`, `BOOL`, `TEXT`),
@@ -375,7 +379,7 @@ three-valued NULL handling, the predicates `IN` / `BETWEEN` / `LIKE` /
 ### Scope and deferrals
 
 - The parser is **schema-free**: it enforces grammar only. Semantic checks (INSERT column/value arity, unknown columns, type errors) are the planner's job, since they need the catalog.
-- Correlated subqueries, `EXISTS`, derived tables in `FROM`, `INTERSECT` / `EXCEPT`, window functions, CTEs, and right/full outer joins are deferred. They are additive: each is a new node or expression form on the same parse/bind/plan/execute pipeline the features above already use. The supported (uncorrelated) subqueries are constant-folded before planning; the deferred forms need the outer row in scope, a larger change.
+- Correlated subqueries, `INTERSECT` / `EXCEPT`, window functions, CTEs, and right/full outer joins are deferred. They are additive: each is a new node or expression form on the same parse/bind/plan/execute pipeline the features above already use. The supported (uncorrelated) subqueries and views are constant-folded or expanded to derived tables before planning; correlated subqueries need the outer row in scope, a larger change.
 
 ---
 

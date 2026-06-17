@@ -263,6 +263,49 @@ pub fn load_txn(path: &Path) -> io::Result<(u64, Vec<u64>)> {
     Ok((next_xid, aborted))
 }
 
+/// Persist the views as `(name, sql)` pairs, one per line.
+///
+/// Each line is the view name (a whitespace-free identifier), a space, then
+/// the view's defining query as canonical single-line SQL. Written atomically
+/// (temp file then rename).
+///
+/// # Errors
+///
+/// Returns an I/O error if the file cannot be written or renamed.
+pub fn save_views(path: &Path, views: &[(String, String)]) -> io::Result<()> {
+    let mut out = String::new();
+    for (name, sql) in views {
+        let _ = writeln!(out, "{name} {sql}");
+    }
+    let tmp = path.with_extension("view.tmp");
+    fs::write(&tmp, out.as_bytes())?;
+    fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// Read the views as `(name, sql)` pairs. An absent file yields an empty list.
+///
+/// # Errors
+///
+/// Returns an I/O error if the file exists but cannot be read.
+pub fn load_views(path: &Path) -> io::Result<Vec<(String, String)>> {
+    let text = match fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let mut views = Vec::new();
+    for line in text.lines() {
+        let line = line.trim_end();
+        if line.is_empty() {
+            continue;
+        }
+        let (name, sql) = line.split_once(' ').ok_or_else(invalid)?;
+        views.push((name.to_string(), sql.to_string()));
+    }
+    Ok(views)
+}
+
 fn invalid() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, "malformed catalog metadata")
 }
