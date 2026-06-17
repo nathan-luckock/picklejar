@@ -309,6 +309,7 @@ impl Database {
                 Ok(QueryOutcome::Ddl)
             }
             Statement::DropTable { ref name } => self.drop_table(&stmt, name),
+            Statement::Truncate { ref table } => self.truncate_table(table),
             // EXPLAIN only plans; it touches no data.
             Statement::Explain(_) => self.run_explain(&stmt),
             // DML and SELECT run inside the open transaction, or a fresh
@@ -467,6 +468,31 @@ impl Database {
             defaults,
         };
         self.tables.insert(name.clone(), store);
+        self.persist()?;
+        Ok(QueryOutcome::Ddl)
+    }
+
+    /// Remove every row of `table` by replacing its storage with fresh, empty
+    /// pages and resetting its rowid counter and indexes. The schema (and its
+    /// column defaults) is untouched.
+    fn truncate_table(&mut self, name: &str) -> Result<QueryOutcome> {
+        if self.catalog.get_table(name).is_none() {
+            return Err(DbError::UnknownTable(name.to_string()));
+        }
+        let table = MvccTable::create(&self.pool, self.wal.clone(), &self.mgr)?;
+        let new_index_root = table.index_root();
+        let new_version_page = table.version_page();
+        let store = self
+            .tables
+            .get_mut(name)
+            .ok_or_else(|| DbError::UnknownTable(name.to_string()))?;
+        store.index_root = new_index_root;
+        store.version_page = new_version_page;
+        store.next_rowid = 0;
+        for sec in &mut store.secondary {
+            sec.root = Index::create(&self.pool)?.root();
+        }
+        self.catalog.set_row_count(name, 0)?;
         self.persist()?;
         Ok(QueryOutcome::Ddl)
     }
@@ -2227,6 +2253,25 @@ mod tests {
             "SELECT name FROM emp WHERE NOT EXISTS (SELECT 1 FROM dept WHERE region = 'north') ORDER BY name LIMIT 1",
         );
         assert_eq!(name_set(&empty_ok), vec!["a"]);
+    }
+
+    // --- TRUNCATE ---
+
+    #[test]
+    fn truncate_empties_table_but_keeps_schema() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT DEFAULT 'x')")
+            .unwrap();
+        db.execute("INSERT INTO t (id, name) VALUES (1, 'a'), (2, 'b')")
+            .unwrap();
+        db.execute("TRUNCATE TABLE t").unwrap();
+        let (_c, empty) = query(&mut db, "SELECT id FROM t");
+        assert!(empty.is_empty());
+        // The schema (and its default) survives; inserts work again, and the
+        // unique PK index was reset (reusing id 1 is fine).
+        db.execute("INSERT INTO t (id) VALUES (1)").unwrap();
+        let (_c, rows) = query(&mut db, "SELECT id, name FROM t");
+        assert_eq!(rows, vec![vec![Value::Int(1), Value::Text("x".into())]]);
     }
 
     // --- DEFAULT column values ---

@@ -296,6 +296,11 @@ pub enum Statement {
     },
     /// `EXPLAIN <statement>`: plan the inner statement instead of running it.
     Explain(Box<Self>),
+    /// `TRUNCATE TABLE t`: remove all rows from `t`.
+    Truncate {
+        /// Target table.
+        table: String,
+    },
     /// `BEGIN`: start an explicit transaction.
     Begin,
     /// `COMMIT`: commit the current transaction.
@@ -403,6 +408,7 @@ impl fmt::Display for Statement {
                 Ok(())
             }
             Self::Explain(inner) => write!(f, "EXPLAIN {inner}"),
+            Self::Truncate { table } => write!(f, "TRUNCATE TABLE {table}"),
             Self::Begin => f.write_str("BEGIN"),
             Self::Commit => f.write_str("COMMIT"),
             Self::Rollback => f.write_str("ROLLBACK"),
@@ -443,6 +449,12 @@ impl Parser {
         let stmt = match self.peek() {
             TokenKind::Keyword(Keyword::Create) => self.parse_create()?,
             TokenKind::Keyword(Keyword::Drop) => self.parse_drop()?,
+            TokenKind::Keyword(Keyword::Truncate) => {
+                self.advance();
+                self.eat_keyword(Keyword::Table); // optional TABLE keyword
+                let table = self.parse_ident()?;
+                Statement::Truncate { table }
+            }
             TokenKind::Keyword(Keyword::Select) => self.parse_query()?,
             TokenKind::Keyword(Keyword::Insert) => self.parse_insert()?,
             TokenKind::Keyword(Keyword::Update) => self.parse_update()?,
