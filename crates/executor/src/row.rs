@@ -35,6 +35,7 @@ const fn value_type_name(v: &Value) -> &'static str {
         Value::Date(_) => "DATE",
         Value::Timestamp(_) => "TIMESTAMP",
         Value::Json(_) => "JSON",
+        Value::Decimal(..) => "DECIMAL",
         Value::Null => "NULL",
     }
 }
@@ -49,6 +50,7 @@ const fn data_type_name(t: DataType) -> &'static str {
         DataType::Date => "DATE",
         DataType::Timestamp => "TIMESTAMP",
         DataType::Json => "JSON",
+        DataType::Decimal => "DECIMAL",
     }
 }
 
@@ -78,6 +80,11 @@ pub fn encode_row(values: &[Value], schema: &[DataType]) -> Result<Vec<u8>> {
             Value::Date(n) if ty == DataType::Date => bytes.extend_from_slice(&n.to_le_bytes()),
             Value::Timestamp(n) if ty == DataType::Timestamp => {
                 bytes.extend_from_slice(&n.to_le_bytes());
+            }
+            // DECIMAL stores a little-endian i128 mantissa then a u32 scale.
+            Value::Decimal(m, scale) if ty == DataType::Decimal => {
+                bytes.extend_from_slice(&m.to_le_bytes());
+                bytes.extend_from_slice(&scale.to_le_bytes());
             }
             // TEXT and JSON share the length-prefixed UTF-8 byte form.
             Value::Text(s) if ty == DataType::Text => {
@@ -152,6 +159,18 @@ pub fn decode_row(bytes: &[u8], schema: &[DataType]) -> Result<Vec<Value>> {
                     Value::Timestamp(n)
                 });
                 rest = &rest[8..];
+            }
+            DataType::Decimal => {
+                let m_bytes = rest
+                    .get(..16)
+                    .ok_or(ExecError::RowTruncated { column: i })?;
+                let mantissa = i128::from_le_bytes(m_bytes.try_into().expect("checked 16 bytes"));
+                let s_bytes = rest
+                    .get(16..20)
+                    .ok_or(ExecError::RowTruncated { column: i })?;
+                let scale = u32::from_le_bytes(s_bytes.try_into().expect("checked 4 bytes"));
+                out.push(Value::Decimal(mantissa, scale));
+                rest = &rest[20..];
             }
             DataType::Text | DataType::Json => {
                 let len_bytes = rest.get(..4).ok_or(ExecError::RowTruncated { column: i })?;

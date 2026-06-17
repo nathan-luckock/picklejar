@@ -206,6 +206,8 @@ pub enum DataType {
     Timestamp,
     /// A JSON document, stored as validated text.
     Json,
+    /// An exact decimal / numeric (free scale).
+    Decimal,
 }
 
 impl fmt::Display for DataType {
@@ -218,6 +220,7 @@ impl fmt::Display for DataType {
             Self::Date => "DATE",
             Self::Timestamp => "TIMESTAMP",
             Self::Json => "JSON",
+            Self::Decimal => "DECIMAL",
         })
     }
 }
@@ -1952,6 +1955,18 @@ mod tests {
                 to: "b".into(),
             }
         );
+    }
+
+    #[test]
+    fn decimal_type_and_literal_round_trip() {
+        round_trip("CREATE TABLE t (price DECIMAL)");
+        // The (precision, scale) is accepted and dropped, printing back as DECIMAL.
+        assert_eq!(
+            parse("CREATE TABLE t (price DECIMAL(10, 2))").to_string(),
+            "CREATE TABLE t (price DECIMAL)"
+        );
+        round_trip("SELECT (amount + DECIMAL '0.20') FROM t");
+        round_trip("SELECT (n)::decimal FROM t");
     }
 
     #[test]

@@ -64,6 +64,12 @@ The complete engine and SQL surface. For the *why* behind each decision, see
   `->` (returns JSON) and `->>` (returns text) access operators, navigating by
   a text member name or an integer array index, and chainable
   (`body -> 'a' ->> 0`). The JSON parser is in-tree (no external crate).
+- **Decimal** — a `DECIMAL` / `NUMERIC` column with exact base-10 arithmetic
+  (`0.1 + 0.2` is `0.3`, not a binary-float approximation), `DECIMAL '12.34'`
+  literals, and exact `SUM` / `AVG`. Stored as an `i128` mantissa plus a scale,
+  so it compares and `ORDER BY`s as a number; the `(precision, scale)` in a
+  type is accepted and each value keeps its own scale. The arithmetic is
+  in-tree (no external bignum).
 - **Casts** — `CAST(expr AS type)` and the `expr::type` shorthand, converting
   between `INT` / `FLOAT` / `BOOL` / `TEXT` / `DATE` / `TIMESTAMP` / `JSON`
   (text is parsed, a float rounds to an int, any value renders to text, a

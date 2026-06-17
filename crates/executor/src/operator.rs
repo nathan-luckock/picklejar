@@ -271,6 +271,9 @@ fn sort_cmp(a: &Value, b: &Value) -> Ordering {
         (Value::Float(x), Value::Int(y)) => x.total_cmp(&(*y as f64)),
         (Value::Text(x), Value::Text(y)) => x.cmp(y),
         (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
+        (Value::Decimal(am, asc), Value::Decimal(bm, bsc)) => {
+            picklejar_sql::decimal::compare(*am, *asc, *bm, *bsc)
+        }
         _ => Ordering::Equal,
     }
 }
@@ -782,6 +785,10 @@ struct Acc {
     fsum: f64,
     /// Whether any summed value was a float (selects the SUM/AVG result type).
     saw_float: bool,
+    /// Running exact decimal sum, used when the summed column is DECIMAL.
+    dsum: (i128, u32),
+    /// Whether any summed value was a decimal.
+    saw_decimal: bool,
     num: u64,
     /// Running min / max of non-null values.
     min: Option<Value>,
@@ -852,6 +859,13 @@ fn update_acc(acc: &mut Acc, spec: &AggSpec, row: &[Value], cols: &[String]) -> 
             acc.saw_float = true;
             acc.num += 1;
         }
+        Value::Decimal(m, s) => {
+            let (am, asc) = acc.dsum;
+            acc.dsum = picklejar_sql::decimal::add(am, asc, *m, *s)
+                .ok_or_else(|| ExecError::Type("decimal SUM overflow".into()))?;
+            acc.saw_decimal = true;
+            acc.num += 1;
+        }
         _ => {}
     }
     acc.min = Some(match acc.min.take() {
@@ -873,6 +887,8 @@ fn finalize_acc(acc: &Acc, spec: &AggSpec) -> Value {
         AggFunc::Sum => {
             if acc.num == 0 {
                 Value::Null
+            } else if acc.saw_decimal {
+                Value::Decimal(acc.dsum.0, acc.dsum.1)
             } else if acc.saw_float {
                 Value::Float(acc.fsum)
             } else {
@@ -882,6 +898,12 @@ fn finalize_acc(acc: &Acc, spec: &AggSpec) -> Value {
         AggFunc::Avg => {
             if acc.num == 0 {
                 Value::Null
+            } else if acc.saw_decimal {
+                // Exact decimal sum divided by the count (a scale-0 decimal).
+                let count = i128::from(acc.num).max(1);
+                let (m, s) =
+                    picklejar_sql::decimal::div(acc.dsum.0, acc.dsum.1, count, 0).unwrap_or((0, 0));
+                Value::Decimal(m, s)
             } else if acc.saw_float {
                 #[allow(clippy::cast_precision_loss)]
                 Value::Float(acc.fsum / acc.num as f64)
@@ -930,6 +952,13 @@ fn group_key_bytes(values: &[Value]) -> Vec<u8> {
             Value::Json(s) => {
                 b.push(7);
                 b.extend_from_slice(s.as_bytes());
+            }
+            Value::Decimal(m, s) => {
+                // Normalize so equal values (12.30 and 12.3) hash the same.
+                let (nm, ns) = picklejar_sql::decimal::normalize(*m, *s);
+                b.push(8);
+                b.extend_from_slice(&nm.to_le_bytes());
+                b.extend_from_slice(&ns.to_le_bytes());
             }
         }
     }

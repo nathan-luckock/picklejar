@@ -49,6 +49,7 @@ const fn type_tag(t: DataType) -> &'static str {
         DataType::Date => "DATE",
         DataType::Timestamp => "TIMESTAMP",
         DataType::Json => "JSON",
+        DataType::Decimal => "DECIMAL",
     }
 }
 
@@ -61,6 +62,7 @@ fn parse_type(s: &str) -> Option<DataType> {
         "DATE" => Some(DataType::Date),
         "TIMESTAMP" => Some(DataType::Timestamp),
         "JSON" => Some(DataType::Json),
+        "DECIMAL" => Some(DataType::Decimal),
         _ => None,
     }
 }
@@ -76,6 +78,7 @@ fn encode_default(default: Option<&Value>) -> String {
         Some(Value::Bool(b)) => format!("B{}", u8::from(*b)),
         Some(Value::Date(n)) => format!("d{n}"),
         Some(Value::Timestamp(n)) => format!("t{n}"),
+        Some(Value::Decimal(m, scale)) => format!("D{m}v{scale}"),
         Some(Value::Text(s) | Value::Json(s)) => {
             // Text and JSON share the hex form; the leading tag records which.
             let tag = if matches!(default, Some(Value::Json(_))) {
@@ -105,6 +108,13 @@ fn decode_default(tok: &str) -> io::Result<Option<Value>> {
         'B' => Value::Bool(rest == "1"),
         'd' => Value::Date(rest.parse().map_err(|_| invalid())?),
         't' => Value::Timestamp(rest.parse().map_err(|_| invalid())?),
+        'D' => {
+            let (m, scale) = rest.split_once('v').ok_or_else(invalid)?;
+            Value::Decimal(
+                m.parse().map_err(|_| invalid())?,
+                scale.parse().map_err(|_| invalid())?,
+            )
+        }
         's' | 'j' => {
             if rest.len() % 2 != 0 {
                 return Err(invalid());

@@ -501,7 +501,7 @@ fn json_get(left: &Value, right: &Value, as_text: bool) -> Result<Value> {
 /// parse as the target type.
 #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 pub fn cast(v: &Value, ty: DataType) -> Result<Value> {
-    use picklejar_sql::datetime;
+    use picklejar_sql::{datetime, decimal};
     if matches!(v, Value::Null) {
         return Ok(Value::Null);
     }
@@ -514,12 +514,16 @@ pub fn cast(v: &Value, ty: DataType) -> Result<Value> {
             Value::Float(x) => Value::Int(x.round() as i64),
             Value::Bool(b) => Value::Int(i64::from(*b)),
             Value::Text(s) => Value::Int(s.trim().parse().map_err(|_| parse_fail("integer", s))?),
+            Value::Decimal(m, sc) => Value::Int(
+                decimal::to_i64(*m, *sc).ok_or_else(|| parse_fail("integer", "decimal"))?,
+            ),
             _ => return Err(bad()),
         },
         DataType::Float => match v {
             Value::Float(x) => Value::Float(*x),
             Value::Int(n) => Value::Float(*n as f64),
             Value::Text(s) => Value::Float(s.trim().parse().map_err(|_| parse_fail("float", s))?),
+            Value::Decimal(m, sc) => Value::Float(decimal::to_f64(*m, *sc)),
             _ => return Err(bad()),
         },
         DataType::Bool => match v {
@@ -557,6 +561,24 @@ pub fn cast(v: &Value, ty: DataType) -> Result<Value> {
             Value::Text(s) => return Err(parse_fail("json", s)),
             _ => return Err(bad()),
         },
+        DataType::Decimal => match v {
+            Value::Decimal(m, sc) => Value::Decimal(*m, *sc),
+            Value::Int(n) => {
+                let (m, sc) = decimal::from_i64(*n);
+                Value::Decimal(m, sc)
+            }
+            // Text is exact; a float goes through its shortest decimal text.
+            Value::Text(s) => {
+                let (m, sc) = decimal::parse(s.trim()).ok_or_else(|| parse_fail("decimal", s))?;
+                Value::Decimal(m, sc)
+            }
+            Value::Float(x) => {
+                let text = x.to_string();
+                let (m, sc) = decimal::parse(&text).ok_or_else(|| parse_fail("decimal", &text))?;
+                Value::Decimal(m, sc)
+            }
+            _ => return Err(bad()),
+        },
     };
     Ok(out)
 }
@@ -571,6 +593,7 @@ fn value_text(v: &Value) -> String {
         Value::Date(days) => picklejar_sql::datetime::format_date(*days),
         Value::Timestamp(micros) => picklejar_sql::datetime::format_timestamp(*micros),
         Value::Json(s) => s.clone(),
+        Value::Decimal(m, s) => picklejar_sql::decimal::format(*m, *s),
         Value::Null => String::new(),
     }
 }
@@ -689,6 +712,29 @@ fn compare(l: &Value, r: &Value) -> Result<Ordering> {
         (Value::Float(a), Value::Int(b)) => Ok(a.total_cmp(&(*b as f64))),
         (Value::Text(a), Value::Text(b)) => Ok(a.cmp(b)),
         (Value::Bool(a), Value::Bool(b)) => Ok(a.cmp(b)),
+        // Decimal compares exactly with decimal or int; a float operand drops to
+        // float comparison.
+        (Value::Decimal(am, asc), Value::Decimal(bm, bsc)) => {
+            Ok(picklejar_sql::decimal::compare(*am, *asc, *bm, *bsc))
+        }
+        (Value::Decimal(am, asc), Value::Int(n)) => Ok(picklejar_sql::decimal::compare(
+            *am,
+            *asc,
+            i128::from(*n),
+            0,
+        )),
+        (Value::Int(n), Value::Decimal(bm, bsc)) => Ok(picklejar_sql::decimal::compare(
+            i128::from(*n),
+            0,
+            *bm,
+            *bsc,
+        )),
+        (Value::Decimal(am, asc), Value::Float(x)) => {
+            Ok(picklejar_sql::decimal::to_f64(*am, *asc).total_cmp(x))
+        }
+        (Value::Float(x), Value::Decimal(bm, bsc)) => {
+            Ok(x.total_cmp(&picklejar_sql::decimal::to_f64(*bm, *bsc)))
+        }
         _ => Err(ExecError::Type(format!("cannot compare {l:?} with {r:?}"))),
     }
 }
@@ -699,6 +745,7 @@ fn numeric(v: &Value) -> Result<f64> {
     match v {
         Value::Int(n) => Ok(*n as f64),
         Value::Float(x) => Ok(*x),
+        Value::Decimal(m, s) => Ok(picklejar_sql::decimal::to_f64(*m, *s)),
         _ => Err(ExecError::Type(format!(
             "arithmetic needs a number, found {v:?}"
         ))),
@@ -722,6 +769,29 @@ fn arithmetic(op: BinOp, l: &Value, r: &Value) -> Result<Value> {
             _ => unreachable!("only arithmetic ops reach here"),
         };
         return Ok(Value::Int(out));
+    }
+    // Exact decimal arithmetic when both operands are decimal or integer (no
+    // float in play). A float operand falls through to float promotion below.
+    let is_dec_or_int = |v: &Value| matches!(v, Value::Int(_) | Value::Decimal(..));
+    let has_decimal = matches!(l, Value::Decimal(..)) || matches!(r, Value::Decimal(..));
+    if has_decimal && is_dec_or_int(l) && is_dec_or_int(r) {
+        use picklejar_sql::decimal;
+        let to_dec = |v: &Value| match v {
+            Value::Decimal(m, s) => (*m, *s),
+            Value::Int(n) => decimal::from_i64(*n),
+            _ => unreachable!("guarded to int or decimal"),
+        };
+        let ((am, asc), (bm, bsc)) = (to_dec(l), to_dec(r));
+        let res = match op {
+            BinOp::Add => decimal::add(am, asc, bm, bsc),
+            BinOp::Sub => decimal::sub(am, asc, bm, bsc),
+            BinOp::Mul => decimal::mul(am, asc, bm, bsc),
+            BinOp::Div => decimal::div(am, asc, bm, bsc),
+            _ => unreachable!("only arithmetic ops reach here"),
+        };
+        let (m, s) =
+            res.ok_or_else(|| ExecError::Type("decimal overflow or division by zero".into()))?;
+        return Ok(Value::Decimal(m, s));
     }
     let a = numeric(l)?;
     let b = numeric(r)?;

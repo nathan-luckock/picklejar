@@ -405,6 +405,8 @@ fn canon_picklejar(v: &Value) -> String {
         Value::Text(s) | Value::Json(s) => format!("t{s}"),
         Value::Bool(b) => format!("i{}", i64::from(*b)),
         Value::Float(x) => canon_float(*x),
+        // No DECIMAL columns are generated; canonicalize as a float for safety.
+        Value::Decimal(m, s) => canon_float(picklejar::decimal::to_f64(*m, *s)),
     }
 }
 
