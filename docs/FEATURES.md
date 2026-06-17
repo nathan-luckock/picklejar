@@ -54,7 +54,11 @@ The complete engine and SQL surface. For the *why* behind each decision, see
   database when run on an empty one. This is rustdb's `pg_dump`.
 - **Expressions** — `INT` / `FLOAT` / `BOOL` / `TEXT`, arithmetic with
   int-to-float promotion, `IN` / `BETWEEN` / `LIKE` / `IS NULL`, `CASE`, string
-  `||`, and a library of scalar functions.
+  `||`, and a library of scalar functions: string (`LENGTH`, `UPPER` / `LOWER`,
+  `INITCAP`, `TRIM` / `LTRIM` / `RTRIM`, `SUBSTR`, `RIGHT`, `REPEAT`, `REVERSE`,
+  `REPLACE`, `STRPOS` / `POSITION`, `CONCAT`), numeric (`ABS`, `SIGN`, `MOD`,
+  `ROUND`, `TRUNC`, `FLOOR`, `CEIL`, `POWER`, `SQRT`, `EXP`, `LN`, `LOG`), and
+  conditional (`COALESCE`, `NULLIF`, `GREATEST`, `LEAST`).
 - **Transactions** — `BEGIN` / `COMMIT` / `ROLLBACK` over MVCC snapshots;
   auto-commit otherwise.
 - **`EXPLAIN`** — the cost-annotated physical plan, showing the planner's scan

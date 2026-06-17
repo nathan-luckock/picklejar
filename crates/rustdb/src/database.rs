@@ -6513,4 +6513,53 @@ mod tests {
         let (_c, nulls) = query(&mut db, "SELECT SUBSTR(s, 1, 2) FROM t WHERE n = 1");
         assert_eq!(nulls, vec![vec![Value::Null]]);
     }
+
+    #[test]
+    fn more_string_and_numeric_functions() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE t (s TEXT, n INT)").unwrap();
+        db.execute("INSERT INTO t VALUES ('hello world', -4)")
+            .unwrap();
+        let (_c, rows) = query(
+            &mut db,
+            "SELECT RIGHT(s, 5), REVERSE(s), REPEAT('ab', 3), INITCAP(s), STRPOS(s, 'world'), \
+             SIGN(n), TRUNC(3.78), TRUNC(3.789, 1) FROM t",
+        );
+        assert_eq!(
+            rows[0],
+            vec![
+                Value::Text("world".into()),
+                Value::Text("dlrow olleh".into()),
+                Value::Text("ababab".into()),
+                Value::Text("Hello World".into()),
+                Value::Int(7),
+                Value::Int(-1),
+                Value::Float(3.0),
+                Value::Float(3.7),
+            ]
+        );
+    }
+
+    #[test]
+    fn greatest_and_least_skip_nulls() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE t (a INT, b INT, c INT)").unwrap();
+        db.execute("INSERT INTO t VALUES (3, 7, 1), (5, NULL, 2)")
+            .unwrap();
+        let (_c, rows) = query(
+            &mut db,
+            "SELECT GREATEST(a, b, c), LEAST(a, b, c) FROM t ORDER BY a",
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Int(7), Value::Int(1)],
+                // The NULL b is ignored, not propagated.
+                vec![Value::Int(5), Value::Int(2)],
+            ]
+        );
+        // All-NULL is NULL.
+        let (_c, n) = query(&mut db, "SELECT GREATEST(NULL, NULL) FROM t WHERE a = 3");
+        assert_eq!(n, vec![vec![Value::Null]]);
+    }
 }

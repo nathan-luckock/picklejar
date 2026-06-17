@@ -158,7 +158,9 @@ fn eval_scalar_func(
         }
         "LENGTH" | "UPPER" | "LOWER" | "ABS" | "ROUND" | "CONCAT" | "NULLIF" | "SUBSTR"
         | "SUBSTRING" | "TRIM" | "LTRIM" | "RTRIM" | "REPLACE" | "MOD" | "POWER" | "POW"
-        | "SQRT" | "FLOOR" | "CEIL" | "CEILING" => {
+        | "SQRT" | "FLOOR" | "CEIL" | "CEILING" | "RIGHT" | "REPEAT" | "REVERSE" | "INITCAP"
+        | "STRPOS" | "POSITION" | "SIGN" | "TRUNC" | "TRUNCATE" | "EXP" | "LN" | "LOG"
+        | "GREATEST" | "LEAST" => {
             let vals = args
                 .iter()
                 .map(|a| eval_with(a, row, columns, runner))
@@ -176,9 +178,12 @@ fn eval_scalar_func(
     clippy::cast_sign_loss
 )]
 fn apply_scalar(name: &str, vals: &[Value]) -> Result<Value> {
-    // NULL propagates through the value functions; CONCAT skips NULLs and
-    // NULLIF compares them, so they opt out of the blanket rule.
-    if !matches!(name, "CONCAT" | "NULLIF") && vals.iter().any(|v| matches!(v, Value::Null)) {
+    // NULL propagates through the value functions; CONCAT skips NULLs, NULLIF
+    // compares them, and GREATEST / LEAST ignore them, so those opt out of the
+    // blanket rule.
+    if !matches!(name, "CONCAT" | "NULLIF" | "GREATEST" | "LEAST")
+        && vals.iter().any(|v| matches!(v, Value::Null))
+    {
         return Ok(Value::Null);
     }
     let bad = || ExecError::Type(format!("{name} applied to wrong argument types"));
@@ -213,8 +218,10 @@ fn apply_scalar(name: &str, vals: &[Value]) -> Result<Value> {
         }
         ("POWER" | "POW", [a, b]) => Value::Float(numeric(a)?.powf(numeric(b)?)),
         ("SQRT", [a]) => Value::Float(numeric(a)?.sqrt()),
-        // Integer floor / ceil / round (no fractional part) are no-ops.
-        ("FLOOR" | "CEIL" | "CEILING" | "ROUND", [Value::Int(n)]) => Value::Int(*n),
+        // Integer floor / ceil / round / trunc (no fractional part) are no-ops.
+        ("FLOOR" | "CEIL" | "CEILING" | "ROUND" | "TRUNC" | "TRUNCATE", [Value::Int(n)]) => {
+            Value::Int(*n)
+        }
         ("FLOOR", [Value::Float(x)]) => Value::Float(x.floor()),
         ("CEIL" | "CEILING", [Value::Float(x)]) => Value::Float(x.ceil()),
         ("ROUND", [Value::Float(x)]) => Value::Float(x.round()),
@@ -230,9 +237,76 @@ fn apply_scalar(name: &str, vals: &[Value]) -> Result<Value> {
             }
         }
         ("CONCAT", parts) => Value::Text(parts.iter().map(value_text).collect()),
+        ("RIGHT", [Value::Text(s), Value::Int(n)]) => {
+            let count = s.chars().count();
+            let take = (*n).max(0) as usize;
+            let skip = count.saturating_sub(take);
+            Value::Text(s.chars().skip(skip).collect())
+        }
+        ("REPEAT", [Value::Text(s), Value::Int(n)]) => Value::Text(s.repeat((*n).max(0) as usize)),
+        ("REVERSE", [Value::Text(s)]) => Value::Text(s.chars().rev().collect()),
+        ("INITCAP", [Value::Text(s)]) => Value::Text(initcap(s)),
+        // 1-based index of the first occurrence of the substring, or 0.
+        ("STRPOS" | "POSITION", [Value::Text(s), Value::Text(sub)]) => {
+            let pos = s
+                .find(sub.as_str())
+                .map_or(0, |byte| s[..byte].chars().count() + 1);
+            Value::Int(i64::try_from(pos).unwrap_or(i64::MAX))
+        }
+        ("SIGN", [Value::Int(n)]) => Value::Int(n.signum()),
+        ("SIGN", [Value::Float(x)]) => Value::Float(if *x == 0.0 { 0.0 } else { x.signum() }),
+        ("TRUNC" | "TRUNCATE", [Value::Float(x)]) => Value::Float(x.trunc()),
+        ("TRUNC" | "TRUNCATE", [Value::Float(x), Value::Int(d)]) => {
+            let f = 10f64.powi(i32::try_from(*d).unwrap_or(0));
+            Value::Float((x * f).trunc() / f)
+        }
+        ("EXP", [a]) => Value::Float(numeric(a)?.exp()),
+        ("LN", [a]) => Value::Float(numeric(a)?.ln()),
+        ("LOG", [a]) => Value::Float(numeric(a)?.log10()),
+        ("LOG", [base, a]) => Value::Float(numeric(a)?.log(numeric(base)?)),
+        // GREATEST / LEAST ignore NULLs and return NULL only if all are NULL.
+        ("GREATEST" | "LEAST", parts) => greatest_least(name == "GREATEST", parts)?,
         _ => return Err(bad()),
     };
     Ok(v)
+}
+
+/// `GREATEST` (when `want_greatest`) or `LEAST` over `vals`, ignoring NULLs and
+/// returning NULL only when every argument is NULL.
+fn greatest_least(want_greatest: bool, vals: &[Value]) -> Result<Value> {
+    let mut best: Option<&Value> = None;
+    for v in vals.iter().filter(|v| !matches!(v, Value::Null)) {
+        let take = match best {
+            None => true,
+            Some(cur) => {
+                let ord = compare(v, cur)?;
+                (want_greatest && ord == Ordering::Greater)
+                    || (!want_greatest && ord == Ordering::Less)
+            }
+        };
+        if take {
+            best = Some(v);
+        }
+    }
+    Ok(best.cloned().unwrap_or(Value::Null))
+}
+
+/// Title-case each whitespace-separated word: first letter upper, rest lower.
+fn initcap(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut start_of_word = true;
+    for ch in s.chars() {
+        if ch.is_whitespace() {
+            start_of_word = true;
+            out.push(ch);
+        } else if start_of_word {
+            out.extend(ch.to_uppercase());
+            start_of_word = false;
+        } else {
+            out.extend(ch.to_lowercase());
+        }
+    }
+    out
 }
 
 /// Resolve a (possibly qualified) column name to its value in `row`.
