@@ -402,8 +402,12 @@ pub enum Statement {
         table: String,
         /// Column list.
         columns: Vec<String>,
-        /// One or more value rows; each row has one expression per column.
+        /// `VALUES` rows; each row has one expression per column. Empty when the
+        /// row source is a query (`source`).
         rows: Vec<Vec<Expr>>,
+        /// `INSERT ... SELECT`: the query whose rows are inserted (None for a
+        /// `VALUES` insert).
+        source: Option<Box<Self>>,
         /// `ON CONFLICT ...` clause (None if absent).
         on_conflict: Option<OnConflict>,
         /// `RETURNING` projection over the inserted rows (empty if absent).
@@ -652,6 +656,7 @@ impl fmt::Display for Statement {
                 table,
                 columns,
                 rows,
+                source,
                 on_conflict,
                 returning,
             } => {
@@ -666,19 +671,23 @@ impl fmt::Display for Statement {
                     }
                     f.write_str(")")?;
                 }
-                f.write_str(" VALUES ")?;
-                for (ri, row) in rows.iter().enumerate() {
-                    if ri > 0 {
-                        f.write_str(", ")?;
-                    }
-                    f.write_str("(")?;
-                    for (i, v) in row.iter().enumerate() {
-                        if i > 0 {
+                if let Some(query) = source {
+                    write!(f, " {query}")?;
+                } else {
+                    f.write_str(" VALUES ")?;
+                    for (ri, row) in rows.iter().enumerate() {
+                        if ri > 0 {
                             f.write_str(", ")?;
                         }
-                        write!(f, "{v}")?;
+                        f.write_str("(")?;
+                        for (i, v) in row.iter().enumerate() {
+                            if i > 0 {
+                                f.write_str(", ")?;
+                            }
+                            write!(f, "{v}")?;
+                        }
+                        f.write_str(")")?;
                     }
-                    f.write_str(")")?;
                 }
                 write_on_conflict(f, on_conflict.as_ref())?;
                 write_returning(f, returning)
@@ -1465,22 +1474,35 @@ impl Parser {
         } else {
             Vec::new()
         };
-        self.expect_keyword(Keyword::Values)?;
+        // The row source is either `VALUES (...), ...` or a query
+        // (`INSERT INTO t SELECT ...` / `WITH ...`).
         let mut rows = Vec::new();
-        loop {
-            self.expect(&TokenKind::LParen)?;
-            let mut row = Vec::new();
+        let mut source = None;
+        if self.eat_keyword(Keyword::Values) {
             loop {
-                row.push(self.parse_expr()?);
+                self.expect(&TokenKind::LParen)?;
+                let mut row = Vec::new();
+                loop {
+                    row.push(self.parse_expr()?);
+                    if !self.eat(&TokenKind::Comma) {
+                        break;
+                    }
+                }
+                self.expect(&TokenKind::RParen)?;
+                rows.push(row);
                 if !self.eat(&TokenKind::Comma) {
                     break;
                 }
             }
-            self.expect(&TokenKind::RParen)?;
-            rows.push(row);
-            if !self.eat(&TokenKind::Comma) {
-                break;
-            }
+        } else if matches!(self.peek(), TokenKind::Keyword(Keyword::With)) {
+            source = Some(Box::new(self.parse_with()?));
+        } else if matches!(self.peek(), TokenKind::Keyword(Keyword::Select)) {
+            source = Some(Box::new(self.parse_query()?));
+        } else {
+            return Err(SqlError::parse(
+                "expected VALUES or a SELECT after INSERT INTO".to_string(),
+                self.span(),
+            ));
         }
         let on_conflict = self.parse_on_conflict()?;
         let returning = self.parse_returning()?;
@@ -1488,6 +1510,7 @@ impl Parser {
             table,
             columns,
             rows,
+            source,
             on_conflict,
             returning,
         })
@@ -1617,6 +1640,7 @@ impl Statement {
                 table,
                 columns,
                 rows,
+                source,
                 on_conflict,
                 returning,
             } => Self::Insert {
@@ -1626,6 +1650,9 @@ impl Statement {
                     .iter()
                     .map(|r| r.iter().map(|e| e.substitute_params(params)).collect())
                     .collect(),
+                source: source
+                    .as_ref()
+                    .map(|q| Box::new(q.substitute_params(params))),
                 on_conflict: on_conflict.as_ref().map(|oc| oc.substitute_params(params)),
                 returning: returning.clone(),
             },
@@ -2196,6 +2223,7 @@ mod tests {
                     Expr::Literal(crate::ast::Value::Int(1)),
                     Expr::Literal(crate::ast::Value::Text("x".into())),
                 ]],
+                source: None,
                 on_conflict: None,
                 returning: vec![],
             }
@@ -2209,6 +2237,20 @@ mod tests {
             panic!("wrong variant");
         };
         assert_eq!(rows.len(), 3);
+    }
+
+    #[test]
+    fn insert_select_round_trips() {
+        round_trip("INSERT INTO t SELECT a FROM u");
+        round_trip("INSERT INTO t (a, b) SELECT x, y FROM u WHERE (z > 0)");
+        round_trip("INSERT INTO t SELECT a FROM u RETURNING a");
+        assert!(matches!(
+            parse("INSERT INTO t SELECT a FROM u"),
+            Statement::Insert {
+                source: Some(_),
+                ..
+            }
+        ));
     }
 
     #[test]

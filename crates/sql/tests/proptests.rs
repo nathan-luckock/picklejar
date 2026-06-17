@@ -187,6 +187,7 @@ fn statement() -> impl Strategy<Value = Statement> {
                 table,
                 columns,
                 rows,
+                source: None,
                 on_conflict: None,
                 returning: vec![],
             }),

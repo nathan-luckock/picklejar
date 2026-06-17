@@ -598,9 +598,16 @@ impl Database {
                 table,
                 columns,
                 rows,
+                source,
                 on_conflict,
                 returning,
-            } => self.insert(txn, table, columns, rows, on_conflict.as_ref(), returning),
+            } => match source {
+                // `INSERT ... SELECT`: run the query, then insert its rows.
+                Some(query) => {
+                    self.insert_select(txn, table, columns, query, on_conflict.as_ref(), returning)
+                }
+                None => self.insert(txn, table, columns, rows, on_conflict.as_ref(), returning),
+            },
             Statement::Update {
                 table,
                 assignments,
@@ -1497,6 +1504,30 @@ impl Database {
         }
         self.save_views()?;
         Ok(QueryOutcome::Ddl)
+    }
+
+    /// `INSERT INTO t [(cols)] <query>`: run the query, then insert its result
+    /// rows through the normal insert path (so constraints, defaults, serials,
+    /// and `ON CONFLICT` all apply). The query's column count must match the
+    /// insert target's.
+    fn insert_select(
+        &mut self,
+        txn: &Transaction,
+        table: &str,
+        columns: &[String],
+        query: &Statement,
+        on_conflict: Option<&OnConflict>,
+        returning: &[SelectItem],
+    ) -> Result<QueryOutcome> {
+        let (_cols, rows) = self.run_query_collect(txn, query)?;
+        let exprs: Vec<Vec<Expr>> = rows
+            .iter()
+            .map(|row| row.iter().map(|v| Expr::Literal(v.clone())).collect())
+            .collect();
+        if exprs.is_empty() {
+            return Ok(QueryOutcome::Mutation { affected: 0 });
+        }
+        self.insert(txn, table, columns, &exprs, on_conflict, returning)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -4617,6 +4648,50 @@ mod tests {
         let mut db = Database::open(&path).expect("reopen");
         let (_c, rows) = query(&mut db, "SELECT id FROM mirror ORDER BY id");
         assert_eq!(rows, vec![vec![Value::Int(7)], vec![Value::Int(8)]]);
+    }
+
+    // --- INSERT ... SELECT ---
+
+    #[test]
+    fn insert_select_copies_rows() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE src (id INT, n INT)").unwrap();
+        db.execute("CREATE TABLE dst (id INT, n INT)").unwrap();
+        db.execute("INSERT INTO src VALUES (1, 10), (2, 20), (3, 30)")
+            .unwrap();
+        let out = db
+            .execute("INSERT INTO dst SELECT id, n FROM src WHERE n >= 20")
+            .unwrap();
+        assert_eq!(out, QueryOutcome::Mutation { affected: 2 });
+        let (_c, rows) = query(&mut db, "SELECT id, n FROM dst ORDER BY id");
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Int(2), Value::Int(20)],
+                vec![Value::Int(3), Value::Int(30)],
+            ]
+        );
+    }
+
+    #[test]
+    fn insert_select_respects_named_columns_and_constraints() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE src (a INT, b INT)").unwrap();
+        db.execute("CREATE TABLE dst (id INT PRIMARY KEY, n INT)")
+            .unwrap();
+        db.execute("INSERT INTO src VALUES (1, 100), (1, 200)")
+            .unwrap();
+        // Two rows map a=1 onto the primary key: the duplicate is rejected and
+        // nothing is written.
+        assert!(db
+            .execute("INSERT INTO dst (id, n) SELECT a, b FROM src")
+            .is_err());
+        assert_eq!(query(&mut db, "SELECT id FROM dst").1.len(), 0);
+        // Distinct keys (a + b) go in fine, into the named columns.
+        db.execute("INSERT INTO dst (id, n) SELECT a + b, b FROM src")
+            .unwrap();
+        let (_c, rows) = query(&mut db, "SELECT id FROM dst ORDER BY id");
+        assert_eq!(rows, vec![vec![Value::Int(101)], vec![Value::Int(201)]]);
     }
 
     // --- COPY (CSV import/export) ---

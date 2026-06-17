@@ -17,8 +17,9 @@ The complete engine and SQL surface. For the *why* behind each decision, see
 - **Constraints** — `CHECK` predicates and `FOREIGN KEY` referential integrity,
   enforced on write (a foreign key is `RESTRICT` on the parent side) and
   persisted across restarts.
-- **DML** — `INSERT` (with or without a column list), `UPDATE`, `DELETE`, each
-  with an optional `RETURNING` projection over the affected rows.
+- **DML** — `INSERT` (with or without a column list, from `VALUES` or from a
+  query: `INSERT INTO t [(cols)] SELECT ...`), `UPDATE`, `DELETE`, each with an
+  optional `RETURNING` projection over the affected rows.
 - **Bulk CSV** — `COPY table FROM 'file.csv' [HEADER]` loads rows (through the
   normal insert path, so all constraints apply), and `COPY table TO 'file.csv'
   [HEADER]` writes the table out as RFC-4180 CSV (quoting fields with commas or
