@@ -77,9 +77,9 @@ Storage · pages, buffer pool, B+ tree     ██████████  done
 WAL + ARIES crash recovery                ██████████  done
 MVCC transactions                         ██████████  done
 SQL surface · joins, windows, CTEs, sets  █████████▒  deep
-Cost-based planner · EXPLAIN              ████████▒▒  solid
+Cost-based planner · ANALYZE, EXPLAIN     █████████▒  solid
 PostgreSQL wire · simple + extended       █████████▒  solid
-Concurrency · multiple connections        ███▒▒▒▒▒▒▒  next
+Concurrency · many connections (actor)    ████████▒▒  works
 Types · DATE / TIMESTAMP / DECIMAL        ██▒▒▒▒▒▒▒▒  next
 ```
 

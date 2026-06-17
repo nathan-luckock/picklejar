@@ -744,10 +744,11 @@ This is the boundary the studio UI is built on: a SQL editor posts to
 
 `rustdb-pg` (in the `rustdb-server` crate, module `pgwire`) serves the engine
 over the real PostgreSQL v3 frontend/backend protocol, so the actual `psql`
-client, GUI tools, and language drivers connect to it directly. Like the HTTP
-server it is single-threaded and owns one `Database`, serving one connection at
-a time. The framing is exact: each backend message is a one-byte type tag, a
-big-endian length that counts itself but not the tag, then the payload.
+client, GUI tools, and language drivers connect to it directly. It serves
+**many connections concurrently** (see "Concurrency: the engine actor" below):
+the accept loop hands each connection its own thread and an `Engine` handle. The
+framing is exact: each backend message is a one-byte type tag, a big-endian
+length that counts itself but not the tag, then the payload.
 
 - **Startup**: SSL/GSS negotiation is declined with a single byte so clients
   fall back to cleartext; protocol 3.0 is accepted with trust authentication,
@@ -774,6 +775,29 @@ big-endian length that counts itself but not the tag, then the payload.
 
 The wire protocol reuses the same `Database::execute` entry point as the CLI and
 the HTTP API, so every interface exercises one engine.
+
+### Concurrency: the engine actor
+
+The engine is `!Send` (the buffer pool holds `Rc`), so it cannot be wrapped in a
+lock and shared across threads. Instead it runs as an **actor**: a dedicated
+thread opens and owns the one `Database` (the database is created *on* that
+thread, never moved across one), and client connections, each on their own
+thread, send SQL to it over a channel and wait for the reply. Because the engine
+thread processes one statement at a time, there is never a data race, and the
+`Rc` interior-mutability that makes the storage layer fast stays valid.
+
+The wire layer talks to a small `Engine` trait (run a statement, ask whether a
+transaction is open), implemented both by the live `Database` (for in-process
+and tests) and by a per-connection `SessionHandle` (which round-trips through
+the actor). Isolation across connections is enforced by **transaction
+exclusivity**: an open explicit transaction owns the engine, so other
+connections' statements queue until it commits or rolls back, while auto-commit
+statements from any connection interleave freely whenever no transaction is
+open; MVCC then gives each statement a consistent snapshot. Dropping a
+connection's handle tells the actor to roll back any transaction it still held.
+Per-row write-write conflict detection for *overlapping* explicit transactions
+(first-updater-wins) is the natural next step; exclusivity makes that case
+serial, hence correct, just not yet concurrent.
 
 ---
 

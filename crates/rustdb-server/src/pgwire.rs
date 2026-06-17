@@ -2,8 +2,9 @@
 //!
 //! This lets standard PostgreSQL clients (`psql`, drivers like psycopg and
 //! JDBC, GUI tools) talk to rustdb over the real frontend/backend protocol.
-//! One [`Database`] is served per process, one connection at a time, because
-//! the engine is single-threaded (`!Send`).
+//! [`serve`] drives one connection over an [`Engine`](crate::engine::Engine);
+//! the binary backs that with an [`EngineActor`](crate::engine::EngineActor) so
+//! many connections run concurrently against the single-threaded engine.
 //!
 //! Implemented: the startup handshake (with SSL/GSS politely declined), trust
 //! authentication, the **simple query protocol** (`Query` -> `RowDescription` /
@@ -23,8 +24,10 @@
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 
-use rustdb::{Database, QueryOutcome, Value};
+use rustdb::{QueryOutcome, Value};
 use rustdb_sql::{Parser, Statement};
+
+use crate::engine::Engine;
 
 /// `int8` (64-bit integer) type OID.
 const INT8_OID: i32 = 20;
@@ -50,7 +53,7 @@ const CANCEL_REQUEST: i32 = 80_877_102;
 /// # Errors
 ///
 /// Returns an I/O error if the socket cannot be read or written.
-pub fn serve<S: Read + Write>(db: &mut Database, stream: &mut S) -> io::Result<()> {
+pub fn serve<S: Read + Write>(db: &mut dyn Engine, stream: &mut S) -> io::Result<()> {
     if startup(db, stream)? {
         query_loop(db, stream)?;
     }
@@ -60,7 +63,7 @@ pub fn serve<S: Read + Write>(db: &mut Database, stream: &mut S) -> io::Result<(
 /// Run the startup handshake. Returns `true` once an authenticated 3.0 session
 /// is ready for queries, or `false` if the client closed the connection or only
 /// probed for SSL/cancel.
-fn startup<S: Read + Write>(db: &Database, stream: &mut S) -> io::Result<bool> {
+fn startup<S: Read + Write>(db: &dyn Engine, stream: &mut S) -> io::Result<bool> {
     loop {
         let Some(len) = read_i32_opt(stream)? else {
             return Ok(false);
@@ -135,7 +138,7 @@ struct Session {
 /// Read and answer frontend messages until termination or EOF. Handles both the
 /// simple query protocol (`Query`) and the extended one (`Parse` / `Bind` /
 /// `Describe` / `Execute` / `Close` / `Sync` / `Flush`).
-fn query_loop<S: Read + Write>(db: &mut Database, stream: &mut S) -> io::Result<()> {
+fn query_loop<S: Read + Write>(db: &mut dyn Engine, stream: &mut S) -> io::Result<()> {
     let mut session = Session::default();
     loop {
         let mut tag = [0u8; 1];
@@ -285,7 +288,7 @@ fn handle_bind<S: Write>(session: &mut Session, stream: &mut S, payload: &[u8]) 
 /// `Describe`: report the result shape of a statement or portal.
 fn handle_describe<S: Write>(
     session: &mut Session,
-    db: &mut Database,
+    db: &mut dyn Engine,
     stream: &mut S,
     payload: &[u8],
 ) -> io::Result<()> {
@@ -330,7 +333,7 @@ fn handle_describe<S: Write>(
                 portal.cached = Some(outcome);
                 Ok(())
             }
-            Err(e) => fail(session, stream, &e.to_string()),
+            Err(e) => fail(session, stream, &e),
         }
     }
 }
@@ -338,7 +341,7 @@ fn handle_describe<S: Write>(
 /// `Execute`: run a portal and stream its rows (or its command tag).
 fn handle_execute<S: Write>(
     session: &mut Session,
-    db: &mut Database,
+    db: &mut dyn Engine,
     stream: &mut S,
     payload: &[u8],
 ) -> io::Result<()> {
@@ -356,7 +359,7 @@ fn handle_execute<S: Write>(
         Some(o) => o,
         None => match db.execute(&portal.sql) {
             Ok(o) => o,
-            Err(e) => return fail(session, stream, &e.to_string()),
+            Err(e) => return fail(session, stream, &e),
         },
     };
     if let Some((_columns, rows)) = outcome_as_rows(&outcome) {
@@ -544,7 +547,7 @@ fn read_bytes(payload: &[u8], off: &mut usize, len: usize) -> Vec<u8> {
 
 /// Execute one simple-query string (which may hold several `;`-separated
 /// statements) and write the responses, ending with `ReadyForQuery`.
-fn handle_query<S: Write>(db: &mut Database, stream: &mut S, payload: &[u8]) -> io::Result<()> {
+fn handle_query<S: Write>(db: &mut dyn Engine, stream: &mut S, payload: &[u8]) -> io::Result<()> {
     let sql = cstr(payload);
     let statements = split_statements(&sql);
     if statements.is_empty() {
@@ -556,7 +559,7 @@ fn handle_query<S: Write>(db: &mut Database, stream: &mut S, payload: &[u8]) -> 
             Ok(outcome) => respond(stream, &statement, outcome)?,
             Err(e) => {
                 // Postgres reports the error and abandons the rest of the batch.
-                send_error(stream, &e.to_string())?;
+                send_error(stream, &e)?;
                 break;
             }
         }
@@ -647,7 +650,7 @@ fn command_complete<S: Write>(stream: &mut S, tag: &str) -> io::Result<()> {
 }
 
 /// Send `ReadyForQuery` with the current transaction status.
-fn ready_for_query<S: Write>(db: &Database, stream: &mut S) -> io::Result<()> {
+fn ready_for_query<S: Write>(db: &dyn Engine, stream: &mut S) -> io::Result<()> {
     let status = if db.in_transaction() { b'T' } else { b'I' };
     write_message(stream, b'Z', &[status])
 }
@@ -829,6 +832,7 @@ fn read_exact_opt<S: Read>(stream: &mut S, buf: &mut [u8]) -> io::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustdb::Database;
     use std::io::Cursor;
     use tempfile::TempDir;
 

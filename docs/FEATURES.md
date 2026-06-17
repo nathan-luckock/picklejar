@@ -62,6 +62,11 @@ The complete engine and SQL surface. For the *why* behind each decision, see
 - **Concurrency control** — MVCC with snapshot isolation and version chains.
 - **Interfaces** — an embeddable library, a `psql`-style CLI, and a
   PostgreSQL-wire-protocol server (simple + extended, with `$N` parameters).
+- **Concurrency** — the wire server handles many client connections at once: the
+  single-threaded engine runs as an actor on its own thread, and each connection
+  gets its own thread and session handle. Transaction exclusivity keeps explicit
+  transactions isolated; auto-commit statements from different connections
+  interleave freely.
 
 ## Correctness and crash safety
 
