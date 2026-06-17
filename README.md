@@ -133,6 +133,7 @@ cargo run --bin difftest -- --seed 42           # replay one exactly
 - **DML**: `INSERT` (with or without a column list), `UPDATE`, `DELETE`, each with an optional `RETURNING` projection over the affected rows.
 - **Upserts**: `INSERT ... ON CONFLICT [(cols)] DO NOTHING | DO UPDATE SET ... [WHERE ...]`, with `excluded.col` referring to the rejected row's proposed value.
 - **Queries**: projection and `*`, `WHERE` with SQL three-valued logic, `INNER` / `LEFT` / `CROSS JOIN`, `GROUP BY` with `COUNT` / `SUM` / `MIN` / `MAX` / `AVG` (and `DISTINCT` aggregates), `HAVING`, `DISTINCT`, `ORDER BY`, `LIMIT` / `OFFSET`, and `UNION` / `UNION ALL`.
+- **Window functions**: `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `LAG` / `LEAD`, and aggregates `OVER (PARTITION BY ... ORDER BY ...)`.
 - **Subqueries**: scalar, `IN`, and `EXISTS`, both uncorrelated and correlated; derived tables (`FROM (SELECT ...)`); views expand to the same machinery.
 - **Expressions**: `INT` / `FLOAT` / `BOOL` / `TEXT`, arithmetic with int-to-float promotion, `IN` / `BETWEEN` / `LIKE` / `IS NULL`, `CASE`, string `||`, and a library of scalar functions.
 - **Transactions**: `BEGIN` / `COMMIT` / `ROLLBACK` over MVCC snapshots; auto-commit otherwise.

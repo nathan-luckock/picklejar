@@ -83,6 +83,10 @@ pub fn eval_with(
             columns,
             runner,
         ),
+        // A window function resolves to the column the Window operator appended
+        // for it, named by the expression's printed form (the same scheme
+        // aggregates use).
+        Expr::Window { .. } => resolve(&expr.to_string(), row, columns),
         // A correlated subquery: evaluate it against the outer row via the
         // runner. Without a runner (e.g. an operator that does not support
         // correlation), this is an error.

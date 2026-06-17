@@ -374,6 +374,13 @@ Transaction control is `BEGIN` / `COMMIT` / `ROLLBACK`. `SELECT` covers:
 - `INNER JOIN`, `LEFT JOIN`, and `CROSS JOIN` (and comma joins) with `ON`.
 - `GROUP BY` with `COUNT` / `SUM` / `MIN` / `MAX` / `AVG` (including
   `COUNT(DISTINCT ...)`), and `HAVING`.
+- Window functions `func(args) OVER ([PARTITION BY ...] [ORDER BY ...])`:
+  `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `LAG` / `LEAD` (with offset and default),
+  and the aggregates over a partition. A blocking Window operator computes them
+  after `GROUP BY` / `HAVING` and before `ORDER BY` and the projection,
+  appending one column per distinct window expression (resolved by its printed
+  name, the same scheme aggregates use). An aggregate window is computed over
+  the whole partition; running-frame semantics are not implemented.
 - `DISTINCT`, `ORDER BY` (multi-key, `ASC` / `DESC`, and by output ordinal or
   alias), `LIMIT`, and `OFFSET`.
 - `UNION` and `UNION ALL`, with a trailing `ORDER BY` / `LIMIT` over the union.

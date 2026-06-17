@@ -1624,6 +1624,7 @@ impl Database {
     /// literal, or an `IN`-list). A correlated one (it references an outer
     /// column) is left in place for the executor to evaluate per row via the
     /// [`crate::correlated::CorrelatedRunner`].
+    #[allow(clippy::too_many_lines)]
     fn fold_expr(&self, txn: &Transaction, expr: &Expr) -> Result<Expr> {
         match expr {
             Expr::Subquery(q) => {
@@ -1698,6 +1699,33 @@ impl Database {
                     .as_ref()
                     .map(|e| self.fold_expr(txn, e).map(Box::new))
                     .transpose()?,
+            }),
+            Expr::Window {
+                func,
+                distinct,
+                args,
+                partition_by,
+                order_by,
+            } => Ok(Expr::Window {
+                func: func.clone(),
+                distinct: *distinct,
+                args: args
+                    .iter()
+                    .map(|a| self.fold_expr(txn, a))
+                    .collect::<Result<_>>()?,
+                partition_by: partition_by
+                    .iter()
+                    .map(|a| self.fold_expr(txn, a))
+                    .collect::<Result<_>>()?,
+                order_by: order_by
+                    .iter()
+                    .map(|o| {
+                        Ok(rustdb_sql::statement::OrderItem {
+                            expr: self.fold_expr(txn, &o.expr)?,
+                            desc: o.desc,
+                        })
+                    })
+                    .collect::<Result<_>>()?,
             }),
             // Leaves carry no nested expressions.
             Expr::Column(_)
@@ -3853,6 +3881,127 @@ mod tests {
         }
         let db = Database::open(&path).expect("reopen");
         assert_eq!(dump(&db, "t"), vec![vec![Value::Int(1), Value::Int(42)]]);
+    }
+
+    // --- window functions ---
+
+    #[test]
+    fn window_row_number_orders_the_whole_input() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE t (id INT)").unwrap();
+        db.execute("INSERT INTO t VALUES (1), (2), (3)").unwrap();
+        let (cols, rows) = query(&mut db, "SELECT id, ROW_NUMBER() OVER (ORDER BY id) FROM t");
+        assert_eq!(names(&cols), ["id", "ROW_NUMBER() OVER (ORDER BY id)"]);
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Int(1), Value::Int(1)],
+                vec![Value::Int(2), Value::Int(2)],
+                vec![Value::Int(3), Value::Int(3)],
+            ]
+        );
+    }
+
+    #[test]
+    fn window_row_number_restarts_per_partition() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE t (id INT, g INT)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 10), (2, 10), (3, 20)")
+            .unwrap();
+        let (_c, rows) = query(
+            &mut db,
+            "SELECT id, ROW_NUMBER() OVER (PARTITION BY g ORDER BY id) FROM t",
+        );
+        // g=10 holds id 1,2 -> 1,2; g=20 holds id 3 -> 1.
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Int(1), Value::Int(1)],
+                vec![Value::Int(2), Value::Int(2)],
+                vec![Value::Int(3), Value::Int(1)],
+            ]
+        );
+    }
+
+    #[test]
+    fn window_rank_and_dense_rank_handle_ties() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE t (id INT, score INT)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 50), (2, 50), (3, 90)")
+            .unwrap();
+        // Ordered by score the two 50s tie: RANK gaps to 3, DENSE_RANK does not.
+        let (_c, rows) = query(
+            &mut db,
+            "SELECT RANK() OVER (ORDER BY score), DENSE_RANK() OVER (ORDER BY score) FROM t",
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Int(1), Value::Int(1)],
+                vec![Value::Int(1), Value::Int(1)],
+                vec![Value::Int(3), Value::Int(2)],
+            ]
+        );
+    }
+
+    #[test]
+    fn window_lag_and_lead_navigate_rows() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE t (id INT)").unwrap();
+        db.execute("INSERT INTO t VALUES (10), (20), (30)").unwrap();
+        // LAG/LEAD with an explicit offset and default fall off the partition
+        // ends to -1.
+        let (_c, rows) = query(
+            &mut db,
+            "SELECT id, LAG(id, 1, -1) OVER (ORDER BY id), LEAD(id, 1, -1) OVER (ORDER BY id) FROM t",
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Int(10), Value::Int(-1), Value::Int(20)],
+                vec![Value::Int(20), Value::Int(10), Value::Int(30)],
+                vec![Value::Int(30), Value::Int(20), Value::Int(-1)],
+            ]
+        );
+    }
+
+    #[test]
+    fn window_aggregate_spans_the_partition() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE t (g INT, n INT)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 10), (1, 20), (2, 5)")
+            .unwrap();
+        // SUM over the partition is constant for every row in that partition.
+        let (_c, rows) = query(&mut db, "SELECT g, n, SUM(n) OVER (PARTITION BY g) FROM t");
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Int(1), Value::Int(10), Value::Int(30)],
+                vec![Value::Int(1), Value::Int(20), Value::Int(30)],
+                vec![Value::Int(2), Value::Int(5), Value::Int(5)],
+            ]
+        );
+    }
+
+    #[test]
+    fn window_runs_below_an_outer_order_by() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE t (id INT)").unwrap();
+        db.execute("INSERT INTO t VALUES (3), (1), (2)").unwrap();
+        // The window numbers rows by id ascending; the query then sorts the
+        // output descending, proving the sort sits above the window.
+        let (_c, rows) = query(
+            &mut db,
+            "SELECT id, ROW_NUMBER() OVER (ORDER BY id) FROM t ORDER BY id DESC",
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Int(3), Value::Int(3)],
+                vec![Value::Int(2), Value::Int(2)],
+                vec![Value::Int(1), Value::Int(1)],
+            ]
+        );
     }
 
     // --- CHECK constraints ---

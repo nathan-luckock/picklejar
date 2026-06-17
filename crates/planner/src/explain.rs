@@ -71,6 +71,15 @@ fn render(plan: &PhysicalPlan, depth: usize, out: &mut String) {
             let _ = writeln!(out, "{pad}Project {cols}  {stats}");
             render(input, depth + 1, out);
         }
+        PhysicalPlan::Window { windows, input, .. } => {
+            let ws = windows
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let _ = writeln!(out, "{pad}Window [{ws}]  {stats}");
+            render(input, depth + 1, out);
+        }
         PhysicalPlan::Sort { keys, input, .. } => {
             let ks = keys
                 .iter()

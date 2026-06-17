@@ -948,6 +948,227 @@ impl Executor for Aggregate {
     }
 }
 
+/// Window functions (a blocking operator): read all input, then for each window
+/// expression compute a value per row over its partition and append it as a new
+/// column, preserving input order. Supports `ROW_NUMBER`, `RANK`, `DENSE_RANK`,
+/// `LAG`, `LEAD`, and the aggregate functions over the whole partition.
+///
+/// Frame note: an aggregate window (e.g. `SUM(x) OVER (...)`) is computed over
+/// the entire partition and is constant per partition; running-frame semantics
+/// (a different value per row when `ORDER BY` is present) are not implemented.
+struct Window {
+    input: Box<dyn Executor>,
+    windows: Vec<Expr>,
+    columns: Vec<String>,
+    buffered: Option<std::vec::IntoIter<Row>>,
+}
+
+impl Window {
+    fn new(input: Box<dyn Executor>, windows: Vec<Expr>) -> Self {
+        let mut columns = input.columns().to_vec();
+        columns.extend(windows.iter().map(ToString::to_string));
+        Self {
+            input,
+            windows,
+            columns,
+            buffered: None,
+        }
+    }
+
+    fn materialize(&mut self) -> Result<()> {
+        let in_cols = self.input.columns().to_vec();
+        let mut rows: Vec<Row> = Vec::new();
+        while let Some(r) = self.input.next()? {
+            rows.push(r);
+        }
+        // One result column per window expression, each aligned to `rows`.
+        let mut cols: Vec<Vec<Value>> = Vec::with_capacity(self.windows.len());
+        for w in &self.windows {
+            cols.push(compute_window(w, &rows, &in_cols)?);
+        }
+        let mut out = Vec::with_capacity(rows.len());
+        for (i, mut row) in rows.into_iter().enumerate() {
+            for col in &cols {
+                row.push(col[i].clone());
+            }
+            out.push(row);
+        }
+        self.buffered = Some(out.into_iter());
+        Ok(())
+    }
+}
+
+impl Executor for Window {
+    fn columns(&self) -> &[String] {
+        &self.columns
+    }
+    fn next(&mut self) -> Result<Option<Row>> {
+        if self.buffered.is_none() {
+            self.materialize()?;
+        }
+        Ok(self.buffered.as_mut().expect("materialized").next())
+    }
+}
+
+/// Compute one window expression's value for every input row, returned aligned
+/// to `rows` (index `i` holds the value for `rows[i]`).
+fn compute_window(expr: &Expr, rows: &[Row], cols: &[String]) -> Result<Vec<Value>> {
+    let Expr::Window {
+        func,
+        distinct,
+        args,
+        partition_by,
+        order_by,
+    } = expr
+    else {
+        return Err(ExecError::Unsupported(format!(
+            "not a window function: {expr}"
+        )));
+    };
+    let mut result = vec![Value::Null; rows.len()];
+
+    // Partition the row indices by the partition keys, preserving first-seen
+    // order (irrelevant to output, which is written back by original index).
+    let mut parts: Vec<Vec<usize>> = Vec::new();
+    let mut index: HashMap<Vec<u8>, usize> = HashMap::new();
+    for (i, row) in rows.iter().enumerate() {
+        let key = partition_by
+            .iter()
+            .map(|e| eval(e, row, cols))
+            .collect::<Result<Vec<_>>>()?;
+        let kb = group_key_bytes(&key);
+        let p = if let Some(&p) = index.get(&kb) {
+            p
+        } else {
+            let p = parts.len();
+            index.insert(kb, p);
+            parts.push(Vec::new());
+            p
+        };
+        parts[p].push(i);
+    }
+
+    let descs: Vec<bool> = order_by.iter().map(|o| o.desc).collect();
+    for part in &parts {
+        // Order the partition by the window ORDER BY. Precompute the keys so
+        // the comparator stays infallible, and use a stable sort so peers keep
+        // their input order.
+        let mut keyed: Vec<(usize, Vec<Value>)> = Vec::with_capacity(part.len());
+        for &i in part {
+            let k = order_by
+                .iter()
+                .map(|o| eval(&o.expr, &rows[i], cols))
+                .collect::<Result<Vec<_>>>()?;
+            keyed.push((i, k));
+        }
+        keyed.sort_by(|a, b| cmp_order_keys(&a.1, &b.1, &descs));
+        compute_partition(func, *distinct, args, &keyed, rows, cols, &mut result)?;
+    }
+    Ok(result)
+}
+
+/// Assign one partition's window values into `result`, indexed by each row's
+/// original position. `ordered` is `(original index, order key)` in window
+/// order.
+fn compute_partition(
+    func: &str,
+    distinct: bool,
+    args: &[Expr],
+    ordered: &[(usize, Vec<Value>)],
+    rows: &[Row],
+    cols: &[String],
+    result: &mut [Value],
+) -> Result<()> {
+    let int = |n: usize| Value::Int(i64::try_from(n).unwrap_or(i64::MAX));
+    match func {
+        "ROW_NUMBER" => {
+            for (pos, (i, _)) in ordered.iter().enumerate() {
+                result[*i] = int(pos + 1);
+            }
+        }
+        "RANK" => {
+            let mut rank = 0usize;
+            for (pos, (i, key)) in ordered.iter().enumerate() {
+                if pos == 0 || *key != ordered[pos - 1].1 {
+                    rank = pos + 1;
+                }
+                result[*i] = int(rank);
+            }
+        }
+        "DENSE_RANK" => {
+            let mut rank = 0usize;
+            for (pos, (i, key)) in ordered.iter().enumerate() {
+                if pos == 0 || *key != ordered[pos - 1].1 {
+                    rank += 1;
+                }
+                result[*i] = int(rank);
+            }
+        }
+        "LAG" | "LEAD" => {
+            let value_expr = args.first().ok_or_else(|| {
+                ExecError::Unsupported(format!("{func} requires a value argument"))
+            })?;
+            // The offset (default 1) is a constant; evaluate it against any row.
+            let offset = match args.get(1) {
+                Some(e) => match eval(e, &rows[ordered[0].0], cols)? {
+                    Value::Int(n) => isize::try_from(n).unwrap_or(1),
+                    _ => 1,
+                },
+                None => 1,
+            };
+            let default_expr = args.get(2);
+            let len = ordered.len();
+            for (pos, &(i, _)) in ordered.iter().enumerate() {
+                let signed = isize::try_from(pos).unwrap_or(0);
+                let target = if func == "LAG" {
+                    signed - offset
+                } else {
+                    signed + offset
+                };
+                // A target inside the partition resolves; otherwise the default.
+                let in_range = usize::try_from(target).ok().filter(|&t| t < len);
+                result[i] = match in_range {
+                    Some(t) => eval(value_expr, &rows[ordered[t].0], cols)?,
+                    None => match default_expr {
+                        Some(d) => eval(d, &rows[i], cols)?,
+                        None => Value::Null,
+                    },
+                };
+            }
+        }
+        "COUNT" | "SUM" | "MIN" | "MAX" | "AVG" => {
+            // Whole-partition aggregate: one value shared by every row.
+            let spec = parse_agg(&Expr::Func {
+                name: func.to_string(),
+                distinct,
+                args: args.to_vec(),
+            })?;
+            let mut acc = Acc::default();
+            for (i, _) in ordered {
+                update_acc(&mut acc, &spec, &rows[*i], cols)?;
+            }
+            let value = finalize_acc(&acc, &spec);
+            for (i, _) in ordered {
+                result[*i] = value.clone();
+            }
+        }
+        other => return Err(ExecError::Unsupported(format!("window function {other}"))),
+    }
+    Ok(())
+}
+
+/// Lexicographic order over two window order keys, flipping per-key for `DESC`.
+fn cmp_order_keys(a: &[Value], b: &[Value], descs: &[bool]) -> Ordering {
+    for ((x, y), desc) in a.iter().zip(b).zip(descs) {
+        let ord = sort_cmp(x, y);
+        let ord = if *desc { ord.reverse() } else { ord };
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    Ordering::Equal
+}
+
 /// Lower a physical plan into an executor tree, reading base tables through
 /// `source`.
 ///
@@ -1115,6 +1336,10 @@ fn build_with(
             group_by.clone(),
             aggregates,
         )?)),
+        PhysicalPlan::Window { windows, input, .. } => Ok(Box::new(Window::new(
+            build_with(input, source, runner)?,
+            windows.clone(),
+        ))),
     }
 }
 

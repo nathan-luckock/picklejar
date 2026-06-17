@@ -848,7 +848,7 @@ impl Parser {
         Ok(keys)
     }
 
-    fn parse_order_by(&mut self) -> Result<Vec<OrderItem>> {
+    pub(crate) fn parse_order_by(&mut self) -> Result<Vec<OrderItem>> {
         if !self.eat_keyword(Keyword::Order) {
             return Ok(Vec::new());
         }
@@ -1906,6 +1906,17 @@ mod tests {
         assert_eq!(oc.target, vec!["id".to_string()]);
         assert!(matches!(oc.action, ConflictAction::Update { .. }));
         assert_eq!(returning.len(), 1);
+    }
+
+    #[test]
+    fn window_functions_round_trip() {
+        round_trip("SELECT ROW_NUMBER() OVER () FROM t");
+        round_trip("SELECT ROW_NUMBER() OVER (ORDER BY x) FROM t");
+        round_trip("SELECT RANK() OVER (PARTITION BY g ORDER BY x DESC) FROM t");
+        round_trip("SELECT g, SUM(n) OVER (PARTITION BY g) FROM t");
+        round_trip("SELECT LAG(n, 1, 0) OVER (PARTITION BY g ORDER BY x) FROM t");
+        // A window result nested in an arithmetic expression.
+        round_trip("SELECT (ROW_NUMBER() OVER (ORDER BY x) + 1) FROM t");
     }
 
     #[test]
