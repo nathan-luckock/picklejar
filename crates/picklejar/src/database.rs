@@ -38,7 +38,8 @@ use crate::correlated;
 use crate::correlated::{CorrelatedRunner, MaterializedSource};
 use picklejar_sql::statement::{
     AlterAction, ColumnDef, ConflictAction, Cte, DataType, ForeignKey, Grantee, Join, OnConflict,
-    OrderItem, Privilege, RefAction, RoleOption, Select, SelectItem, TableConstraint, TableRef,
+    OrderItem, PolicyCommand, Privilege, RefAction, RoleOption, Select, SelectItem,
+    TableConstraint, TableRef,
 };
 use picklejar_sql::{BinOp, Expr, Parser, SetOp, Statement, UnOp, Value};
 use picklejar_storage::{BufferPool, FileManager, PageId};
@@ -129,6 +130,32 @@ struct TableConstraints {
     foreign_keys: Vec<ForeignKeyMeta>,
 }
 
+/// One row-level-security policy on a table.
+#[derive(Debug, Clone)]
+struct Policy {
+    /// Policy name (unique within the table).
+    name: String,
+    /// The command(s) it applies to.
+    command: PolicyCommand,
+    /// The roles it applies to; empty means `PUBLIC` (every role).
+    roles: Vec<String>,
+    /// `USING` predicate: which existing rows are visible / affectable.
+    using: Option<Expr>,
+    /// `WITH CHECK` predicate: which new rows a write may produce.
+    check: Option<Expr>,
+}
+
+/// The row-level-security state of one table.
+#[derive(Debug, Clone, Default)]
+struct TableRls {
+    /// Whether RLS is enabled (policies apply).
+    enabled: bool,
+    /// Whether RLS is forced (applies even to the table owner).
+    forced: bool,
+    /// The policies declared on the table.
+    policies: Vec<Policy>,
+}
+
 /// An embedded picklejar instance.
 pub struct Database {
     pool: BufferPool,
@@ -169,6 +196,10 @@ pub struct Database {
     current_role: String,
     /// Sidecar file recording roles, grants, memberships, and ownership.
     acl_path: PathBuf,
+    /// Per-table row-level-security state (flags and policies).
+    rls: HashMap<String, TableRls>,
+    /// Sidecar file recording the row-level-security state.
+    pol_path: PathBuf,
 }
 
 impl std::fmt::Debug for Database {
@@ -196,6 +227,7 @@ impl Database {
         let cons_path = base.with_extension("cons");
         let seq_path = base.with_extension("seq");
         let acl_path = base.with_extension("acl");
+        let pol_path = base.with_extension("pol");
         let writer = WalWriter::open(&wal_path)?;
         let wal = WalSyncHandle::new(writer);
         let file = FileManager::open(base)?;
@@ -219,12 +251,15 @@ impl Database {
             session_user: security::BOOTSTRAP_SUPERUSER.to_string(),
             current_role: security::BOOTSTRAP_SUPERUSER.to_string(),
             acl_path,
+            rls: HashMap::new(),
+            pol_path,
         };
         db.load_catalog()?;
         db.load_views()?;
         db.load_constraints()?;
         db.load_serials()?;
         db.load_security()?;
+        db.load_rls()?;
         // Register the read-only information_schema views so introspection
         // queries bind. They are catalog-only (no physical store) and are built
         // on demand by `EngineSource`, so they are never persisted.
@@ -574,6 +609,7 @@ impl Database {
             &self.mgr.aborted_xids(),
         )?;
         self.save_security()?;
+        self.save_rls()?;
         Ok(())
     }
 
@@ -596,6 +632,9 @@ impl Database {
         // A superuser session (the default) passes every check, so an
         // unconfigured database is unaffected.
         self.check_permission(&stmt)?;
+        // Enforce row-level security by folding policy predicates into the
+        // statement's reads. A role that bypasses RLS gets it unchanged.
+        let stmt = self.apply_rls(stmt);
         match stmt {
             // Transaction control.
             Statement::Begin => self.begin_txn(),
@@ -630,6 +669,19 @@ impl Database {
                 ref grantees,
             } => self.run_grant(privileges, table.as_deref(), roles, grantees, false),
             Statement::SetRole { ref name } => self.set_role(name.as_deref()),
+            Statement::CreatePolicy {
+                ref name,
+                ref table,
+                command,
+                ref roles,
+                ref using,
+                ref check,
+            } => self.create_policy(name, table, command, roles, using.clone(), check.clone()),
+            Statement::DropPolicy {
+                if_exists,
+                ref name,
+                ref table,
+            } => self.drop_policy(if_exists, name, table),
             // DDL auto-commits: it persists immediately regardless of any open
             // transaction.
             Statement::CreateTable { .. } => self.create_table(&stmt),
@@ -999,6 +1051,255 @@ impl Database {
             return Ok(());
         }
         self.require_priv(table, needed)
+    }
+
+    // --- row-level security ---
+
+    /// `CREATE POLICY`.
+    fn create_policy(
+        &mut self,
+        name: &str,
+        table: &str,
+        command: PolicyCommand,
+        roles: &[Grantee],
+        using: Option<Expr>,
+        check: Option<Expr>,
+    ) -> Result<QueryOutcome> {
+        self.require_owner(table)?;
+        if self.catalog.get_table(table).is_none() {
+            return Err(DbError::UnknownTable(table.to_string()));
+        }
+        let entry = self.rls.entry(table.to_string()).or_default();
+        if entry.policies.iter().any(|p| p.name == name) {
+            return Err(DbError::Constraint(format!(
+                "policy \"{name}\" for table \"{table}\" already exists"
+            )));
+        }
+        entry.policies.push(Policy {
+            name: name.to_string(),
+            command,
+            roles: policy_roles(roles),
+            using,
+            check,
+        });
+        self.persist()?;
+        Ok(QueryOutcome::Ddl)
+    }
+
+    /// `DROP POLICY [IF EXISTS]`.
+    fn drop_policy(&mut self, if_exists: bool, name: &str, table: &str) -> Result<QueryOutcome> {
+        self.require_owner(table)?;
+        let removed = self.rls.get_mut(table).is_some_and(|entry| {
+            let before = entry.policies.len();
+            entry.policies.retain(|p| p.name != name);
+            entry.policies.len() != before
+        });
+        if !removed && !if_exists {
+            return Err(DbError::Unsupported(format!(
+                "policy \"{name}\" for table \"{table}\" does not exist"
+            )));
+        }
+        self.persist()?;
+        Ok(QueryOutcome::Ddl)
+    }
+
+    /// Load the row-level-security state from its sidecar.
+    fn load_rls(&mut self) -> Result<()> {
+        let data = persist::load_rls(&self.pol_path)?;
+        for (table, enabled, forced) in data.flags {
+            let entry = self.rls.entry(table).or_default();
+            entry.enabled = enabled;
+            entry.forced = forced;
+        }
+        for sql in data.policies {
+            let stmt = Parser::from_sql(&sql)?.parse_statement()?;
+            if let Statement::CreatePolicy {
+                name,
+                table,
+                command,
+                roles,
+                using,
+                check,
+            } = stmt
+            {
+                self.rls.entry(table).or_default().policies.push(Policy {
+                    name,
+                    command,
+                    roles: policy_roles(&roles),
+                    using,
+                    check,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Snapshot the row-level-security state to its sidecar.
+    fn save_rls(&self) -> Result<()> {
+        let mut tables: Vec<&String> = self.rls.keys().collect();
+        tables.sort();
+        let mut flags = Vec::new();
+        let mut policies = Vec::new();
+        for table in tables {
+            let entry = &self.rls[table];
+            flags.push((table.clone(), entry.enabled, entry.forced));
+            for p in &entry.policies {
+                policies.push(policy_to_sql(table, p));
+            }
+        }
+        persist::save_rls(&self.pol_path, &persist::RlsData { flags, policies })?;
+        Ok(())
+    }
+
+    /// Whether row-level security applies to `table` for the current role: RLS is
+    /// enabled, the role is not exempt (superuser / `BYPASSRLS`), and the role is
+    /// not the owner unless the table forces RLS.
+    fn rls_applies(&self, table: &str) -> bool {
+        let Some(entry) = self.rls.get(table) else {
+            return false;
+        };
+        if !entry.enabled || self.security.can_bypass_rls(&self.current_role) {
+            return false;
+        }
+        entry.forced || !self.security.owns(&self.current_role, table)
+    }
+
+    /// Build the visibility predicate for `table` and `command`: the `OR` of the
+    /// `USING` clauses of every policy applicable to the current role, qualified
+    /// by `qualifier`. Returns `None` if RLS does not apply, or `Some(FALSE)` when
+    /// it applies but no policy grants visibility (default deny).
+    fn rls_predicate(
+        &self,
+        table: &str,
+        command: PolicyCommand,
+        qualifier: Option<&str>,
+    ) -> Option<Expr> {
+        if !self.rls_applies(table) {
+            return None;
+        }
+        let entry = self.rls.get(table)?;
+        let mut terms: Vec<Expr> = Vec::new();
+        for p in &entry.policies {
+            if policy_matches(p, command, &self.current_role) {
+                if let Some(using) = &p.using {
+                    // SELECT may join or alias the table, so its columns are
+                    // qualified; an UPDATE/DELETE targets the bare table, where
+                    // the executor resolves only unqualified names.
+                    terms.push(qualifier.map_or_else(|| using.clone(), |q| qualify_expr(using, q)));
+                }
+            }
+        }
+        Some(or_all(terms))
+    }
+
+    /// Rewrite a statement to enforce row-level security on the tables it reads.
+    /// A role that bypasses RLS gets the statement unchanged.
+    fn apply_rls(&self, stmt: Statement) -> Statement {
+        if self.security.can_bypass_rls(&self.current_role) {
+            return stmt;
+        }
+        match stmt {
+            Statement::Select(s) => Statement::Select(Box::new(self.rls_select(*s))),
+            Statement::Union {
+                op,
+                all,
+                left,
+                right,
+                order_by,
+                limit,
+                offset,
+            } => Statement::Union {
+                op,
+                all,
+                left: Box::new(self.apply_rls(*left)),
+                right: Box::new(self.apply_rls(*right)),
+                order_by,
+                limit,
+                offset,
+            },
+            Statement::Update {
+                table,
+                assignments,
+                where_clause,
+                returning,
+            } => {
+                let guard = self.rls_predicate(&table, PolicyCommand::Update, None);
+                Statement::Update {
+                    table,
+                    assignments,
+                    where_clause: and_opt(where_clause, guard),
+                    returning,
+                }
+            }
+            Statement::Delete {
+                table,
+                where_clause,
+                returning,
+            } => {
+                let guard = self.rls_predicate(&table, PolicyCommand::Delete, None);
+                Statement::Delete {
+                    table,
+                    where_clause: and_opt(where_clause, guard),
+                    returning,
+                }
+            }
+            Statement::Explain { analyze, statement } => Statement::Explain {
+                analyze,
+                statement: Box::new(self.apply_rls(*statement)),
+            },
+            other => other,
+        }
+    }
+
+    /// Apply RLS to one `SELECT`: guard its `FROM` and `JOIN` tables, and recurse
+    /// into derived-table subqueries.
+    fn rls_select(&self, mut select: Select) -> Select {
+        let mut guards: Vec<Expr> = Vec::new();
+        rls_guard_table_ref(self, &mut select.from, &mut guards);
+        for join in &mut select.joins {
+            rls_guard_table_ref(self, &mut join.table, &mut guards);
+        }
+        if !guards.is_empty() {
+            let combined = and_all(guards);
+            select.where_clause = Some(and_two(select.where_clause.take(), combined));
+        }
+        select
+    }
+
+    /// Reject `row` if it fails the row-level-security `WITH CHECK` for `command`
+    /// on `table`. `columns` are aligned with `row`. A write produces a row that
+    /// must satisfy some applicable policy's check (its `USING` stands in when a
+    /// policy has no explicit check); with RLS on and no applicable policy, the
+    /// write is denied.
+    fn enforce_rls_check(
+        &self,
+        table: &str,
+        command: PolicyCommand,
+        columns: &[String],
+        row: &[Value],
+    ) -> Result<()> {
+        if !self.rls_applies(table) {
+            return Ok(());
+        }
+        let entry = self.rls.get(table).expect("rls_applies checked presence");
+        for p in &entry.policies {
+            if !policy_matches(p, command, &self.current_role) {
+                continue;
+            }
+            // A policy's WITH CHECK governs writes; if it has none, its USING
+            // does (Postgres semantics).
+            match p.check.as_ref().or(p.using.as_ref()) {
+                None => return Ok(()), // a permissive policy with no check passes.
+                Some(expr) => {
+                    if matches!(eval(expr, row, columns)?, Value::Bool(true)) {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        Err(DbError::PermissionDenied(format!(
+            "new row violates row-level security policy for table \"{table}\""
+        )))
     }
 
     /// Run a DML or SELECT statement inside the open transaction, or, in
@@ -1788,7 +2089,25 @@ impl Database {
             }
             AlterAction::RenameColumn { from, to } => self.alter_rename_column(table, from, to),
             AlterAction::RenameTable { to } => self.alter_rename_table(table, to),
+            AlterAction::EnableRls => self.set_table_rls(table, |r| r.enabled = true),
+            AlterAction::DisableRls => self.set_table_rls(table, |r| r.enabled = false),
+            AlterAction::ForceRls => self.set_table_rls(table, |r| r.forced = true),
+            AlterAction::NoForceRls => self.set_table_rls(table, |r| r.forced = false),
         }
+    }
+
+    /// Apply a change to a table's row-level-security flags and persist it.
+    fn set_table_rls(
+        &mut self,
+        table: &str,
+        change: impl FnOnce(&mut TableRls),
+    ) -> Result<QueryOutcome> {
+        if self.catalog.get_table(table).is_none() {
+            return Err(DbError::UnknownTable(table.to_string()));
+        }
+        change(self.rls.entry(table.to_string()).or_default());
+        self.persist()?;
+        Ok(QueryOutcome::Ddl)
     }
 
     /// `ALTER TABLE t DROP COLUMN c`: rewrite every row without the column into
@@ -1911,8 +2230,11 @@ impl Database {
             self.serial_cols.insert(to.to_string(), serials);
             self.save_serials()?;
         }
-        // Move ownership and grants to the new name.
+        // Move ownership, grants, and row-level-security state to the new name.
         self.security.rename_table(from, to);
+        if let Some(rls) = self.rls.remove(from) {
+            self.rls.insert(to.to_string(), rls);
+        }
         self.persist()?;
         Ok(QueryOutcome::Ddl)
     }
@@ -2162,8 +2484,9 @@ impl Database {
         if self.serial_cols.remove(name).is_some() {
             self.save_serials()?;
         }
-        // Forget the table's ownership and any grants on it.
+        // Forget the table's ownership, grants, and row-level-security policies.
         self.security.clear_owner(name);
+        self.rls.remove(name);
         self.persist()?;
         Ok(QueryOutcome::Ddl)
     }
@@ -2605,6 +2928,7 @@ impl Database {
                 }
             }
             self.enforce_checks(table, &column_names, &values)?;
+            self.enforce_rls_check(table, PolicyCommand::Insert, &column_names, &values)?;
             self.enforce_fk_child(txn, table, &column_names, &values)?;
             built.push(values);
         }
@@ -2765,6 +3089,12 @@ impl Database {
                                     }
                                 }
                                 self.enforce_checks(table, &column_names, &new_row)?;
+                                self.enforce_rls_check(
+                                    table,
+                                    PolicyCommand::Update,
+                                    &column_names,
+                                    &new_row,
+                                )?;
                                 self.enforce_fk_child(txn, table, &column_names, &new_row)?;
                                 // Reflect the change in the snapshot so a later
                                 // row of this statement sees the updated value.
@@ -3395,6 +3725,7 @@ impl Database {
                     }
                 }
                 self.enforce_checks(table, &columns, &new_row)?;
+                self.enforce_rls_check(table, PolicyCommand::Update, &columns, &new_row)?;
                 self.enforce_fk_child(txn, table, &columns, &new_row)?;
                 // RESTRICT / NO ACTION on a changed referenced key blocks before
                 // any write; CASCADE / SET NULL run after the parent is updated.
@@ -3945,6 +4276,137 @@ fn grantee_name(grantee: &Grantee) -> String {
 fn others(mut set: HashSet<String>, victim: &str) -> HashSet<String> {
     set.remove(victim);
     set
+}
+
+/// The role names a policy applies to. An empty list, or one naming `PUBLIC`,
+/// means every role.
+fn policy_roles(grantees: &[Grantee]) -> Vec<String> {
+    if grantees.is_empty() || grantees.iter().any(|g| matches!(g, Grantee::Public)) {
+        Vec::new()
+    } else {
+        grantees.iter().map(grantee_name).collect()
+    }
+}
+
+/// Whether a policy applies to `command` for `role`.
+fn policy_matches(policy: &Policy, command: PolicyCommand, role: &str) -> bool {
+    let command_ok = matches!(policy.command, PolicyCommand::All) || policy.command == command;
+    let role_ok = policy.roles.is_empty() || policy.roles.iter().any(|r| r == role);
+    command_ok && role_ok
+}
+
+/// Reconstruct a policy's `CREATE POLICY` text for persistence.
+fn policy_to_sql(table: &str, policy: &Policy) -> String {
+    Statement::CreatePolicy {
+        name: policy.name.clone(),
+        table: table.to_string(),
+        command: policy.command,
+        roles: policy
+            .roles
+            .iter()
+            .map(|r| Grantee::Role(r.clone()))
+            .collect(),
+        using: policy.using.clone(),
+        check: policy.check.clone(),
+    }
+    .to_string()
+}
+
+/// Qualify every bare column reference in `expr` with `qualifier`, so a policy
+/// predicate is unambiguous when its table is aliased or joined. Already-qualified
+/// columns, literals, and functions (e.g. `current_user`) are left alone, and the
+/// rewrite does not descend into subqueries (they carry their own scope).
+fn qualify_expr(expr: &Expr, qualifier: &str) -> Expr {
+    match expr {
+        Expr::Column(c) => Expr::QualifiedColumn(qualifier.to_string(), c.clone()),
+        Expr::Binary { op, left, right } => Expr::Binary {
+            op: *op,
+            left: Box::new(qualify_expr(left, qualifier)),
+            right: Box::new(qualify_expr(right, qualifier)),
+        },
+        Expr::Unary { op, expr } => Expr::Unary {
+            op: *op,
+            expr: Box::new(qualify_expr(expr, qualifier)),
+        },
+        Expr::Func {
+            name,
+            distinct,
+            args,
+        } => Expr::Func {
+            name: name.clone(),
+            distinct: *distinct,
+            args: args.iter().map(|a| qualify_expr(a, qualifier)).collect(),
+        },
+        Expr::Cast { expr, ty } => Expr::Cast {
+            expr: Box::new(qualify_expr(expr, qualifier)),
+            ty: *ty,
+        },
+        Expr::Case {
+            operand,
+            whens,
+            else_result,
+        } => Expr::Case {
+            operand: operand
+                .as_ref()
+                .map(|o| Box::new(qualify_expr(o, qualifier))),
+            whens: whens
+                .iter()
+                .map(|(w, t)| (qualify_expr(w, qualifier), qualify_expr(t, qualifier)))
+                .collect(),
+            else_result: else_result
+                .as_ref()
+                .map(|e| Box::new(qualify_expr(e, qualifier))),
+        },
+        other => other.clone(),
+    }
+}
+
+/// `OR` a list of predicates, or `FALSE` when empty (RLS default deny).
+fn or_all(mut terms: Vec<Expr>) -> Expr {
+    let Some(first) = terms.pop() else {
+        return Expr::Literal(Value::Bool(false));
+    };
+    terms
+        .into_iter()
+        .fold(first, |acc, t| Expr::binary(BinOp::Or, t, acc))
+}
+
+/// `AND` a non-empty list of predicates.
+fn and_all(mut terms: Vec<Expr>) -> Expr {
+    let first = terms.pop().expect("and_all called with at least one term");
+    terms
+        .into_iter()
+        .fold(first, |acc, t| Expr::binary(BinOp::And, t, acc))
+}
+
+/// `AND` an optional existing predicate with a required one.
+fn and_two(existing: Option<Expr>, extra: Expr) -> Expr {
+    match existing {
+        Some(w) => Expr::binary(BinOp::And, w, extra),
+        None => extra,
+    }
+}
+
+/// `AND` an optional guard into an optional WHERE clause.
+fn and_opt(existing: Option<Expr>, guard: Option<Expr>) -> Option<Expr> {
+    match guard {
+        None => existing,
+        Some(g) => Some(and_two(existing, g)),
+    }
+}
+
+/// Add an RLS guard for one table reference: recurse into a derived-table
+/// subquery, or push the base table's policy predicate (qualified by its alias or
+/// name) onto `guards`.
+fn rls_guard_table_ref(db: &Database, table: &mut TableRef, guards: &mut Vec<Expr>) {
+    if let Some(sub) = table.subquery.take() {
+        table.subquery = Some(Box::new(db.apply_rls(*sub)));
+        return;
+    }
+    let qualifier = table.alias.clone().unwrap_or_else(|| table.name.clone());
+    if let Some(pred) = db.rls_predicate(&table.name, PolicyCommand::Select, Some(&qualifier)) {
+        guards.push(pred);
+    }
 }
 
 /// Every base-table name a statement reads, for privilege checks. Walks
@@ -5129,6 +5591,137 @@ mod tests {
             db.execute("CREATE ROLE mallory").unwrap_err(),
             DbError::PermissionDenied(_)
         ));
+    }
+
+    // --- row-level security ---
+
+    /// Set up a multi-tenant table with a USING policy keyed on `current_user`,
+    /// RLS enabled, and SELECT granted to PUBLIC. Two tenant rows are seeded.
+    fn rls_tenant_table(db: &mut Database) {
+        db.execute("CREATE TABLE docs (id INT, owner TEXT, body TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO docs VALUES (1, 'alice', 'a-doc'), (2, 'bob', 'b-doc')")
+            .unwrap();
+        db.execute("GRANT SELECT, INSERT, UPDATE, DELETE ON docs TO PUBLIC")
+            .unwrap();
+        db.execute("CREATE ROLE alice LOGIN").unwrap();
+        db.execute("CREATE ROLE bob LOGIN").unwrap();
+        db.execute("CREATE POLICY tenant ON docs USING ((owner = current_user()))")
+            .unwrap();
+        db.execute("ALTER TABLE docs ENABLE ROW LEVEL SECURITY")
+            .unwrap();
+    }
+
+    #[test]
+    fn rls_using_policy_filters_rows_by_role() {
+        let (_d, mut db) = db();
+        rls_tenant_table(&mut db);
+
+        db.set_session_user("alice");
+        let (_c, rows) = query(&mut db, "SELECT id FROM docs");
+        assert_eq!(rows, vec![vec![Value::Int(1)]], "alice sees only her row");
+
+        db.set_session_user("bob");
+        let (_c, rows) = query(&mut db, "SELECT id FROM docs");
+        assert_eq!(rows, vec![vec![Value::Int(2)]], "bob sees only his row");
+
+        // A superuser bypasses RLS and sees everything.
+        db.set_session_user(SUPER);
+        let (_c, rows) = query(&mut db, "SELECT id FROM docs ORDER BY id");
+        assert_eq!(rows, vec![vec![Value::Int(1)], vec![Value::Int(2)]]);
+    }
+
+    #[test]
+    fn rls_restricts_update_and_delete_to_visible_rows() {
+        let (_d, mut db) = db();
+        rls_tenant_table(&mut db);
+
+        db.set_session_user("alice");
+        // alice can update only her own row; bob's row is invisible, so the
+        // UPDATE affects nothing.
+        let out = db
+            .execute("UPDATE docs SET body = 'edited' WHERE id = 2")
+            .unwrap();
+        assert!(matches!(out, QueryOutcome::Mutation { affected: 0 }));
+        let out = db
+            .execute("UPDATE docs SET body = 'edited' WHERE id = 1")
+            .unwrap();
+        assert!(matches!(out, QueryOutcome::Mutation { affected: 1 }));
+        // Likewise DELETE only reaches her row.
+        let out = db.execute("DELETE FROM docs WHERE id = 2").unwrap();
+        assert!(matches!(out, QueryOutcome::Mutation { affected: 0 }));
+    }
+
+    #[test]
+    fn rls_with_check_blocks_inserting_other_tenants_rows() {
+        let (_d, mut db) = db();
+        rls_tenant_table(&mut db);
+
+        db.set_session_user("alice");
+        // The USING predicate doubles as the WITH CHECK: alice may insert her own
+        // row but not one owned by bob.
+        db.execute("INSERT INTO docs VALUES (3, 'alice', 'mine')")
+            .unwrap();
+        assert!(matches!(
+            db.execute("INSERT INTO docs VALUES (4, 'bob', 'spoof')")
+                .unwrap_err(),
+            DbError::PermissionDenied(_)
+        ));
+    }
+
+    #[test]
+    fn rls_default_denies_when_no_policy_matches() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE t (id INT)").unwrap();
+        db.execute("INSERT INTO t VALUES (1), (2)").unwrap();
+        db.execute("GRANT SELECT ON t TO PUBLIC").unwrap();
+        db.execute("CREATE ROLE carol LOGIN").unwrap();
+        // RLS enabled but no policy: a non-owner sees nothing.
+        db.execute("ALTER TABLE t ENABLE ROW LEVEL SECURITY")
+            .unwrap();
+        db.set_session_user("carol");
+        assert!(query(&mut db, "SELECT id FROM t").1.is_empty());
+    }
+
+    #[test]
+    fn rls_force_applies_to_the_owner_too() {
+        let (_d, mut db) = db();
+        db.execute("CREATE ROLE dan LOGIN").unwrap();
+        db.set_session_user("dan");
+        // dan owns the table.
+        db.execute("CREATE TABLE t (id INT, owner TEXT)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'dan'), (2, 'eve')")
+            .unwrap();
+        db.execute("CREATE POLICY p ON t USING ((owner = current_user()))")
+            .unwrap();
+        db.execute("ALTER TABLE t ENABLE ROW LEVEL SECURITY")
+            .unwrap();
+        // Without FORCE, the owner bypasses the policy and sees both rows.
+        assert_eq!(query(&mut db, "SELECT id FROM t ORDER BY id").1.len(), 2);
+        // FORCE makes the policy apply to the owner as well.
+        db.execute("ALTER TABLE t FORCE ROW LEVEL SECURITY")
+            .unwrap();
+        assert_eq!(
+            query(&mut db, "SELECT id FROM t").1,
+            vec![vec![Value::Int(1)]]
+        );
+    }
+
+    #[test]
+    fn rls_policies_survive_reopen() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("rls.db");
+        {
+            let mut db = Database::open(&path).expect("open");
+            rls_tenant_table(&mut db);
+        }
+        let mut db = Database::open(&path).expect("reopen");
+        db.set_session_user("alice");
+        // The policy and the enabled flag both reload.
+        assert_eq!(
+            query(&mut db, "SELECT id FROM docs").1,
+            vec![vec![Value::Int(1)]]
+        );
     }
 
     #[test]

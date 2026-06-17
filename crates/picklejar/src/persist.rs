@@ -579,6 +579,69 @@ pub fn load_acl(path: &Path) -> io::Result<AclData> {
     Ok(acl)
 }
 
+/// The persisted row-level-security state: per-table flags and the policy
+/// statements (stored as their canonical SQL text, re-parsed on load).
+#[derive(Debug, Default, Clone)]
+pub struct RlsData {
+    /// `(table, enabled, forced)`.
+    pub flags: Vec<(String, bool, bool)>,
+    /// Each a full `CREATE POLICY ...` statement.
+    pub policies: Vec<String>,
+}
+
+/// Persist the row-level-security state, one record per line, atomically.
+///
+/// # Errors
+///
+/// Returns an I/O error if the file cannot be written or renamed.
+pub fn save_rls(path: &Path, rls: &RlsData) -> io::Result<()> {
+    let mut out = String::new();
+    for (table, enabled, forced) in &rls.flags {
+        let _ = writeln!(
+            out,
+            "flags {table} {} {}",
+            u8::from(*enabled),
+            u8::from(*forced)
+        );
+    }
+    for policy in &rls.policies {
+        let _ = writeln!(out, "policy {policy}");
+    }
+    let tmp = path.with_extension("pol.tmp");
+    fs::write(&tmp, out.as_bytes())?;
+    fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// Read the row-level-security state. An absent file yields an empty set.
+///
+/// # Errors
+///
+/// Returns an I/O error if the file exists but is unreadable or malformed.
+pub fn load_rls(path: &Path) -> io::Result<RlsData> {
+    let text = match fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(RlsData::default()),
+        Err(e) => return Err(e),
+    };
+    let mut rls = RlsData::default();
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("flags ") {
+            let toks: Vec<&str> = rest.split_whitespace().collect();
+            if toks.len() != 3 {
+                return Err(invalid());
+            }
+            rls.flags
+                .push((toks[0].to_string(), toks[1] == "1", toks[2] == "1"));
+        } else if let Some(sql) = line.strip_prefix("policy ") {
+            rls.policies.push(sql.to_string());
+        } else if !line.trim().is_empty() {
+            return Err(invalid());
+        }
+    }
+    Ok(rls)
+}
+
 fn invalid() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, "malformed catalog metadata")
 }
