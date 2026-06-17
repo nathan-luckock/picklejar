@@ -109,6 +109,13 @@ cargo run --bin dst -- --seed 42             # replay one exactly
 
 DST is not decoration: it **found a real recovery bug**. An aborted transaction whose in-memory rollback was lost in the crash could resurrect its row, because recovery skips undo for a transaction that already logged `Abort`. The fix makes rollback log compensation records so redo reproduces it. A 5000-seed sweep now verifies 206,007 committed rows recover correctly. The write-up is in [docs/design.md](docs/design.md#crash-model-and-the-torture-test).
 
+For query correctness, a separate **differential tester checks rustdb against SQLite**. Each seed generates random SQL (joins, `GROUP BY` / `HAVING`, `DISTINCT`, three-valued NULL logic) in a dialect-shared subset and runs the identical query through both engines, comparing results as a sorted multiset. SQLite is the independent oracle, so any divergence is a rustdb bug.
+
+```bash
+cargo run --release --bin difftest -- 100000   # 100k queries vs SQLite
+cargo run --bin difftest -- --seed 42           # replay one exactly
+```
+
 ## Features
 
 - **DDL**: `CREATE TABLE` (with `PRIMARY KEY` / `UNIQUE` / `NOT NULL` / `DEFAULT`), `DROP TABLE`, `TRUNCATE TABLE`, `ALTER TABLE ... ADD COLUMN`, `CREATE INDEX`, and `CREATE VIEW` / `DROP VIEW`.
@@ -157,6 +164,7 @@ Every design decision, with the alternatives considered and rejected, is written
 | [`rustdb`](crates/rustdb/) | The embedded engine that wires every layer together |
 | [`rustdb-cli`](crates/rustdb-cli/) | The interactive shell |
 | [`rustdb-server`](crates/rustdb-server/) | The PostgreSQL-wire-protocol server (`rustdb-pg`) and an HTTP/JSON API |
+| [`rustdb-difftest`](crates/rustdb-difftest/) | Differential testing of the engine against SQLite |
 
 ## Build and test
 
@@ -173,8 +181,8 @@ The project targets Rust 1.80+ and has no external database, SQL-parser, wire-pr
 ## Roadmap
 
 Done: the storage / WAL+ARIES / MVCC / planner / executor core, a deep SQL
-surface, the PostgreSQL wire protocol, and deterministic simulation testing.
-Next: differential testing against SQLite, foreign-key and `CHECK` constraints,
+surface, the PostgreSQL wire protocol, deterministic simulation testing, and
+differential testing against SQLite. Next: foreign-key and `CHECK` constraints,
 more column types (`DATE` / `TIMESTAMP` / `DECIMAL`), the extended wire protocol
 for drivers, and concurrent connections (the engine is single-threaded today).
 See [docs/sprints.md](docs/sprints.md) and [docs/design.md](docs/design.md).

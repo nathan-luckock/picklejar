@@ -1,0 +1,21 @@
+[package]
+name = "rustdb-difftest"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Differential testing of the rustdb engine against SQLite."
+
+[[bin]]
+name = "difftest"
+path = "src/bin/difftest.rs"
+
+[dependencies]
+rustdb.workspace = true
+rusqlite = { version = "0.31", features = ["bundled"] }
+tempfile = "3"
+
+[lints]
+workspace = true
