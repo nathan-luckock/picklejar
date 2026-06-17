@@ -203,6 +203,10 @@ impl Database {
         db.load_views()?;
         db.load_constraints()?;
         db.load_serials()?;
+        // Register the read-only information_schema views so introspection
+        // queries bind. They are catalog-only (no physical store) and are built
+        // on demand by `EngineSource`, so they are never persisted.
+        db.register_system_tables();
         // Restore the transaction watermark so data committed in a previous
         // session stays visible (its xids would otherwise read as aborted).
         let (next_xid, aborted) = persist::load_txn(&db.txn_path)?;
@@ -382,6 +386,36 @@ impl Database {
         }
         persist::save_sequences(&self.seq_path, &records)?;
         Ok(())
+    }
+
+    /// Register the `information_schema` views in the catalog so introspection
+    /// queries bind. They carry no physical store; [`EngineSource`] materializes
+    /// their rows from the live catalog on each scan.
+    fn register_system_tables(&mut self) {
+        for name in SYSTEM_TABLES {
+            if self.catalog.get_table(name).is_some() {
+                continue;
+            }
+            let columns = system_table_schema(name)
+                .expect("a known system table")
+                .into_iter()
+                .map(|(c, ty)| ColumnDef {
+                    name: c.to_string(),
+                    ty,
+                    primary_key: false,
+                    not_null: false,
+                    unique: false,
+                    default: None,
+                    serial: false,
+                })
+                .collect();
+            let create = Statement::CreateTable {
+                name: name.to_string(),
+                columns,
+                constraints: Vec::new(),
+            };
+            let _ = self.catalog.apply(&create);
+        }
     }
 
     /// Flush every dirty page to the data file and rewrite the catalog
@@ -2126,9 +2160,55 @@ struct EngineSource<'a> {
     txn: &'a Transaction,
 }
 
+impl EngineSource<'_> {
+    /// Build a system view's rows from the live catalog. `table` must be a known
+    /// `information_schema` view.
+    fn system_relation(&self, table: &str) -> Relation {
+        let schema = system_table_schema(table).expect("a known system table");
+        let columns: Vec<String> = schema.iter().map(|(c, _)| (*c).to_string()).collect();
+        // List user tables only, in a stable order. The system views are
+        // catalog-only (absent from `tables`), so they exclude themselves.
+        let mut names: Vec<&String> = self.tables.keys().collect();
+        names.sort();
+        let mut rows: Vec<Vec<Value>> = Vec::new();
+        match table {
+            "information_schema.tables" => {
+                for name in names {
+                    rows.push(vec![
+                        Value::Text(name.clone()),
+                        Value::Text("BASE TABLE".to_string()),
+                    ]);
+                }
+            }
+            "information_schema.columns" => {
+                for name in names {
+                    let Some(meta) = self.catalog.get_table(name) else {
+                        continue;
+                    };
+                    for (i, col) in meta.columns.iter().enumerate() {
+                        rows.push(vec![
+                            Value::Text(name.clone()),
+                            Value::Text(col.name.clone()),
+                            Value::Int(i64::try_from(i + 1).unwrap_or(i64::MAX)),
+                            Value::Text(sql_type_name(col.ty).to_string()),
+                            Value::Text(if col.not_null { "NO" } else { "YES" }.to_string()),
+                        ]);
+                    }
+                }
+            }
+            _ => {}
+        }
+        Relation { columns, rows }
+    }
+}
+
 impl TableSource for EngineSource<'_> {
     fn scan(&self, table: &str) -> std::result::Result<Relation, rustdb_executor::ExecError> {
         use rustdb_executor::ExecError;
+        // The information_schema views are computed from the catalog, not stored.
+        if system_table_schema(table).is_some() {
+            return Ok(self.system_relation(table));
+        }
         let meta = self
             .catalog
             .get_table(table)
@@ -2238,6 +2318,39 @@ fn find_equality(predicate: &Expr, col: &str) -> Option<Value> {
             right,
         } => find_equality(left, col).or_else(|| find_equality(right, col)),
         _ => None,
+    }
+}
+
+/// The `information_schema` views the engine exposes for introspection.
+const SYSTEM_TABLES: [&str; 2] = ["information_schema.tables", "information_schema.columns"];
+
+/// The fixed schema of a system view, or `None` if `name` is not one. Used both
+/// to register the view in the catalog and to build its rows on scan.
+fn system_table_schema(name: &str) -> Option<Vec<(&'static str, DataType)>> {
+    match name {
+        "information_schema.tables" => Some(vec![
+            ("table_name", DataType::Text),
+            ("table_type", DataType::Text),
+        ]),
+        "information_schema.columns" => Some(vec![
+            ("table_name", DataType::Text),
+            ("column_name", DataType::Text),
+            ("ordinal_position", DataType::Int),
+            ("data_type", DataType::Text),
+            ("is_nullable", DataType::Text),
+        ]),
+        _ => None,
+    }
+}
+
+/// The SQL type name reported by `information_schema.columns`, in the
+/// Postgres-style spelling tools expect.
+const fn sql_type_name(ty: DataType) -> &'static str {
+    match ty {
+        DataType::Int => "integer",
+        DataType::Float => "double precision",
+        DataType::Bool => "boolean",
+        DataType::Text => "text",
     }
 }
 
@@ -3693,6 +3806,73 @@ mod tests {
             .execute("WITH c AS (SELECT id FROM c) SELECT id FROM c")
             .unwrap_err();
         assert!(matches!(err, DbError::Unsupported(_)), "got {err:?}");
+    }
+
+    // --- information_schema ---
+
+    #[test]
+    fn information_schema_tables_lists_user_tables() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE alpha (id INT)").unwrap();
+        db.execute("CREATE TABLE beta (id INT, name TEXT)").unwrap();
+        // Only user tables appear; the views exclude themselves.
+        let (cols, rows) = query(
+            &mut db,
+            "SELECT table_name, table_type FROM information_schema.tables ORDER BY table_name",
+        );
+        assert_eq!(names(&cols), ["table_name", "table_type"]);
+        assert_eq!(
+            rows,
+            vec![
+                vec![
+                    Value::Text("alpha".into()),
+                    Value::Text("BASE TABLE".into())
+                ],
+                vec![Value::Text("beta".into()), Value::Text("BASE TABLE".into())],
+            ]
+        );
+    }
+
+    #[test]
+    fn information_schema_columns_describes_a_table() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")
+            .unwrap();
+        // A PRIMARY KEY column is NOT NULL; a plain column is nullable.
+        let (_c, rows) = query(
+            &mut db,
+            "SELECT column_name, ordinal_position, data_type, is_nullable FROM information_schema.columns WHERE table_name = 't' ORDER BY ordinal_position",
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec![
+                    Value::Text("id".into()),
+                    Value::Int(1),
+                    Value::Text("integer".into()),
+                    Value::Text("NO".into()),
+                ],
+                vec![
+                    Value::Text("name".into()),
+                    Value::Int(2),
+                    Value::Text("text".into()),
+                    Value::Text("YES".into()),
+                ],
+            ]
+        );
+    }
+
+    #[test]
+    fn information_schema_can_be_aliased_and_counted() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE a (x INT)").unwrap();
+        db.execute("CREATE TABLE b (x INT)").unwrap();
+        // An aggregate over a system view, with an alias on the qualified name.
+        let (_c, rows) = query(
+            &mut db,
+            "SELECT COUNT(*) FROM information_schema.tables AS t",
+        );
+        assert_eq!(rows, vec![vec![Value::Int(2)]]);
     }
 
     // --- subqueries (uncorrelated scalar and IN) ---
