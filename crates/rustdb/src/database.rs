@@ -2701,6 +2701,10 @@ impl Database {
                 op: *op,
                 expr: Box::new(self.fold_expr(txn, expr)?),
             }),
+            Expr::Cast { expr, ty } => Ok(Expr::Cast {
+                expr: Box::new(self.fold_expr(txn, expr)?),
+                ty: *ty,
+            }),
             Expr::Func {
                 name,
                 distinct,
@@ -3805,6 +3809,9 @@ fn const_eval(expr: &Expr) -> Result<Value> {
             Value::Bool(b) => Ok(Value::Bool(!b)),
             _ => Err(DbError::Unsupported("NOT on a non-boolean".into())),
         },
+        // A cast over a constant (e.g. `CAST('5' AS INT)` in VALUES or a
+        // DEFAULT) folds to its converted value.
+        Expr::Cast { expr, ty } => Ok(rustdb_executor::eval::cast(&const_eval(expr)?, *ty)?),
         _ => Err(DbError::Unsupported(
             "non-constant expression in INSERT".into(),
         )),
@@ -6628,6 +6635,41 @@ mod tests {
         assert!(db
             .execute("INSERT INTO events VALUES (3, 'not-a-date', NULL)")
             .is_err());
+    }
+
+    #[test]
+    fn cast_converts_between_types() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE t (n INT, x FLOAT, s TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (5, 2.7, '42')").unwrap();
+        let (cols, rows) = query(
+            &mut db,
+            "SELECT CAST(x AS INT), CAST(n AS TEXT), CAST(s AS INT), CAST(n AS BOOL), \
+             '2024-01-15'::date, CAST(x AS FLOAT) FROM t",
+        );
+        assert_eq!(cols.len(), 6);
+        assert_eq!(
+            rows[0],
+            vec![
+                Value::Int(3), // 2.7 rounds to 3
+                Value::Text("5".into()),
+                Value::Int(42),
+                Value::Bool(true),
+                Value::Date(parse_day("2024-01-15")),
+                Value::Float(2.7),
+            ]
+        );
+        // A cast can drive a WHERE predicate.
+        let (_c, hit) = query(&mut db, "SELECT n FROM t WHERE CAST(s AS INT) > 40");
+        assert_eq!(hit, vec![vec![Value::Int(5)]]);
+        // An unparseable text cast errors.
+        assert!(db.execute("SELECT CAST('nope' AS INT) FROM t").is_err());
+        // A constant cast folds in INSERT VALUES.
+        db.execute("INSERT INTO t (n) VALUES (CAST('7' AS INT))")
+            .unwrap();
+        let (_c, n) = query(&mut db, "SELECT n FROM t WHERE x IS NULL");
+        assert_eq!(n, vec![vec![Value::Int(7)]]);
     }
 
     fn parse_day(s: &str) -> i64 {

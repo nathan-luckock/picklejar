@@ -58,6 +58,10 @@ The complete engine and SQL surface. For the *why* behind each decision, see
   they compare, `ORDER BY`, and index as time, not text. The date math is
   in-tree (no external crate); a column named `date` still works, since the
   type words are not reserved.
+- **Casts** — `CAST(expr AS type)` and the `expr::type` shorthand, converting
+  between `INT` / `FLOAT` / `BOOL` / `TEXT` / `DATE` / `TIMESTAMP` (text is
+  parsed, a float rounds to an int, any value renders to text, a timestamp
+  truncates to a date). A cast over a constant folds at insert time.
 - **Expressions** — `INT` / `FLOAT` / `BOOL` / `TEXT` / `DATE` / `TIMESTAMP`,
   arithmetic with int-to-float promotion, `IN` / `BETWEEN` / `LIKE` / `IS NULL`,
   `CASE`, string `||`, and a library of scalar functions: string (`LENGTH`,

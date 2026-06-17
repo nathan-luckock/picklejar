@@ -225,6 +225,14 @@ pub enum Expr {
         /// The `ELSE` result, or `None` (which yields `NULL`).
         else_result: Option<Box<Self>>,
     },
+    /// `CAST(expr AS type)` (or the `expr::type` shorthand): convert a value to
+    /// another type. Always printed in the canonical `CAST(... AS ...)` form.
+    Cast {
+        /// The value being converted.
+        expr: Box<Self>,
+        /// The target type.
+        ty: crate::statement::DataType,
+    },
     /// A scalar subquery `(SELECT ...)` used as a value. Evaluated to a single
     /// value before planning (uncorrelated subqueries only).
     Subquery(Box<crate::statement::Statement>),
@@ -305,6 +313,10 @@ impl Expr {
                 else_result: else_result
                     .as_ref()
                     .map(|e| Box::new(e.substitute_params(params))),
+            },
+            Self::Cast { expr, ty } => Self::Cast {
+                expr: Box::new(expr.substitute_params(params)),
+                ty: *ty,
             },
             Self::Subquery(q) => Self::Subquery(Box::new(q.substitute_params(params))),
             Self::Exists(q) => Self::Exists(Box::new(q.substitute_params(params))),
@@ -419,6 +431,7 @@ impl fmt::Display for Expr {
                 }
                 f.write_str(" END")
             }
+            Self::Cast { expr, ty } => write!(f, "CAST({expr} AS {ty})"),
             Self::Subquery(q) => write!(f, "({q})"),
             Self::InSubquery {
                 expr,

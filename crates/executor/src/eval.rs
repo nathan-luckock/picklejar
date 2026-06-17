@@ -8,6 +8,7 @@
 
 use std::cmp::Ordering;
 
+use rustdb_sql::statement::DataType;
 use rustdb_sql::{BinOp, Expr, UnOp, Value};
 
 use crate::error::{ExecError, Result};
@@ -71,6 +72,7 @@ pub fn eval_with(
         // output column by its rendered name.
         Expr::Func { name, args, .. } => eval_scalar_func(name, args, row, columns, runner)?
             .map_or_else(|| resolve(&expr.to_string(), row, columns), Ok),
+        Expr::Cast { expr, ty } => cast(&eval_with(expr, row, columns, runner)?, *ty),
         Expr::Case {
             operand,
             whens,
@@ -391,6 +393,70 @@ fn eval_binary(
         BinOp::Concat => Ok(Value::Text(value_text(&l) + &value_text(&r))),
         BinOp::And | BinOp::Or => unreachable!("handled above"),
     }
+}
+
+/// Convert a value to `ty`, the engine for `CAST(expr AS ty)` and `expr::ty`.
+///
+/// NULL casts to NULL. A text source is parsed; a number, boolean, or temporal
+/// value converts where there is a meaningful conversion, and errors otherwise.
+///
+/// # Errors
+///
+/// Returns an error if there is no conversion to `ty`, or a text source does not
+/// parse as the target type.
+#[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+pub fn cast(v: &Value, ty: DataType) -> Result<Value> {
+    use rustdb_sql::datetime;
+    if matches!(v, Value::Null) {
+        return Ok(Value::Null);
+    }
+    let bad = || ExecError::Type(format!("cannot cast {v:?} to {ty:?}"));
+    let parse_fail = |what: &str, s: &str| ExecError::Type(format!("invalid {what}: {s:?}"));
+    let out = match ty {
+        DataType::Int => match v {
+            Value::Int(n) => Value::Int(*n),
+            // Float to int rounds to the nearest integer (saturating).
+            Value::Float(x) => Value::Int(x.round() as i64),
+            Value::Bool(b) => Value::Int(i64::from(*b)),
+            Value::Text(s) => Value::Int(s.trim().parse().map_err(|_| parse_fail("integer", s))?),
+            _ => return Err(bad()),
+        },
+        DataType::Float => match v {
+            Value::Float(x) => Value::Float(*x),
+            Value::Int(n) => Value::Float(*n as f64),
+            Value::Text(s) => Value::Float(s.trim().parse().map_err(|_| parse_fail("float", s))?),
+            _ => return Err(bad()),
+        },
+        DataType::Bool => match v {
+            Value::Bool(b) => Value::Bool(*b),
+            Value::Int(n) => Value::Bool(*n != 0),
+            Value::Text(s) => match s.trim().to_ascii_lowercase().as_str() {
+                "true" | "t" | "1" => Value::Bool(true),
+                "false" | "f" | "0" => Value::Bool(false),
+                _ => return Err(parse_fail("boolean", s)),
+            },
+            _ => return Err(bad()),
+        },
+        // Any value renders to its canonical text form.
+        DataType::Text => Value::Text(value_text(v)),
+        DataType::Date => match v {
+            Value::Date(d) => Value::Date(*d),
+            Value::Timestamp(micros) => Value::Date(micros.div_euclid(datetime::MICROS_PER_DAY)),
+            Value::Text(s) => {
+                Value::Date(datetime::parse_date(s.trim()).ok_or_else(|| parse_fail("date", s))?)
+            }
+            _ => return Err(bad()),
+        },
+        DataType::Timestamp => match v {
+            Value::Timestamp(m) => Value::Timestamp(*m),
+            Value::Date(d) => Value::Timestamp(*d * datetime::MICROS_PER_DAY),
+            Value::Text(s) => Value::Timestamp(
+                datetime::parse_timestamp(s.trim()).ok_or_else(|| parse_fail("timestamp", s))?,
+            ),
+            _ => return Err(bad()),
+        },
+    };
+    Ok(out)
 }
 
 /// Render a non-NULL value as the text `||` and `CONCAT` use.

@@ -42,6 +42,7 @@ pub enum Keyword {
     Analyze,
     Vacuum,
     Copy,
+    Cast,
     Add,
     Column,
     View,
@@ -135,6 +136,7 @@ impl Keyword {
             "analyze" => Self::Analyze,
             "vacuum" => Self::Vacuum,
             "copy" => Self::Copy,
+            "cast" => Self::Cast,
             "add" => Self::Add,
             "column" => Self::Column,
             "view" => Self::View,
@@ -256,6 +258,8 @@ pub enum TokenKind {
     Semicolon,
     /// `.`
     Dot,
+    /// `::` (the cast operator)
+    ColonColon,
     /// End of input.
     Eof,
 }

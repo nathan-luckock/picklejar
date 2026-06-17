@@ -379,7 +379,21 @@ impl Parser {
 
     /// Parse a prefix position: literals, columns, parens, and the prefix
     /// operators `NOT` and unary `-`.
+    /// Parse a prefix expression, then apply any postfix `::type` casts (which
+    /// bind tighter than every operator).
     fn parse_prefix(&mut self) -> Result<Expr> {
+        let mut expr = self.parse_atom()?;
+        while self.eat(&TokenKind::ColonColon) {
+            let ty = self.parse_data_type()?;
+            expr = Expr::Cast {
+                expr: Box::new(expr),
+                ty,
+            };
+        }
+        Ok(expr)
+    }
+
+    fn parse_atom(&mut self) -> Result<Expr> {
         match self.peek().clone() {
             TokenKind::Keyword(Keyword::Not) => {
                 self.advance();
@@ -443,6 +457,18 @@ impl Parser {
                 self.advance();
                 self.parse_case()
             }
+            TokenKind::Keyword(Keyword::Cast) => {
+                self.advance();
+                self.expect(&TokenKind::LParen)?;
+                let expr = self.parse_expr()?;
+                self.expect_keyword(Keyword::As)?;
+                let ty = self.parse_data_type()?;
+                self.expect(&TokenKind::RParen)?;
+                Ok(Expr::Cast {
+                    expr: Box::new(expr),
+                    ty,
+                })
+            }
             TokenKind::Keyword(Keyword::Exists) => {
                 self.advance();
                 self.expect(&TokenKind::LParen)?;
@@ -504,6 +530,37 @@ impl Parser {
         } else {
             Ok(Expr::Column(name))
         }
+    }
+
+    /// Parse a data-type name (for `CAST(... AS type)` and column definitions).
+    /// `SERIAL` is intentionally not accepted here: it is a column-only flag,
+    /// handled by the column parser. `DATE` / `TIMESTAMP` are not reserved, so
+    /// they are matched as identifiers.
+    pub(crate) fn parse_data_type(&mut self) -> Result<crate::statement::DataType> {
+        use crate::statement::DataType;
+        let ty = match self.peek() {
+            TokenKind::Keyword(Keyword::Int) => DataType::Int,
+            TokenKind::Keyword(Keyword::Float) => DataType::Float,
+            TokenKind::Keyword(Keyword::Bool) => DataType::Bool,
+            TokenKind::Keyword(Keyword::Text) => DataType::Text,
+            TokenKind::Ident(s) if s.eq_ignore_ascii_case("date") => DataType::Date,
+            TokenKind::Ident(s)
+                if s.eq_ignore_ascii_case("timestamp") || s.eq_ignore_ascii_case("datetime") =>
+            {
+                DataType::Timestamp
+            }
+            other => {
+                return Err(SqlError::parse(
+                    format!(
+                        "expected a type (INT, FLOAT, BOOL, TEXT, DATE, or TIMESTAMP), \
+                         found {other:?}"
+                    ),
+                    self.span(),
+                ));
+            }
+        };
+        self.advance();
+        Ok(ty)
     }
 
     /// Parse the string following a `DATE` / `TIMESTAMP` type word into the
