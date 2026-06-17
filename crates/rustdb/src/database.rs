@@ -36,7 +36,8 @@ use rustdb_planner::{bind, explain, plan, Catalog, ColumnStats};
 use crate::correlated;
 use crate::correlated::{CorrelatedRunner, MaterializedSource};
 use rustdb_sql::statement::{
-    ColumnDef, DataType, Join, OrderItem, Select, SelectItem, TableConstraint, TableRef,
+    ColumnDef, ConflictAction, DataType, Join, OnConflict, OrderItem, Select, SelectItem,
+    TableConstraint, TableRef,
 };
 use rustdb_sql::{BinOp, Expr, Parser, Statement, UnOp, Value};
 use rustdb_storage::{BufferPool, FileManager, PageId};
@@ -549,8 +550,9 @@ impl Database {
                 table,
                 columns,
                 rows,
+                on_conflict,
                 returning,
-            } => self.insert(txn, table, columns, rows, returning),
+            } => self.insert(txn, table, columns, rows, on_conflict.as_ref(), returning),
             Statement::Update {
                 table,
                 assignments,
@@ -1106,6 +1108,7 @@ impl Database {
         table: &str,
         columns: &[String],
         rows: &[Vec<Expr>],
+        on_conflict: Option<&OnConflict>,
         returning: &[SelectItem],
     ) -> Result<QueryOutcome> {
         // Resolve the schema, the column-to-position mapping, and the column
@@ -1200,7 +1203,186 @@ impl Database {
             built.push(values);
         }
 
-        // Pass 2: enforce UNIQUE and write the validated rows.
+        // The UNIQUE columns and the ON CONFLICT arbiter (the columns whose
+        // collision the clause resolves). An explicit `ON CONFLICT (cols)`
+        // names the arbiter; otherwise every UNIQUE column arbitrates.
+        let unique_cols: Vec<usize> = col_meta
+            .iter()
+            .enumerate()
+            .filter_map(|(i, (_, _, unique))| unique.then_some(i))
+            .collect();
+        let arbiter: Vec<usize> = match on_conflict {
+            Some(oc) if !oc.target.is_empty() => oc
+                .target
+                .iter()
+                .map(|name| {
+                    column_names.iter().position(|c| c == name).ok_or_else(|| {
+                        DbError::UnknownColumn {
+                            table: table.to_string(),
+                            column: name.clone(),
+                        }
+                    })
+                })
+                .collect::<Result<_>>()?,
+            _ => unique_cols.clone(),
+        };
+        let has_target = matches!(on_conflict, Some(oc) if !oc.target.is_empty());
+        if let Some(OnConflict {
+            target,
+            action: ConflictAction::Update { .. },
+        }) = on_conflict
+        {
+            if target.is_empty() {
+                return Err(DbError::Unsupported(
+                    "ON CONFLICT DO UPDATE requires a conflict target".into(),
+                ));
+            }
+        }
+
+        // Snapshot the live rows (rowid plus values) once, so conflict
+        // detection and the DO UPDATE target lookup read a stable picture.
+        let (snap_root, snap_version) = {
+            let s = self
+                .tables
+                .get(table)
+                .ok_or_else(|| DbError::UnknownTable(table.to_string()))?;
+            (s.index_root, s.version_page)
+        };
+        let snap = MvccTable::open(
+            &self.pool,
+            self.wal.clone(),
+            &self.mgr,
+            snap_root,
+            snap_version,
+        );
+        let mut existing: Vec<(u64, Vec<Value>)> = Vec::new();
+        for (key, bytes) in snap.scan(txn)? {
+            existing.push((key, decode_row(&bytes, &schema)?));
+        }
+
+        // Closure-free conflict test: does `row` collide with `cand` on the
+        // arbiter (with a target) or on any single UNIQUE column (without one)?
+        let collides = |cand: &[Value], row: &[Value]| -> bool {
+            if has_target {
+                rows_match_on(cand, row, &arbiter)
+            } else {
+                unique_cols.iter().any(|&c| rows_match_on(cand, row, &[c]))
+            }
+        };
+
+        // Plan each row: an insert, a skip (DO NOTHING / failed WHERE), or an
+        // update of the conflicting row. Values claimed by earlier rows of this
+        // same statement are tracked so an intra-statement duplicate is caught.
+        let mut planned: Vec<Vec<Value>> = Vec::new();
+        let mut plans: Vec<RowPlan> = Vec::with_capacity(built.len());
+        for values in built {
+            let hit = existing
+                .iter()
+                .find(|(_, row)| collides(&values, row))
+                .map(|(rid, _)| *rid);
+            let intra = planned.iter().any(|row| collides(&values, row));
+
+            match on_conflict {
+                None => {
+                    if hit.is_some() || intra {
+                        let col = unique_cols
+                            .iter()
+                            .find(|&&c| {
+                                !matches!(values[c], Value::Null)
+                                    && (existing
+                                        .iter()
+                                        .any(|(_, r)| rows_match_on(&values, r, &[c]))
+                                        || planned.iter().any(|r| rows_match_on(&values, r, &[c])))
+                            })
+                            .copied()
+                            .unwrap_or(0);
+                        return Err(DbError::Constraint(format!(
+                            "duplicate value in column {}",
+                            col_meta[col].0
+                        )));
+                    }
+                    planned.push(values.clone());
+                    plans.push(RowPlan::Insert(values));
+                }
+                Some(oc) => match &oc.action {
+                    ConflictAction::Nothing => {
+                        if hit.is_some() || intra {
+                            plans.push(RowPlan::Skip);
+                        } else {
+                            planned.push(values.clone());
+                            plans.push(RowPlan::Insert(values));
+                        }
+                    }
+                    ConflictAction::Update {
+                        assignments,
+                        where_clause,
+                    } => {
+                        if let Some(rowid) = hit {
+                            let existing_row = existing
+                                .iter()
+                                .find(|(rid, _)| *rid == rowid)
+                                .map(|(_, r)| r.clone())
+                                .expect("conflicting rowid is present in the snapshot");
+                            // Evaluate the SET list and WHERE against a combined
+                            // row: bare names bind to the existing row, and
+                            // `excluded.col` to the rejected (proposed) row.
+                            let mut combined_cols: Vec<String> = column_names.clone();
+                            combined_cols
+                                .extend(column_names.iter().map(|c| format!("excluded.{c}")));
+                            let mut combined_row: Vec<Value> = existing_row.clone();
+                            combined_row.extend(values.clone());
+                            let apply = match where_clause {
+                                Some(w) => is_truthy(&eval(w, &combined_row, &combined_cols)?),
+                                None => true,
+                            };
+                            if apply {
+                                let mut new_row = existing_row;
+                                for (col, expr) in assignments {
+                                    let idx = column_names
+                                        .iter()
+                                        .position(|c| c == col)
+                                        .ok_or_else(|| DbError::UnknownColumn {
+                                            table: table.to_string(),
+                                            column: col.clone(),
+                                        })?;
+                                    new_row[idx] = eval(expr, &combined_row, &combined_cols)?;
+                                }
+                                // Validate the updated row as any written row is.
+                                for (i, (name, not_null, _)) in col_meta.iter().enumerate() {
+                                    if *not_null && matches!(new_row[i], Value::Null) {
+                                        return Err(DbError::Constraint(format!(
+                                            "column {name} cannot be NULL"
+                                        )));
+                                    }
+                                }
+                                self.enforce_checks(table, &column_names, &new_row)?;
+                                self.enforce_fk_child(txn, table, &column_names, &new_row)?;
+                                // Reflect the change in the snapshot so a later
+                                // row of this statement sees the updated value.
+                                if let Some(slot) =
+                                    existing.iter_mut().find(|(rid, _)| *rid == rowid)
+                                {
+                                    slot.1.clone_from(&new_row);
+                                }
+                                plans.push(RowPlan::Update { rowid, new_row });
+                            } else {
+                                plans.push(RowPlan::Skip);
+                            }
+                        } else if intra {
+                            return Err(DbError::Unsupported(
+                                "ON CONFLICT DO UPDATE cannot affect one row twice in a statement"
+                                    .into(),
+                            ));
+                        } else {
+                            planned.push(values.clone());
+                            plans.push(RowPlan::Insert(values));
+                        }
+                    }
+                },
+            }
+        }
+
+        // Execute the plan under the mutable table borrow.
         let store = self
             .tables
             .get_mut(table)
@@ -1212,51 +1394,31 @@ impl Database {
             store.index_root,
             store.version_page,
         );
-
-        // For each UNIQUE column, gather the values already present so
-        // duplicates (including duplicates within this statement) are caught.
-        let unique_cols: Vec<usize> = col_meta
-            .iter()
-            .enumerate()
-            .filter_map(|(i, (_, _, unique))| unique.then_some(i))
-            .collect();
-        let mut seen: Vec<Vec<Value>> = vec![Vec::new(); unique_cols.len()];
-        if !unique_cols.is_empty() {
-            for (_, bytes) in handle.scan(txn)? {
-                let row = decode_row(&bytes, &schema)?;
-                for (slot, &col) in unique_cols.iter().enumerate() {
-                    if !matches!(row[col], Value::Null) {
-                        seen[slot].push(row[col].clone());
+        let mut inserted: Vec<Vec<Value>> = Vec::with_capacity(plans.len());
+        for plan in plans {
+            match plan {
+                RowPlan::Skip => {}
+                RowPlan::Insert(values) => {
+                    let rowid = store.next_rowid;
+                    handle.insert(txn, rowid, &encode_row(&values, &schema)?)?;
+                    for sec in &mut store.secondary {
+                        let index = Index::open(&self.pool, sec.root);
+                        index.put(&values[sec.column], rowid)?;
+                        sec.root = index.root();
                     }
+                    store.next_rowid += 1;
+                    inserted.push(values);
+                }
+                RowPlan::Update { rowid, new_row } => {
+                    handle.update(txn, rowid, &encode_row(&new_row, &schema)?)?;
+                    for sec in &mut store.secondary {
+                        let index = Index::open(&self.pool, sec.root);
+                        index.put(&new_row[sec.column], rowid)?;
+                        sec.root = index.root();
+                    }
+                    inserted.push(new_row);
                 }
             }
-        }
-
-        let mut inserted: Vec<Vec<Value>> = Vec::with_capacity(built.len());
-        for values in built {
-            // UNIQUE (NULLs do not conflict).
-            for (slot, &col) in unique_cols.iter().enumerate() {
-                if !matches!(values[col], Value::Null) {
-                    if seen[slot].contains(&values[col]) {
-                        return Err(DbError::Constraint(format!(
-                            "duplicate value in column {}",
-                            col_meta[col].0
-                        )));
-                    }
-                    seen[slot].push(values[col].clone());
-                }
-            }
-            let rowid = store.next_rowid;
-            let bytes = encode_row(&values, &schema)?;
-            handle.insert(txn, rowid, &bytes)?;
-            // Maintain the physical secondary indexes: record value -> rowid.
-            for sec in &mut store.secondary {
-                let index = Index::open(&self.pool, sec.root);
-                index.put(&values[sec.column], rowid)?;
-                sec.root = index.root();
-            }
-            store.next_rowid += 1;
-            inserted.push(values);
         }
         let affected = inserted.len();
 
@@ -1911,6 +2073,27 @@ fn find_equality(predicate: &Expr, col: &str) -> Option<Value> {
         } => find_equality(left, col).or_else(|| find_equality(right, col)),
         _ => None,
     }
+}
+
+/// The planned outcome for one row of an `INSERT ... ON CONFLICT`.
+enum RowPlan {
+    /// Write the row as a fresh tuple.
+    Insert(Vec<Value>),
+    /// Drop the row (a `DO NOTHING` conflict, or a `DO UPDATE` whose `WHERE`
+    /// was false).
+    Skip,
+    /// Overwrite the conflicting existing row (`rowid`) with `new_row`.
+    Update { rowid: u64, new_row: Vec<Value> },
+}
+
+/// Whether `cand` and `row` are equal on every column in `cols`, treating a
+/// NULL on either side as never matching (SQL UNIQUE semantics). An empty
+/// `cols` never matches.
+fn rows_match_on(cand: &[Value], row: &[Value], cols: &[usize]) -> bool {
+    !cols.is_empty()
+        && cols.iter().all(|&c| {
+            !matches!(cand[c], Value::Null) && !matches!(row[c], Value::Null) && cand[c] == row[c]
+        })
 }
 
 /// Desugar `lhs [NOT] IN (v1, v2, ...)` to a chain of equalities, the same
@@ -3553,6 +3736,123 @@ mod tests {
         );
         assert_eq!(names(&cols), ["id"]);
         assert_eq!(rows, vec![vec![Value::Int(1)], vec![Value::Int(2)]]);
+    }
+
+    // --- ON CONFLICT ---
+
+    #[test]
+    fn on_conflict_do_nothing_skips_the_duplicate() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, n INT)")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+        // The conflicting row is skipped; the fresh row is inserted; no error.
+        let out = db
+            .execute("INSERT INTO t VALUES (1, 99), (2, 20) ON CONFLICT DO NOTHING")
+            .unwrap();
+        assert_eq!(out, QueryOutcome::Mutation { affected: 1 });
+        assert_eq!(
+            dump(&db, "t"),
+            vec![
+                vec![Value::Int(1), Value::Int(10)],
+                vec![Value::Int(2), Value::Int(20)],
+            ]
+        );
+    }
+
+    #[test]
+    fn on_conflict_do_update_overwrites_existing() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, n INT)")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+        // The upsert updates the existing row in place, using EXCLUDED for the
+        // rejected row's value, and inserts the non-conflicting row.
+        db.execute(
+            "INSERT INTO t VALUES (1, 5), (2, 20) ON CONFLICT (id) DO UPDATE SET n = excluded.n",
+        )
+        .unwrap();
+        assert_eq!(
+            dump(&db, "t"),
+            vec![
+                vec![Value::Int(1), Value::Int(5)],
+                vec![Value::Int(2), Value::Int(20)],
+            ]
+        );
+    }
+
+    #[test]
+    fn on_conflict_do_update_can_read_the_existing_row() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, n INT)")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+        // SET n = n + excluded.n accumulates: existing 10 plus proposed 5.
+        db.execute("INSERT INTO t VALUES (1, 5) ON CONFLICT (id) DO UPDATE SET n = n + excluded.n")
+            .unwrap();
+        assert_eq!(dump(&db, "t"), vec![vec![Value::Int(1), Value::Int(15)]]);
+    }
+
+    #[test]
+    fn on_conflict_do_update_where_gates_the_update() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, n INT)")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 100)").unwrap();
+        // The guard is false (100 < 5 is false), so the existing row stays.
+        db.execute(
+            "INSERT INTO t VALUES (1, 5) ON CONFLICT (id) DO UPDATE SET n = excluded.n WHERE n < excluded.n",
+        )
+        .unwrap();
+        assert_eq!(dump(&db, "t"), vec![vec![Value::Int(1), Value::Int(100)]]);
+    }
+
+    #[test]
+    fn on_conflict_do_update_returns_the_final_rows() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, n INT)")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+        let (cols, rows) = query(
+            &mut db,
+            "INSERT INTO t VALUES (1, 7), (2, 20) ON CONFLICT (id) DO UPDATE SET n = excluded.n RETURNING id, n",
+        );
+        assert_eq!(names(&cols), ["id", "n"]);
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Int(1), Value::Int(7)],
+                vec![Value::Int(2), Value::Int(20)],
+            ]
+        );
+    }
+
+    #[test]
+    fn without_on_conflict_a_duplicate_still_errors() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, n INT)")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+        // The clause is opt-in: a plain INSERT of a duplicate is still rejected.
+        assert!(db.execute("INSERT INTO t VALUES (1, 99)").is_err());
+    }
+
+    #[test]
+    fn on_conflict_upsert_survives_reopen() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("test.db");
+        {
+            let mut db = Database::open(&path).expect("open");
+            db.execute("CREATE TABLE t (id INT PRIMARY KEY, n INT)")
+                .unwrap();
+            db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+            db.execute(
+                "INSERT INTO t VALUES (1, 42) ON CONFLICT (id) DO UPDATE SET n = excluded.n",
+            )
+            .unwrap();
+        }
+        let db = Database::open(&path).expect("reopen");
+        assert_eq!(dump(&db, "t"), vec![vec![Value::Int(1), Value::Int(42)]]);
     }
 
     // --- CHECK constraints ---
