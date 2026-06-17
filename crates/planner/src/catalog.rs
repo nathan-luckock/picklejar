@@ -46,13 +46,23 @@ pub struct ColumnStats {
     /// Number of distinct values (cardinality). Used for equality
     /// selectivity (`1 / distinct`). Never zero.
     pub distinct: u64,
+    /// Smallest integer value seen, for range selectivity (`None` for a
+    /// non-integer column or before `ANALYZE`).
+    pub min: Option<i64>,
+    /// Largest integer value seen, for range selectivity.
+    pub max: Option<i64>,
 }
 
 impl Default for ColumnStats {
     fn default() -> Self {
         // A single distinct value is the most pessimistic non-degenerate
-        // default: equality selectivity 1.0 (matches every row).
-        Self { distinct: 1 }
+        // default: equality selectivity 1.0 (matches every row). No min/max
+        // means range estimates fall back to the textbook default.
+        Self {
+            distinct: 1,
+            min: None,
+            max: None,
+        }
     }
 }
 
@@ -360,11 +370,24 @@ mod tests {
         // Defaults.
         let t = c.get_table("t").expect("table");
         assert_eq!(t.stats.row_count, 0);
-        assert_eq!(t.column_stats("a"), ColumnStats { distinct: 1 });
+        assert_eq!(
+            t.column_stats("a"),
+            ColumnStats {
+                distinct: 1,
+                ..Default::default()
+            }
+        );
         // Set.
         c.set_row_count("t", 1000).expect("rows");
-        c.set_column_stats("t", "a", ColumnStats { distinct: 500 })
-            .expect("stats");
+        c.set_column_stats(
+            "t",
+            "a",
+            ColumnStats {
+                distinct: 500,
+                ..Default::default()
+            },
+        )
+        .expect("stats");
         let t = c.get_table("t").expect("table");
         assert_eq!(t.stats.row_count, 1000);
         assert_eq!(t.column_stats("a").distinct, 500);

@@ -42,6 +42,10 @@ The complete engine and SQL surface. For the *why* behind each decision, see
   auto-commit otherwise.
 - **`EXPLAIN`** — the cost-annotated physical plan, showing the planner's scan
   and join choices.
+- **`ANALYZE [table]`** — scan the live rows and record real per-column
+  statistics (distinct count and integer min/max) so the cost model estimates
+  selectivity from data instead of defaults; a range bound now uses the
+  column's observed `[min, max]` span.
 
 ## Engine
 

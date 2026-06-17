@@ -203,8 +203,15 @@ mod tests {
             .unwrap();
         c.apply(&stmt("CREATE INDEX idx_id ON parts (id)")).unwrap();
         c.set_row_count("parts", 1000).unwrap();
-        c.set_column_stats("parts", "id", ColumnStats { distinct: 1000 })
-            .unwrap();
+        c.set_column_stats(
+            "parts",
+            "id",
+            ColumnStats {
+                distinct: 1000,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         c
     }
 

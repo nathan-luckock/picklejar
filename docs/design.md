@@ -462,12 +462,17 @@ nested-loop vs hash join per join. `crates/planner`, no external dependencies.
 ### Pipeline
 
 1. **Catalog** (`catalog.rs`). In-memory schema + statistics: tables,
-   columns, indexes, per-table `row_count`, and per-column distinct-value
-   counts (`ColumnStats`). DDL is applied through `Catalog::apply`; stats are
-   set via `set_row_count` / `set_column_stats`. A column with no recorded
-   stats defaults to `distinct = 1` (pessimistic: it makes equality look
+   columns, indexes, per-table `row_count`, and per-column statistics
+   (`ColumnStats`: distinct-value count plus an integer min/max). DDL is
+   applied through `Catalog::apply`; stats are set via `set_row_count` /
+   `set_column_stats`. A column with no recorded stats defaults to
+   `distinct = 1` and no min/max (pessimistic: it makes equality look
    non-selective, so the planner does not reach for an index on a column it
-   knows nothing about).
+   knows nothing about). The `ANALYZE [table]` statement scans the live rows
+   and records the real distinct count and integer min/max per column, so the
+   estimates below come from data rather than defaults. Stats are in-memory, so
+   a reopen needs a fresh `ANALYZE` (writes keep a rough distinct count current
+   in the meantime).
 2. **Logical plan** (`logical.rs`, `binder.rs`). The binder resolves table and
    column names against the catalog and emits a relational-algebra tree
    bottom-up in SQL's evaluation order: `Scan -> Join* -> Filter (WHERE) ->
@@ -477,7 +482,10 @@ nested-loop vs hash join per join. `crates/planner`, no external dependencies.
 3. **Cost model** (`cost.rs`). Selectivity is estimated from catalog stats:
    - `col = const` -> `1 / distinct(col)` (uniform-distribution guess),
      floored at `1e-6` so a huge cardinality never estimates zero rows.
-   - a range comparison (`<`, `<=`, `>`, `>=`) -> `0.3` (textbook default).
+   - a range comparison (`<`, `<=`, `>`, `>=`) -> the fraction of the column's
+     `[min, max]` span the bound admits when `ANALYZE` has recorded it, else
+     `0.3` (textbook default). A bound outside the observed range estimates
+     all or almost-no rows.
    - `a AND b` -> `sel(a) * sel(b)` (independence); `a OR b` ->
      `sel(a) + sel(b) - sel(a)*sel(b)` (inclusion-exclusion); `NOT a` ->
      `1 - sel(a)`.

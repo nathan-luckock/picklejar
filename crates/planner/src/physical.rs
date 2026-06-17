@@ -533,6 +533,7 @@ mod tests {
             "id",
             ColumnStats {
                 distinct: distinct_id,
+                ..Default::default()
             },
         )
         .unwrap();

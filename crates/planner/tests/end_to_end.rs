@@ -38,8 +38,15 @@ fn parts() -> Catalog {
         "CREATE INDEX idx_id ON parts (id)",
     ]);
     c.set_row_count("parts", 1000).unwrap();
-    c.set_column_stats("parts", "id", ColumnStats { distinct: 1000 })
-        .unwrap();
+    c.set_column_stats(
+        "parts",
+        "id",
+        ColumnStats {
+            distinct: 1000,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     c
 }
 

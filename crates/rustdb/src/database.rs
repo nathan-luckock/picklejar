@@ -268,6 +268,8 @@ impl Database {
                         col,
                         ColumnStats {
                             distinct: r.next_rowid.max(1),
+                            min: None,
+                            max: None,
                         },
                     )?;
                 }
@@ -509,6 +511,7 @@ impl Database {
             } => self.create_view(name, query),
             Statement::DropView { ref name } => self.drop_view(name),
             Statement::Truncate { ref table } => self.truncate_table(table),
+            Statement::Analyze { ref table } => self.run_analyze(table.as_deref()),
             Statement::AlterTableAddColumn {
                 ref table,
                 ref column,
@@ -776,6 +779,58 @@ impl Database {
         self.catalog.set_row_count(name, 0)?;
         self.persist()?;
         Ok(QueryOutcome::Ddl)
+    }
+
+    /// Recompute planner statistics for one table or all of them: scan the live
+    /// rows and record each column's distinct count and (for integers) its
+    /// min/max, so the cost model estimates selectivity from real data instead
+    /// of defaults. Statistics live in the in-memory catalog, so a reopen needs
+    /// a fresh `ANALYZE` (writes also keep a rough distinct count current).
+    fn run_analyze(&mut self, table: Option<&str>) -> Result<QueryOutcome> {
+        let targets: Vec<String> = if let Some(t) = table {
+            if !self.tables.contains_key(t) {
+                return Err(DbError::UnknownTable(t.to_string()));
+            }
+            vec![t.to_string()]
+        } else {
+            let mut all: Vec<String> = self.tables.keys().cloned().collect();
+            all.sort();
+            all
+        };
+
+        // Pass 1: scan and compute, holding only shared borrows of the engine.
+        let txn = self.mgr.begin();
+        let source = EngineSource {
+            pool: &self.pool,
+            wal: self.wal.clone(),
+            mgr: &self.mgr,
+            catalog: &self.catalog,
+            tables: &self.tables,
+            txn: &txn,
+        };
+        // (table, row count, [(column, stats)]) computed before any catalog write.
+        let mut computed: Vec<(String, u64, ColumnStatList)> = Vec::new();
+        for name in &targets {
+            let relation = source.scan(name)?;
+            let cols: ColumnStatList = relation
+                .columns
+                .iter()
+                .enumerate()
+                .map(|(i, col)| (col.clone(), analyze_column(&relation.rows, i)))
+                .collect();
+            let rows = u64::try_from(relation.rows.len()).unwrap_or(u64::MAX);
+            computed.push((name.clone(), rows, cols));
+        }
+        drop(source);
+
+        // Pass 2: store the statistics in the catalog.
+        for (name, rows, cols) in computed {
+            self.catalog.set_row_count(&name, rows)?;
+            for (col, stats) in cols {
+                self.catalog.set_column_stats(&name, &col, stats)?;
+            }
+        }
+        Ok(QueryOutcome::Message("ANALYZE"))
     }
 
     /// Append a column to a table, rewriting every existing row into fresh
@@ -1481,6 +1536,8 @@ impl Database {
                 &name,
                 ColumnStats {
                     distinct: row_count.max(1),
+                    min: None,
+                    max: None,
                 },
             )?;
         }
@@ -2319,6 +2376,59 @@ fn find_equality(predicate: &Expr, col: &str) -> Option<Value> {
         } => find_equality(left, col).or_else(|| find_equality(right, col)),
         _ => None,
     }
+}
+
+/// A table's freshly computed `(column name, statistics)` list.
+type ColumnStatList = Vec<(String, ColumnStats)>;
+
+/// Compute one column's statistics over `rows`: its distinct count (NULLs
+/// excluded) and, for an integer column, its min and max.
+fn analyze_column(rows: &[Vec<Value>], col: usize) -> ColumnStats {
+    let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+    let mut min: Option<i64> = None;
+    let mut max: Option<i64> = None;
+    for row in rows {
+        let Some(value) = row.get(col) else { continue };
+        if matches!(value, Value::Null) {
+            continue;
+        }
+        seen.insert(stat_key(value));
+        if let Value::Int(n) = value {
+            min = Some(min.map_or(*n, |m| m.min(*n)));
+            max = Some(max.map_or(*n, |m| m.max(*n)));
+        }
+    }
+    ColumnStats {
+        distinct: u64::try_from(seen.len()).unwrap_or(u64::MAX).max(1),
+        min,
+        max,
+    }
+}
+
+/// A canonical byte key for a value, so equal values hash equal when counting
+/// distinct values.
+fn stat_key(value: &Value) -> Vec<u8> {
+    let mut b = Vec::new();
+    match value {
+        Value::Null => b.push(0),
+        Value::Int(n) => {
+            b.push(1);
+            b.extend_from_slice(&n.to_le_bytes());
+        }
+        Value::Text(s) => {
+            b.push(2);
+            b.extend_from_slice(s.as_bytes());
+        }
+        Value::Bool(x) => {
+            b.push(3);
+            b.push(u8::from(*x));
+        }
+        Value::Float(x) => {
+            b.push(4);
+            b.extend_from_slice(&x.to_bits().to_le_bytes());
+        }
+    }
+    b
 }
 
 /// The `information_schema` views the engine exposes for introspection.
@@ -3873,6 +3983,50 @@ mod tests {
             "SELECT COUNT(*) FROM information_schema.tables AS t",
         );
         assert_eq!(rows, vec![vec![Value::Int(2)]]);
+    }
+
+    // --- ANALYZE ---
+
+    #[test]
+    fn analyze_records_distinct_and_min_max() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE t (id INT, name TEXT)").unwrap();
+        db.execute("INSERT INTO t VALUES (10, 'a'), (20, 'b'), (20, 'c'), (30, 'a')")
+            .unwrap();
+        assert_eq!(
+            db.execute("ANALYZE t").unwrap(),
+            QueryOutcome::Message("ANALYZE")
+        );
+        let meta = db.catalog.get_table("t").expect("table");
+        let id = meta.column_stats("id");
+        assert_eq!(id.distinct, 3, "10, 20, 30");
+        assert_eq!(id.min, Some(10));
+        assert_eq!(id.max, Some(30));
+        let name = meta.column_stats("name");
+        assert_eq!(name.distinct, 3, "a, b, c");
+        assert_eq!(name.min, None, "text has no integer min/max");
+        assert_eq!(meta.stats.row_count, 4);
+    }
+
+    #[test]
+    fn analyze_all_tables_and_unknown_errors() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE a (x INT)").unwrap();
+        db.execute("CREATE TABLE b (y INT)").unwrap();
+        db.execute("INSERT INTO a VALUES (1), (2)").unwrap();
+        db.execute("INSERT INTO b VALUES (9)").unwrap();
+        // Bare ANALYZE covers every table.
+        db.execute("ANALYZE").unwrap();
+        assert_eq!(
+            db.catalog.get_table("a").unwrap().column_stats("x").max,
+            Some(2)
+        );
+        assert_eq!(
+            db.catalog.get_table("b").unwrap().column_stats("y").min,
+            Some(9)
+        );
+        // A named, unknown table is an error.
+        assert!(db.execute("ANALYZE ghost").is_err());
     }
 
     // --- subqueries (uncorrelated scalar and IN) ---

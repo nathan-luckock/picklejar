@@ -428,6 +428,12 @@ pub enum Statement {
         /// Target table.
         table: String,
     },
+    /// `ANALYZE [table]`: recompute planner statistics. `None` analyzes every
+    /// table.
+    Analyze {
+        /// Target table, or `None` for all tables.
+        table: Option<String>,
+    },
     /// `ALTER TABLE t ADD COLUMN c TYPE ...`: append a column.
     AlterTableAddColumn {
         /// Target table.
@@ -675,6 +681,10 @@ impl fmt::Display for Statement {
             }
             Self::Explain(inner) => write!(f, "EXPLAIN {inner}"),
             Self::Truncate { table } => write!(f, "TRUNCATE TABLE {table}"),
+            Self::Analyze { table } => match table {
+                Some(t) => write!(f, "ANALYZE {t}"),
+                None => f.write_str("ANALYZE"),
+            },
             Self::AlterTableAddColumn { table, column } => {
                 write!(f, "ALTER TABLE {table} ADD COLUMN {column}")
             }
@@ -745,6 +755,16 @@ impl Parser {
                 self.eat_keyword(Keyword::Table); // optional TABLE keyword
                 let table = self.parse_ident()?;
                 Statement::Truncate { table }
+            }
+            TokenKind::Keyword(Keyword::Analyze) => {
+                self.advance();
+                // An optional table name; bare `ANALYZE` covers every table.
+                let table = if matches!(self.peek(), TokenKind::Ident(_)) {
+                    Some(self.parse_ident()?)
+                } else {
+                    None
+                };
+                Statement::Analyze { table }
             }
             TokenKind::Keyword(Keyword::Alter) => {
                 self.advance();
@@ -1665,6 +1685,20 @@ mod tests {
         round_trip("ALTER TABLE t ADD COLUMN c INT DEFAULT 0");
         round_trip("ALTER TABLE t ADD COLUMN flag BOOL NOT NULL DEFAULT TRUE");
         round_trip("TRUNCATE TABLE t");
+    }
+
+    #[test]
+    fn analyze_round_trips() {
+        round_trip("ANALYZE t");
+        round_trip("ANALYZE");
+        assert!(matches!(
+            parse("ANALYZE t"),
+            Statement::Analyze { table: Some(t) } if t == "t"
+        ));
+        assert!(matches!(
+            parse("ANALYZE"),
+            Statement::Analyze { table: None }
+        ));
     }
 
     #[test]

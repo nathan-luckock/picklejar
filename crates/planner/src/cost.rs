@@ -67,18 +67,76 @@ fn binary_selectivity(op: BinOp, left: &Expr, right: &Expr, table: &TableMeta) -
             let d = distinct as f64;
             1.0 - 1.0 / d
         }),
-        BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
-            if column_const(left, right).is_some() {
-                RANGE_SELECTIVITY
-            } else {
-                UNKNOWN_SELECTIVITY
-            }
-        }
+        BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => range_selectivity(op, left, right, table),
         // LIKE has no cheap cardinality estimate, and the arithmetic and
         // concatenation operators are not boolean predicates: all default.
         BinOp::Like | BinOp::Concat | BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => {
             UNKNOWN_SELECTIVITY
         }
+    }
+}
+
+/// Estimate a range comparison's selectivity. With `ANALYZE`-gathered min/max
+/// for the column, the fraction of `[min, max]` the bound admits is used;
+/// otherwise the textbook default. The column may be on either side of the
+/// operator, so the comparison is normalized to `column <op> const`.
+fn range_selectivity(op: BinOp, left: &Expr, right: &Expr, table: &TableMeta) -> f64 {
+    let Some(col) = column_const(left, right) else {
+        return UNKNOWN_SELECTIVITY;
+    };
+    // Pull the integer constant and orient the operator so the column is on the
+    // left (flip when the literal was the left operand).
+    let (k, op) = if is_literal(left) {
+        (int_literal(left), flip(op))
+    } else {
+        (int_literal(right), op)
+    };
+    let (Some(k), stats) = (k, table.column_stats(col)) else {
+        return RANGE_SELECTIVITY;
+    };
+    let (Some(min), Some(max)) = (stats.min, stats.max) else {
+        return RANGE_SELECTIVITY;
+    };
+    if max <= min {
+        // A single-valued (or empty) column: the bound either admits all or
+        // none of the rows.
+        let admits = match op {
+            BinOp::Lt => min < k,
+            BinOp::Le => min <= k,
+            BinOp::Gt => min > k,
+            BinOp::Ge => min >= k,
+            _ => return RANGE_SELECTIVITY,
+        };
+        return if admits { 1.0 } else { MIN_SELECTIVITY };
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let span = (max - min) as f64;
+    // Fraction of the value span the predicate admits, clamped to [0, 1].
+    #[allow(clippy::cast_precision_loss)]
+    let frac = match op {
+        BinOp::Lt | BinOp::Le => (k - min) as f64 / span,
+        BinOp::Gt | BinOp::Ge => (max - k) as f64 / span,
+        _ => return RANGE_SELECTIVITY,
+    };
+    frac.clamp(MIN_SELECTIVITY, 1.0)
+}
+
+/// Flip a comparison operator's sense (for `const <op> column`).
+const fn flip(op: BinOp) -> BinOp {
+    match op {
+        BinOp::Lt => BinOp::Gt,
+        BinOp::Le => BinOp::Ge,
+        BinOp::Gt => BinOp::Lt,
+        BinOp::Ge => BinOp::Le,
+        other => other,
+    }
+}
+
+/// The `i64` value of an integer literal expression, if it is one.
+const fn int_literal(expr: &Expr) -> Option<i64> {
+    match expr {
+        Expr::Literal(rustdb_sql::Value::Int(n)) => Some(*n),
+        _ => None,
     }
 }
 
@@ -183,6 +241,7 @@ mod tests {
             "id",
             ColumnStats {
                 distinct: distinct_id,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -204,6 +263,49 @@ mod tests {
     fn range_selectivity_is_default_third() {
         let t = table(100);
         assert!((selectivity(&pred("id > 5"), &t) - RANGE_SELECTIVITY).abs() < 1e-9);
+    }
+
+    /// A table whose `id` column has known min/max from `ANALYZE`.
+    fn table_with_range(min: i64, max: i64) -> TableMeta {
+        let mut c = Catalog::new();
+        c.apply(
+            &Parser::from_sql("CREATE TABLE t (id INT, name TEXT)")
+                .unwrap()
+                .parse_statement()
+                .unwrap(),
+        )
+        .unwrap();
+        c.set_column_stats(
+            "t",
+            "id",
+            ColumnStats {
+                distinct: 100,
+                min: Some(min),
+                max: Some(max),
+            },
+        )
+        .unwrap();
+        c.get_table("t").unwrap().clone()
+    }
+
+    #[test]
+    fn range_selectivity_uses_min_max() {
+        let t = table_with_range(0, 100);
+        // id > 75 admits the top quarter of [0, 100].
+        assert!((selectivity(&pred("id > 75"), &t) - 0.25).abs() < 1e-9);
+        // id < 25 admits the bottom quarter.
+        assert!((selectivity(&pred("id < 25"), &t) - 0.25).abs() < 1e-9);
+        // The literal may be on the left: 75 < id is id > 75.
+        assert!((selectivity(&pred("75 < id"), &t) - 0.25).abs() < 1e-9);
+    }
+
+    #[test]
+    fn range_outside_min_max_is_tiny_or_full() {
+        let t = table_with_range(10, 20);
+        // Everything is below 100, so id < 100 matches all.
+        assert!((selectivity(&pred("id < 100"), &t) - 1.0).abs() < 1e-9);
+        // Nothing is above 100, so id > 100 matches almost none.
+        assert!(selectivity(&pred("id > 100"), &t) <= MIN_SELECTIVITY * 2.0);
     }
 
     #[test]

@@ -55,7 +55,15 @@ proptest! {
             c.apply(&stmt("CREATE INDEX idx ON t (id)")).unwrap();
         }
         c.set_row_count("t", rows).unwrap();
-        c.set_column_stats("t", "id", ColumnStats { distinct }).unwrap();
+        c.set_column_stats(
+            "t",
+            "id",
+            ColumnStats {
+                distinct,
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
         let sql = format!("SELECT * FROM t WHERE {pred}");
         let logical = bind(&c, &stmt(&sql)).unwrap();
