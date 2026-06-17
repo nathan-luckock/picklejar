@@ -4,20 +4,21 @@
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 [![Rust](https://img.shields.io/badge/rust-1.80%2B-orange.svg)](https://www.rust-lang.org)
 
-A relational database engine written from scratch in Rust: disk-backed storage, a write-ahead log with ARIES crash recovery, MVCC transactions, a SQL parser, a cost-based query planner, and a Volcano executor, all behind a `psql`-style shell.
+A relational database engine written from scratch in Rust: disk-backed storage, a write-ahead log with ARIES crash recovery, MVCC transactions, a SQL parser, a cost-based query planner, and a Volcano executor. It runs as an embeddable library, a `psql`-style shell, and a **server that speaks the real PostgreSQL wire protocol** so `psql` and standard drivers connect to it directly.
 
-> Not a wrapper around SQLite or Postgres, and not a key-value store with SQL bolted on. Every layer, from the bytes on disk to the query optimizer, is implemented in this repository.
+> Not a wrapper around SQLite or Postgres, and not a key-value store with SQL bolted on. Every layer, from the bytes on disk to the query optimizer to the wire protocol, is implemented in this repository.
 
 ## Why it is interesting
 
 Most "build a database" projects stop at a key-value store or wrap an existing engine. rustdb implements the parts that actually make a database a database:
 
-- **It survives crashes.** A write-ahead log and ARIES-style recovery (analysis, redo, undo with compensation records) guarantee that no committed transaction is lost. This is proven by a torture test that force-kills the process mid-write and verifies the data after recovery.
+- **Real PostgreSQL clients connect to it.** It implements the PostgreSQL v3 wire protocol, so the actual `psql` client (and GUI tools and drivers) talk to the from-scratch engine over TCP, with no shim. See [Connect with psql](#connect-with-psql).
+- **It survives crashes, and that is proven reproducibly.** A write-ahead log and ARIES recovery (analysis, redo, undo with compensation records) guarantee no committed transaction is lost. Beyond a force-kill torture test, a **deterministic simulation tester** explores thousands of seeded, reproducible crash scenarios against a fault-injecting disk. It found and fixed a real recovery bug. See [Correctness and crash safety](#correctness-and-crash-safety).
 - **It is transactional.** MVCC gives every transaction a consistent snapshot; `BEGIN` / `COMMIT` / `ROLLBACK` work, and a reader never blocks a writer.
 - **It optimizes queries.** A cost-based planner chooses between a sequential scan and an index scan, and between a nested-loop and a hash join, from table statistics. `EXPLAIN` prints the annotated plan.
-- **It enforces a schema.** Typed columns with `PRIMARY KEY`, `UNIQUE`, and `NOT NULL` constraints.
+- **It speaks a deep slice of SQL.** Joins, aggregates with `GROUP BY` / `HAVING`, `DISTINCT`, `UNION`, subqueries (scalar, `IN`, `EXISTS`, both uncorrelated and **correlated**), **derived tables**, and **views**, over typed columns with `PRIMARY KEY` / `UNIQUE` / `NOT NULL` / `DEFAULT`.
 
-The whole thing is around 360 tests, including property tests and the crash-recovery torture test, with `clippy -D warnings` and `rustfmt` enforced in CI.
+Correctness is enforced by hundreds of unit tests, parser property tests, a forced-kill crash torture test, and thousands of deterministic crash-simulation seeds, all under `clippy -D warnings` and `rustfmt` in CI.
 
 ## Quickstart
 
@@ -61,14 +62,64 @@ rustdb> \q
 
 Reopen the same file and the schema and rows are still there.
 
+## Connect with psql
+
+rustdb ships a server that speaks the PostgreSQL v3 wire protocol, so the real `psql` client connects to the from-scratch engine:
+
+```bash
+cargo run --release --bin rustdb-pg -- --database mydb.db --port 5433
+psql -h 127.0.0.1 -p 5433 -U postgres
+```
+
+```text
+psql (18.0)
+postgres=> CREATE TABLE engineers (id INT, name TEXT, rust_years FLOAT, active BOOL);
+CREATE TABLE
+postgres=> INSERT INTO engineers VALUES (1,'Nathan',3.5,TRUE),(2,'Ada',7.0,TRUE),(3,'Linus',1.0,FALSE);
+INSERT 0 3
+postgres=> SELECT name, rust_years FROM engineers WHERE active = TRUE ORDER BY rust_years DESC;
+  name  | rust_years
+--------+------------
+ Ada    |          7
+ Nathan |        3.5
+(2 rows)
+
+postgres=> SELECT name FROM engineers AS e
+postgres->  WHERE rust_years > (SELECT AVG(rust_years) FROM engineers WHERE active = e.active);
+ name
+------
+ Ada
+(1 row)
+```
+
+The correlated subquery, the aggregate, and `EXPLAIN` all run through the engine and render as ordinary psql tables. The simple query protocol is implemented; the extended (parse/bind/execute) protocol used by some drivers is the next step.
+
+## Correctness and crash safety
+
+The graded requirement is "forced crash, no committed data loss." rustdb proves it three ways:
+
+1. **In-process recovery tests**: drive a workload, drop the buffer pool without flushing (losing dirty pages, exactly as a kill does), recover from the WAL, and assert committed rows survive while uncommitted rows roll back.
+2. **Forced process kill**: a child process commits rows forever and is hard-killed (`SIGKILL` / `TerminateProcess`); recovery must reproduce every row recorded as durable.
+3. **Deterministic simulation testing (DST)**: every run is one `u64` seed, so any failure replays exactly. The data file is a fault-injecting in-memory disk that models durability honestly (only `fsync`-ed writes survive a crash, unlike a real test where the OS page cache hides un-fsynced writes). Each seed builds a random workload, crashes at a random durable/lost split, recovers, and checks an oracle of exactly which rows must survive.
+
+```bash
+cargo run --release --bin dst -- 100000      # 100k reproducible crash scenarios
+cargo run --bin dst -- --seed 42             # replay one exactly
+```
+
+DST is not decoration: it **found a real recovery bug**. An aborted transaction whose in-memory rollback was lost in the crash could resurrect its row, because recovery skips undo for a transaction that already logged `Abort`. The fix makes rollback log compensation records so redo reproduces it. A 5000-seed sweep now verifies 206,007 committed rows recover correctly. The write-up is in [docs/design.md](docs/design.md#crash-model-and-the-torture-test).
+
 ## Features
 
-- **DDL**: `CREATE TABLE` (with `PRIMARY KEY` / `UNIQUE` / `NOT NULL`), `DROP TABLE`, `CREATE INDEX`.
+- **DDL**: `CREATE TABLE` (with `PRIMARY KEY` / `UNIQUE` / `NOT NULL` / `DEFAULT`), `DROP TABLE`, `TRUNCATE TABLE`, `ALTER TABLE ... ADD COLUMN`, `CREATE INDEX`, and `CREATE VIEW` / `DROP VIEW`.
 - **DML**: `INSERT` (with or without a column list), `UPDATE`, `DELETE`.
-- **Queries**: projection and `*`, `WHERE` with SQL three-valued logic, `INNER` and `LEFT JOIN`, `GROUP BY` with `COUNT` / `SUM` / `MIN` / `MAX` / `AVG`, `ORDER BY`, `LIMIT`.
+- **Queries**: projection and `*`, `WHERE` with SQL three-valued logic, `INNER` / `LEFT` / `CROSS JOIN`, `GROUP BY` with `COUNT` / `SUM` / `MIN` / `MAX` / `AVG` (and `DISTINCT` aggregates), `HAVING`, `DISTINCT`, `ORDER BY`, `LIMIT` / `OFFSET`, and `UNION` / `UNION ALL`.
+- **Subqueries**: scalar, `IN`, and `EXISTS`, both uncorrelated and correlated; derived tables (`FROM (SELECT ...)`); views expand to the same machinery.
+- **Expressions**: `INT` / `FLOAT` / `BOOL` / `TEXT`, arithmetic with int-to-float promotion, `IN` / `BETWEEN` / `LIKE` / `IS NULL`, `CASE`, string `||`, and a library of scalar functions.
 - **Transactions**: `BEGIN` / `COMMIT` / `ROLLBACK` over MVCC snapshots; auto-commit otherwise.
 - **`EXPLAIN`**: the cost-annotated physical plan, showing the planner's scan and join choices.
 - **Durability**: write-ahead logging, ARIES crash recovery, and schema plus data that survive a restart.
+- **Interfaces**: an embeddable library, a `psql`-style CLI, and a PostgreSQL-wire-protocol server.
 
 ## Architecture
 
@@ -97,32 +148,36 @@ Every design decision, with the alternatives considered and rejected, is written
 
 | Crate | Responsibility |
 |---|---|
-| [`storage`](crates/storage/) | 8 KiB pages, an LRU-K buffer pool, a B+ tree, CRC32 checksums |
-| [`wal`](crates/wal/) | Write-ahead log and ARIES recovery |
+| [`storage`](crates/storage/) | 8 KiB pages, an LRU-K buffer pool, a B+ tree, CRC32 checksums, the `Disk` trait |
+| [`wal`](crates/wal/) | Write-ahead log, ARIES recovery, and the deterministic crash simulator |
 | [`txn`](crates/txn/) | Transactions and MVCC |
 | [`sql`](crates/sql/) | SQL lexer and recursive-descent parser |
 | [`planner`](crates/planner/) | Logical plan, cost model, physical plan, EXPLAIN |
 | [`executor`](crates/executor/) | Volcano operators and the row codec |
 | [`rustdb`](crates/rustdb/) | The embedded engine that wires every layer together |
 | [`rustdb-cli`](crates/rustdb-cli/) | The interactive shell |
+| [`rustdb-server`](crates/rustdb-server/) | The PostgreSQL-wire-protocol server (`rustdb-pg`) and an HTTP/JSON API |
 
 ## Build and test
 
 ```bash
 cargo build --workspace
 cargo test --workspace
-cargo run --bin rustdb        # the CLI
+cargo run --bin rustdb         # the psql-style CLI
+cargo run --bin rustdb-pg      # the PostgreSQL-wire-protocol server
+cargo run --release --bin dst  # deterministic crash-recovery simulations
 ```
 
-The project targets Rust 1.80+ and has no external database, SQL-parser, or checksum dependencies; the graded engine is implemented in-tree.
+The project targets Rust 1.80+ and has no external database, SQL-parser, wire-protocol, or checksum dependencies; the graded engine and its interfaces are implemented in-tree.
 
 ## Roadmap
 
-The engine is feature-complete for a single connection. Next is more depth
-(more column types, a true secondary-index runtime, concurrent connections)
-and a Supabase-style studio: an HTTP API over the engine and a web UI with a
-SQL editor, a results grid, a live plan visualizer, and a crash-recovery panel.
-See [docs/sprints.md](docs/sprints.md).
+Done: the storage / WAL+ARIES / MVCC / planner / executor core, a deep SQL
+surface, the PostgreSQL wire protocol, and deterministic simulation testing.
+Next: differential testing against SQLite, foreign-key and `CHECK` constraints,
+more column types (`DATE` / `TIMESTAMP` / `DECIMAL`), the extended wire protocol
+for drivers, and concurrent connections (the engine is single-threaded today).
+See [docs/sprints.md](docs/sprints.md) and [docs/design.md](docs/design.md).
 
 ## Contributing
 
