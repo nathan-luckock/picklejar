@@ -479,6 +479,12 @@ struct NestedLoopJoin {
     right_idx: usize,
     /// Whether the current left row matched any right row (for LEFT joins).
     matched: bool,
+    /// Per-right-row matched flags, for emitting unmatched right rows on a
+    /// RIGHT / FULL join once the left side is exhausted.
+    right_matched: Vec<bool>,
+    /// When the left side is done, the index into `right_rows` of the next
+    /// unmatched right row to emit (RIGHT / FULL only).
+    drain_right: Option<usize>,
 }
 
 impl NestedLoopJoin {
@@ -495,6 +501,7 @@ impl NestedLoopJoin {
         while let Some(r) = right.next()? {
             right_rows.push(r);
         }
+        let right_matched = vec![false; right_rows.len()];
         Ok(Self {
             kind,
             left,
@@ -505,6 +512,8 @@ impl NestedLoopJoin {
             current_left: None,
             right_idx: 0,
             matched: false,
+            right_matched,
+            drain_right: None,
         })
     }
 }
@@ -515,25 +524,47 @@ impl Executor for NestedLoopJoin {
     }
     fn next(&mut self) -> Result<Option<Row>> {
         loop {
+            // Drain phase: after the left side is exhausted, a RIGHT / FULL join
+            // emits each right row that no left row matched, NULL-padded on the
+            // left.
+            if let Some(i) = self.drain_right {
+                let mut j = i;
+                while j < self.right_rows.len() {
+                    if !self.right_matched[j] {
+                        let mut combined: Row = vec![Value::Null; self.left_width()];
+                        combined.extend_from_slice(&self.right_rows[j]);
+                        self.drain_right = Some(j + 1);
+                        return Ok(Some(combined));
+                    }
+                    j += 1;
+                }
+                return Ok(None);
+            }
             // Advance to the next left row when the current one is exhausted.
             if self.current_left.is_none() {
-                match self.left.next()? {
-                    Some(l) => {
-                        self.current_left = Some(l);
-                        self.right_idx = 0;
-                        self.matched = false;
+                let Some(l) = self.left.next()? else {
+                    // Left side done. RIGHT / FULL drains unmatched right rows;
+                    // INNER / LEFT are finished.
+                    if matches!(self.kind, JoinKind::Right | JoinKind::Full) {
+                        self.drain_right = Some(0);
+                        continue;
                     }
-                    None => return Ok(None),
-                }
+                    return Ok(None);
+                };
+                self.current_left = Some(l);
+                self.right_idx = 0;
+                self.matched = false;
             }
             let left_row = self.current_left.clone().expect("left row present");
 
             while self.right_idx < self.right_rows.len() {
                 let mut combined = left_row.clone();
                 combined.extend_from_slice(&self.right_rows[self.right_idx]);
+                let idx = self.right_idx;
                 self.right_idx += 1;
                 if is_truthy(&eval(&self.on, &combined, &self.columns)?) {
                     self.matched = true;
+                    self.right_matched[idx] = true;
                     return Ok(Some(combined));
                 }
             }
@@ -541,13 +572,20 @@ impl Executor for NestedLoopJoin {
             // The right side is exhausted for this left row.
             let unmatched_left = !self.matched;
             self.current_left = None;
-            if self.kind == JoinKind::Left && unmatched_left {
-                // Emit the left row padded with NULLs for the right columns.
+            // LEFT and FULL keep an unmatched left row, padded with NULLs.
+            if matches!(self.kind, JoinKind::Left | JoinKind::Full) && unmatched_left {
                 let mut combined = left_row;
                 combined.extend(std::iter::repeat(Value::Null).take(self.right_width));
                 return Ok(Some(combined));
             }
         }
+    }
+}
+
+impl NestedLoopJoin {
+    /// The number of left-side columns (total minus the right width).
+    fn left_width(&self) -> usize {
+        self.columns.len() - self.right_width
     }
 }
 
@@ -567,8 +605,14 @@ struct HashJoin {
     left_keys: Vec<Expr>,
     /// The full `ON` predicate, re-checked per candidate as a residual.
     on: Expr,
-    /// Build-side rows indexed by their encoded join key.
-    table: HashMap<Vec<u8>, Vec<Row>>,
+    /// All build-side (right) rows.
+    build_rows: Vec<Row>,
+    /// Build-row positions indexed by their encoded join key.
+    index: HashMap<Vec<u8>, Vec<usize>>,
+    /// Per-build-row matched flags, for RIGHT / FULL unmatched emission.
+    build_matched: Vec<bool>,
+    /// Whether the unmatched build rows have been queued (RIGHT / FULL).
+    drained: bool,
     /// Output rows produced from the current left row, drained one at a time.
     pending: VecDeque<Row>,
 }
@@ -588,19 +632,24 @@ impl HashJoin {
         columns.extend(right_columns.iter().cloned());
         let right_width = right_columns.len();
 
-        // Build phase: hash every right row by its key. A row whose key contains
-        // NULL can never satisfy an equi-join (NULL = NULL is unknown), so it is
-        // dropped from the build side.
-        let mut table: HashMap<Vec<u8>, Vec<Row>> = HashMap::new();
+        // Build phase: store every right row and index it by its key. A row
+        // whose key contains NULL can never satisfy an equi-join (NULL = NULL is
+        // unknown), so it is left out of the index, but it is still kept in
+        // `build_rows` so a RIGHT / FULL join can emit it as unmatched.
+        let mut build_rows: Vec<Row> = Vec::new();
+        let mut index: HashMap<Vec<u8>, Vec<usize>> = HashMap::new();
         while let Some(r) = right.next()? {
             let key = right_keys
                 .iter()
                 .map(|e| eval(e, &r, &right_columns))
                 .collect::<Result<Vec<_>>>()?;
+            let pos = build_rows.len();
             if let Some(kb) = join_key_bytes(&key) {
-                table.entry(kb).or_default().push(r);
+                index.entry(kb).or_default().push(pos);
             }
+            build_rows.push(r);
         }
+        let build_matched = vec![false; build_rows.len()];
 
         Ok(Self {
             kind,
@@ -610,7 +659,10 @@ impl HashJoin {
             left_columns,
             left_keys,
             on,
-            table,
+            build_rows,
+            index,
+            build_matched,
+            drained: false,
             pending: VecDeque::new(),
         })
     }
@@ -626,6 +678,20 @@ impl Executor for HashJoin {
                 return Ok(Some(row));
             }
             let Some(left_row) = self.left.next()? else {
+                // Left side done. RIGHT / FULL queues each build row no left row
+                // matched, NULL-padded on the left; then there is nothing more.
+                if matches!(self.kind, JoinKind::Right | JoinKind::Full) && !self.drained {
+                    self.drained = true;
+                    let left_width = self.columns.len() - self.right_width;
+                    for (i, r) in self.build_rows.iter().enumerate() {
+                        if !self.build_matched[i] {
+                            let mut combined: Row = vec![Value::Null; left_width];
+                            combined.extend_from_slice(r);
+                            self.pending.push_back(combined);
+                        }
+                    }
+                    continue;
+                }
                 return Ok(None);
             };
             let key = self
@@ -635,19 +701,20 @@ impl Executor for HashJoin {
                 .collect::<Result<Vec<_>>>()?;
             let mut matched = false;
             if let Some(kb) = join_key_bytes(&key) {
-                if let Some(rights) = self.table.get(&kb) {
-                    for right in rights {
+                if let Some(positions) = self.index.get(&kb).cloned() {
+                    for i in positions {
                         let mut combined = left_row.clone();
-                        combined.extend_from_slice(right);
+                        combined.extend_from_slice(&self.build_rows[i]);
                         if is_truthy(&eval(&self.on, &combined, &self.columns)?) {
                             matched = true;
+                            self.build_matched[i] = true;
                             self.pending.push_back(combined);
                         }
                     }
                 }
             }
-            // A LEFT join keeps an unmatched left row, padded with NULLs.
-            if self.kind == JoinKind::Left && !matched {
+            // LEFT and FULL keep an unmatched left row, padded with NULLs.
+            if matches!(self.kind, JoinKind::Left | JoinKind::Full) && !matched {
                 let mut combined = left_row;
                 combined.extend(std::iter::repeat(Value::Null).take(self.right_width));
                 self.pending.push_back(combined);

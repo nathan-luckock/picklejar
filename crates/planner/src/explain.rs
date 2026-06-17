@@ -29,6 +29,8 @@ const fn kind_tag(kind: JoinKind) -> &'static str {
     match kind {
         JoinKind::Inner => "INNER",
         JoinKind::Left => "LEFT",
+        JoinKind::Right => "RIGHT",
+        JoinKind::Full => "FULL",
     }
 }
 

@@ -65,8 +65,12 @@ impl fmt::Display for SelectItem {
 pub enum JoinKind {
     /// `INNER JOIN`.
     Inner,
-    /// `LEFT JOIN`.
+    /// `LEFT [OUTER] JOIN`: keep every left row, NULL-extending unmatched ones.
     Left,
+    /// `RIGHT [OUTER] JOIN`: keep every right row.
+    Right,
+    /// `FULL [OUTER] JOIN`: keep every row from both sides.
+    Full,
 }
 
 impl fmt::Display for JoinKind {
@@ -74,6 +78,8 @@ impl fmt::Display for JoinKind {
         f.write_str(match self {
             Self::Inner => "INNER JOIN",
             Self::Left => "LEFT JOIN",
+            Self::Right => "RIGHT JOIN",
+            Self::Full => "FULL JOIN",
         })
     }
 }
@@ -1136,12 +1142,24 @@ impl Parser {
                 joins.push(Join { table, ..cross() });
                 continue;
             }
+            // RIGHT / FULL / OUTER are matched context-sensitively (not reserved
+            // words), so `RIGHT(s, n)` stays usable as a function. The optional
+            // OUTER keyword is accepted and dropped on LEFT / RIGHT / FULL.
             let kind = if self.eat_keyword(Keyword::Inner) {
                 self.expect_keyword(Keyword::Join)?;
                 JoinKind::Inner
             } else if self.eat_keyword(Keyword::Left) {
+                self.eat_ident_kw("outer");
                 self.expect_keyword(Keyword::Join)?;
                 JoinKind::Left
+            } else if self.eat_ident_kw("right") {
+                self.eat_ident_kw("outer");
+                self.expect_keyword(Keyword::Join)?;
+                JoinKind::Right
+            } else if self.eat_ident_kw("full") {
+                self.eat_ident_kw("outer");
+                self.expect_keyword(Keyword::Join)?;
+                JoinKind::Full
             } else if self.eat_keyword(Keyword::Join) {
                 JoinKind::Inner
             } else {
@@ -1283,6 +1301,15 @@ impl Parser {
             return None;
         }
         if let TokenKind::Ident(name) = self.peek().clone() {
+            // RIGHT / FULL / OUTER are not reserved words, but as a bare trailing
+            // identifier after a table they introduce a join, not an alias, so
+            // leave them for the join parser. (An explicit `AS right` still works.)
+            if matches!(
+                name.to_ascii_lowercase().as_str(),
+                "right" | "full" | "outer"
+            ) {
+                return None;
+            }
             self.advance();
             return Some(name);
         }
@@ -2685,6 +2712,29 @@ mod tests {
         assert_eq!(s.joins.len(), 2);
         assert_eq!(s.joins[0].kind, JoinKind::Left);
         assert_eq!(s.joins[1].kind, JoinKind::Inner);
+    }
+
+    #[test]
+    fn right_full_and_outer_joins_parse() {
+        // RIGHT / FULL are not reserved words, and the optional OUTER is dropped;
+        // each prints back in the canonical `<KIND> JOIN` form.
+        let s = as_select(
+            "SELECT * FROM a RIGHT OUTER JOIN b ON a.id = b.aid \
+             FULL JOIN c ON b.id = c.bid LEFT OUTER JOIN d ON c.id = d.cid",
+        );
+        assert_eq!(s.joins.len(), 3);
+        assert_eq!(s.joins[0].kind, JoinKind::Right);
+        assert_eq!(s.joins[1].kind, JoinKind::Full);
+        assert_eq!(s.joins[2].kind, JoinKind::Left);
+        assert_eq!(
+            Statement::Select(Box::new(as_select(
+                "SELECT * FROM a RIGHT OUTER JOIN b ON a.x = b.x"
+            )))
+            .to_string(),
+            "SELECT * FROM a RIGHT JOIN b ON (a.x = b.x)"
+        );
+        // `right` still works as a function name (not reserved).
+        round_trip("SELECT RIGHT(name, 3) FROM t");
     }
 
     #[test]

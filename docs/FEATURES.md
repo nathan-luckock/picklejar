@@ -44,7 +44,8 @@ tour, see the [README](../README.md).
   [WHERE ...]`, with `excluded.col` referring to the rejected row's proposed
   value.
 - **Queries** - projection and `*`, `WHERE` with SQL three-valued logic,
-  `INNER` / `LEFT` / `CROSS JOIN`, `GROUP BY` with `COUNT` / `SUM` / `MIN` /
+  `INNER` / `LEFT` / `RIGHT` / `FULL` / `CROSS JOIN` (the `OUTER` keyword
+  optional), `GROUP BY` with `COUNT` / `SUM` / `MIN` /
   `MAX` / `AVG` (and `DISTINCT` aggregates), `HAVING`, `DISTINCT`, `ORDER BY`,
   `LIMIT` / `OFFSET`.
 - **Set operations** - `UNION`, `INTERSECT`, and `EXCEPT`, each with optional

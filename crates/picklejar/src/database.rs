@@ -6560,6 +6560,51 @@ mod tests {
         );
     }
 
+    #[test]
+    fn right_and_full_outer_joins() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE emp (id INT, dept INT, name TEXT)")
+            .unwrap();
+        db.execute("CREATE TABLE dept (id INT, label TEXT)")
+            .unwrap();
+        // alice -> 1, bob -> 2, carol -> NULL dept; dept 1 has staff, dept 3 has none.
+        db.execute("INSERT INTO emp VALUES (1, 1, 'alice'), (2, 2, 'bob'), (3, NULL, 'carol')")
+            .unwrap();
+        db.execute("INSERT INTO dept VALUES (1, 'eng'), (3, 'ops')")
+            .unwrap();
+
+        // RIGHT JOIN keeps every dept, including 'ops' with no employees.
+        let (_c, right) = query(
+            &mut db,
+            "SELECT e.name, d.label FROM emp e RIGHT JOIN dept d ON e.dept = d.id ORDER BY d.label",
+        );
+        assert_eq!(
+            right,
+            vec![
+                vec![Value::Text("alice".into()), Value::Text("eng".into())],
+                vec![Value::Null, Value::Text("ops".into())], // dept 3, no employee
+            ]
+        );
+
+        // FULL JOIN keeps unmatched rows from both sides: bob and carol (no
+        // matching dept) and 'ops' (no employee).
+        let (_c, full) = query(
+            &mut db,
+            "SELECT e.name, d.label FROM emp e FULL OUTER JOIN dept d ON e.dept = d.id \
+             ORDER BY e.name, d.label",
+        );
+        // NULL names sort last (NULLS LAST), so the unmatched 'ops' row trails.
+        assert_eq!(
+            full,
+            vec![
+                vec![Value::Text("alice".into()), Value::Text("eng".into())],
+                vec![Value::Text("bob".into()), Value::Null],
+                vec![Value::Text("carol".into()), Value::Null],
+                vec![Value::Null, Value::Text("ops".into())],
+            ]
+        );
+    }
+
     // --- ORDER BY ordinal and output alias ---
 
     #[test]
