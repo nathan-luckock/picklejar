@@ -110,6 +110,7 @@ fn handle_meta(db: &Database, cmd: &str) -> Flow {
             Some(table) => describe(db, table),
             None => println!("usage: \\d <table>"),
         },
+        Some("\\dump") => dump(db, parts.next()),
         Some("\\?" | "\\h" | "\\help") => print_help(),
         Some(other) => println!("unknown command: {other}  (\\? for help)"),
         None => {}
@@ -129,6 +130,20 @@ fn describe(db: &Database, table: &str) {
     }
 }
 
+/// `\dump [file]`: print the database as a SQL script, or write it to `file`.
+fn dump(db: &Database, file: Option<&str>) {
+    match db.dump() {
+        Ok(script) => match file {
+            Some(path) => match std::fs::write(path, &script) {
+                Ok(()) => println!("dumped to {path}"),
+                Err(e) => println!("error writing {path}: {e}"),
+            },
+            None => print!("{script}"),
+        },
+        Err(e) => println!("error: {e}"),
+    }
+}
+
 const fn type_name(ty: DataType) -> &'static str {
     match ty {
         DataType::Int => "INT",
@@ -142,6 +157,7 @@ fn print_help() {
     println!("commands:");
     println!("  \\dt           list tables");
     println!("  \\d <table>    describe a table");
+    println!("  \\dump [file]  dump schema + data as SQL (to stdout or a file)");
     println!("  \\?            this help");
     println!("  \\q            quit");
     println!("any other input is run as SQL (terminate with ;)");

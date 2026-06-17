@@ -48,6 +48,10 @@ The complete engine and SQL surface. For the *why* behind each decision, see
   `WITH RECURSIVE` evaluated to a fixpoint (e.g. a transitive closure).
 - **Introspection** — queryable `information_schema.tables` and
   `information_schema.columns` views, so a client can discover the schema.
+- **Dump / restore** — the CLI's `\dump [file]` writes a self-contained SQL
+  script (tables in foreign-key-safe order with their constraints, then
+  explicit indexes, views, and an `INSERT` per table) that recreates the whole
+  database when run on an empty one. This is rustdb's `pg_dump`.
 - **Expressions** — `INT` / `FLOAT` / `BOOL` / `TEXT`, arithmetic with
   int-to-float promotion, `IN` / `BETWEEN` / `LIKE` / `IS NULL`, `CASE`, string
   `||`, and a library of scalar functions.

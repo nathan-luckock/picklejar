@@ -36,8 +36,8 @@ use rustdb_planner::{bind, explain, plan, Catalog, ColumnStats};
 use crate::correlated;
 use crate::correlated::{CorrelatedRunner, MaterializedSource};
 use rustdb_sql::statement::{
-    AlterAction, ColumnDef, ConflictAction, Cte, DataType, Join, OnConflict, OrderItem, Select,
-    SelectItem, TableConstraint, TableRef,
+    AlterAction, ColumnDef, ConflictAction, Cte, DataType, ForeignKey, Join, OnConflict, OrderItem,
+    Select, SelectItem, TableConstraint, TableRef,
 };
 use rustdb_sql::{BinOp, Expr, Parser, SetOp, Statement, UnOp, Value};
 use rustdb_storage::{BufferPool, FileManager, PageId};
@@ -667,6 +667,188 @@ impl Database {
         self.catalog
             .get_table(table)
             .map(|m| m.columns.iter().map(|c| (c.name.clone(), c.ty)).collect())
+    }
+
+    /// Produce a self-contained SQL script that recreates this database: the
+    /// schema (tables in foreign-key-safe order, then explicit indexes and
+    /// views) followed by every row as an `INSERT`. Running the script on an
+    /// empty database reproduces this one. This is rustdb's `pg_dump`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a table cannot be scanned.
+    pub fn dump(&self) -> Result<String> {
+        use std::fmt::Write as _;
+        let mut out = String::new();
+        let order = self.fk_safe_table_order();
+
+        // 1. Schema: CREATE TABLE in dependency order (a parent before any
+        //    child whose foreign key references it).
+        for table in &order {
+            let create = self.reconstruct_create_table(table)?;
+            let _ = writeln!(out, "{create};");
+        }
+        // 2. Explicit indexes: those whose name is not the auto-generated
+        //    `{table}_{column}_idx` created for a PRIMARY KEY / UNIQUE column.
+        for table in &order {
+            if let Some(meta) = self.catalog.get_table(table) {
+                for ix in &meta.indexes {
+                    if ix.name != format!("{table}_{}_idx", ix.column) {
+                        let _ =
+                            writeln!(out, "CREATE INDEX {} ON {table} ({});", ix.name, ix.column);
+                    }
+                }
+            }
+        }
+        // 3. Views, in name order.
+        let mut views: Vec<(&String, &Statement)> = self.views.iter().collect();
+        views.sort_by(|a, b| a.0.cmp(b.0));
+        for (name, query) in views {
+            let _ = writeln!(out, "CREATE VIEW {name} AS {query};");
+        }
+        // 4. Data: an INSERT per non-empty table, in dependency order so a
+        //    child's rows land after the parent rows they reference.
+        for table in &order {
+            let Some(meta) = self.catalog.get_table(table) else {
+                continue;
+            };
+            let schema: Vec<DataType> = meta.columns.iter().map(|c| c.ty).collect();
+            let col_names = meta
+                .columns
+                .iter()
+                .map(|c| c.name.clone())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let rows = self.scan_all_rows(table, &schema)?;
+            if rows.is_empty() {
+                continue;
+            }
+            let _ = write!(out, "INSERT INTO {table} ({col_names}) VALUES ");
+            for (i, row) in rows.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                let cells = row
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let _ = write!(out, "({cells})");
+            }
+            out.push_str(";\n");
+        }
+        Ok(out)
+    }
+
+    /// Order the user tables so every table follows the tables its foreign keys
+    /// reference. A reference cycle (or self-reference) falls back to name order
+    /// for the tables it involves.
+    fn fk_safe_table_order(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.tables.keys().cloned().collect();
+        names.sort();
+        let parents = |t: &str| -> Vec<String> {
+            self.constraints
+                .get(t)
+                .map(|tc| {
+                    tc.foreign_keys
+                        .iter()
+                        .map(|fk| fk.parent_table.clone())
+                        .filter(|p| p != t)
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let mut ordered: Vec<String> = Vec::new();
+        while ordered.len() < names.len() {
+            let mut progressed = false;
+            for n in &names {
+                if ordered.contains(n) {
+                    continue;
+                }
+                if parents(n)
+                    .iter()
+                    .all(|p| ordered.contains(p) || !names.contains(p))
+                {
+                    ordered.push(n.clone());
+                    progressed = true;
+                }
+            }
+            if !progressed {
+                // A cycle: emit whatever is left in name order and stop.
+                for n in &names {
+                    if !ordered.contains(n) {
+                        ordered.push(n.clone());
+                    }
+                }
+                break;
+            }
+        }
+        ordered
+    }
+
+    /// Rebuild the `CREATE TABLE` statement for `table` from the catalog plus
+    /// the engine's own sidecars (defaults, serials, constraints), so its
+    /// `Display` reproduces the original DDL.
+    fn reconstruct_create_table(&self, table: &str) -> Result<Statement> {
+        let meta = self
+            .catalog
+            .get_table(table)
+            .ok_or_else(|| DbError::UnknownTable(table.to_string()))?;
+        let serials = self.serial_cols.get(table);
+        let store = self.tables.get(table);
+        let columns = meta
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let serial = serials.is_some_and(|s| s.iter().any(|n| n == &c.name));
+                // A serial column carries no DEFAULT of its own.
+                let default = if serial {
+                    None
+                } else {
+                    store
+                        .and_then(|s| s.defaults.get(i))
+                        .cloned()
+                        .flatten()
+                        .map(Expr::Literal)
+                };
+                ColumnDef {
+                    name: c.name.clone(),
+                    ty: c.ty,
+                    primary_key: c.primary_key,
+                    // PRIMARY KEY already implies NOT NULL and UNIQUE, so don't
+                    // re-emit them and produce redundant DDL.
+                    not_null: c.not_null && !c.primary_key,
+                    unique: c.unique && !c.primary_key,
+                    default,
+                    serial,
+                }
+            })
+            .collect();
+        let constraints = self
+            .constraints
+            .get(table)
+            .map(|tc| {
+                let mut v: Vec<TableConstraint> = Vec::new();
+                for chk in &tc.checks {
+                    v.push(TableConstraint::Check(chk.clone()));
+                }
+                for fk in &tc.foreign_keys {
+                    v.push(TableConstraint::ForeignKey(ForeignKey {
+                        column: fk.column.clone(),
+                        parent_table: fk.parent_table.clone(),
+                        parent_column: fk.parent_column.clone(),
+                    }));
+                }
+                v
+            })
+            .unwrap_or_default();
+        Ok(Statement::CreateTable {
+            if_not_exists: false,
+            name: table.to_string(),
+            columns,
+            constraints,
+        })
     }
 
     // --- statement handlers ---
@@ -5648,6 +5830,65 @@ mod tests {
         let mut db = Database::open(&path).expect("reopen");
         let (_c, rows) = query(&mut db, "SELECT id FROM users");
         assert_eq!(rows, vec![vec![Value::Int(1)]]);
+    }
+
+    #[test]
+    fn dump_reproduces_the_database() {
+        // Bind the fresh restore target up front, before `db` is shadowed by the
+        // source database below (a second `db()` would otherwise resolve to the
+        // local variable, not the helper).
+        let (_d2, mut restored) = db();
+        let (_d, mut db) = db();
+        // A schema exercising serial, defaults, constraints, a foreign key, an
+        // explicit index, and a view.
+        db.execute("CREATE TABLE parent (id INT PRIMARY KEY, name TEXT NOT NULL)")
+            .unwrap();
+        db.execute(
+            "CREATE TABLE child (id SERIAL PRIMARY KEY, pid INT REFERENCES parent (id), \
+             qty INT DEFAULT 1 CHECK (qty > 0))",
+        )
+        .unwrap();
+        db.execute("CREATE INDEX child_qty_ix ON child (qty)")
+            .unwrap();
+        db.execute("CREATE VIEW big AS SELECT id FROM child WHERE qty > 5")
+            .unwrap();
+        db.execute("INSERT INTO parent VALUES (1, 'a'), (2, 'b')")
+            .unwrap();
+        db.execute("INSERT INTO child (pid, qty) VALUES (1, 3), (2, 9)")
+            .unwrap();
+
+        let script = db.dump().unwrap();
+        // child must be created and loaded after parent (foreign-key safe).
+        let create_parent = script.find("CREATE TABLE parent").unwrap();
+        let create_child = script.find("CREATE TABLE child").unwrap();
+        assert!(create_parent < create_child, "parent DDL before child DDL");
+
+        // Restoring the script into the fresh database reproduces every row.
+        for stmt in script.split(";\n").map(str::trim).filter(|s| !s.is_empty()) {
+            restored.execute(stmt).unwrap();
+        }
+        let (_c, parents) = query(&mut restored, "SELECT id, name FROM parent ORDER BY id");
+        assert_eq!(
+            parents,
+            vec![
+                vec![Value::Int(1), Value::Text("a".into())],
+                vec![Value::Int(2), Value::Text("b".into())],
+            ]
+        );
+        let (_c, kids) = query(&mut restored, "SELECT id, pid, qty FROM child ORDER BY id");
+        assert_eq!(
+            kids,
+            vec![
+                vec![Value::Int(1), Value::Int(1), Value::Int(3)],
+                vec![Value::Int(2), Value::Int(2), Value::Int(9)],
+            ]
+        );
+        // The view and the CHECK constraint came across too.
+        let (_c, v) = query(&mut restored, "SELECT id FROM big");
+        assert_eq!(v, vec![vec![Value::Int(2)]]);
+        assert!(restored
+            .execute("INSERT INTO child (pid, qty) VALUES (1, 0)")
+            .is_err());
     }
 
     // --- RETURNING ---
