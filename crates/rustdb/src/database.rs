@@ -1509,6 +1509,7 @@ impl Database {
         match stmt {
             Statement::Select(s) => Ok(Statement::Select(Box::new(self.fold_select(txn, s)?))),
             Statement::Union {
+                op,
                 all,
                 left,
                 right,
@@ -1516,6 +1517,7 @@ impl Database {
                 limit,
                 offset,
             } => Ok(Statement::Union {
+                op: *op,
                 all: *all,
                 left: Box::new(self.fold_query(txn, left)?),
                 right: Box::new(self.fold_query(txn, right)?),
@@ -3172,7 +3174,7 @@ mod tests {
             QueryOutcome::Explain(p) => p,
             other => panic!("expected explain, got {other:?}"),
         };
-        assert!(plan.contains("Union ALL"), "plan was:\n{plan}");
+        assert!(plan.contains("UNION ALL"), "plan was:\n{plan}");
     }
 
     #[test]
@@ -3185,6 +3187,87 @@ mod tests {
         assert!(db
             .execute("SELECT x, y FROM a UNION SELECT z FROM b")
             .is_err());
+    }
+
+    /// Collect the single INT column of each row into a sorted Vec for
+    /// order-insensitive comparison of set-operation output.
+    fn int_col_sorted(rows: &[Vec<Value>]) -> Vec<i64> {
+        let mut v: Vec<i64> = rows
+            .iter()
+            .map(|r| match r[0] {
+                Value::Int(n) => n,
+                ref o => panic!("want int, got {o:?}"),
+            })
+            .collect();
+        v.sort_unstable();
+        v
+    }
+
+    #[test]
+    fn intersect_keeps_only_common_rows() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE a (x INT)").unwrap();
+        db.execute("CREATE TABLE b (y INT)").unwrap();
+        db.execute("INSERT INTO a VALUES (1), (2), (2), (3)")
+            .unwrap();
+        db.execute("INSERT INTO b VALUES (2), (3), (3), (4)")
+            .unwrap();
+        // INTERSECT is distinct: the shared values 2 and 3, once each.
+        let (_c, rows) = query(&mut db, "SELECT x FROM a INTERSECT SELECT y FROM b");
+        assert_eq!(int_col_sorted(&rows), vec![2, 3]);
+    }
+
+    #[test]
+    fn except_subtracts_the_right_side() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE a (x INT)").unwrap();
+        db.execute("CREATE TABLE b (y INT)").unwrap();
+        db.execute("INSERT INTO a VALUES (1), (2), (2), (3)")
+            .unwrap();
+        db.execute("INSERT INTO b VALUES (2), (4)").unwrap();
+        // EXCEPT is distinct: values in a not present in b, namely 1 and 3.
+        let (_c, rows) = query(&mut db, "SELECT x FROM a EXCEPT SELECT y FROM b");
+        assert_eq!(int_col_sorted(&rows), vec![1, 3]);
+    }
+
+    #[test]
+    fn intersect_all_keeps_minimum_multiplicity() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE a (x INT)").unwrap();
+        db.execute("CREATE TABLE b (y INT)").unwrap();
+        db.execute("INSERT INTO a VALUES (2), (2), (2)").unwrap();
+        db.execute("INSERT INTO b VALUES (2), (2)").unwrap();
+        // min(3, 2) = 2 copies of the value 2.
+        let (_c, rows) = query(&mut db, "SELECT x FROM a INTERSECT ALL SELECT y FROM b");
+        assert_eq!(int_col_sorted(&rows), vec![2, 2]);
+    }
+
+    #[test]
+    fn except_all_subtracts_multiplicity() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE a (x INT)").unwrap();
+        db.execute("CREATE TABLE b (y INT)").unwrap();
+        db.execute("INSERT INTO a VALUES (2), (2), (2), (5)")
+            .unwrap();
+        db.execute("INSERT INTO b VALUES (2)").unwrap();
+        // max(0, 3 - 1) = 2 copies of 2, plus the lone 5.
+        let (_c, rows) = query(&mut db, "SELECT x FROM a EXCEPT ALL SELECT y FROM b");
+        assert_eq!(int_col_sorted(&rows), vec![2, 2, 5]);
+    }
+
+    #[test]
+    fn intersect_explains_with_its_keyword() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE a (x INT)").unwrap();
+        db.execute("CREATE TABLE b (y INT)").unwrap();
+        let plan = match db
+            .execute("EXPLAIN SELECT x FROM a EXCEPT SELECT y FROM b")
+            .unwrap()
+        {
+            QueryOutcome::Explain(p) => p,
+            other => panic!("expected explain, got {other:?}"),
+        };
+        assert!(plan.contains("EXCEPT"), "plan was:\n{plan}");
     }
 
     // --- subqueries (uncorrelated scalar and IN) ---

@@ -383,7 +383,13 @@ Transaction control is `BEGIN` / `COMMIT` / `ROLLBACK`. `SELECT` covers:
   the whole partition; running-frame semantics are not implemented.
 - `DISTINCT`, `ORDER BY` (multi-key, `ASC` / `DESC`, and by output ordinal or
   alias), `LIMIT`, and `OFFSET`.
-- `UNION` and `UNION ALL`, with a trailing `ORDER BY` / `LIMIT` over the union.
+- Set operations `UNION`, `INTERSECT`, and `EXCEPT` (each with optional `ALL`),
+  chained left-associatively at equal precedence (matching SQLite), with a
+  trailing `ORDER BY` / `LIMIT` over the whole result. `UNION` streams both
+  sides with optional dedup; `INTERSECT` / `EXCEPT` buffer the right side to
+  test membership, then stream the left, preserving left-side order. The `ALL`
+  forms use multiset arithmetic (`INTERSECT ALL` keeps `min` multiplicity,
+  `EXCEPT ALL` the difference).
 - Scalar subqueries `(SELECT ...)`, `expr [NOT] IN (SELECT ...)`, and
   `EXISTS (SELECT ...)`, both uncorrelated and correlated. An uncorrelated one
   is folded to a literal before planning; a correlated one (it references an

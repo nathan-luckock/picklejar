@@ -16,7 +16,7 @@ use std::rc::Rc;
 
 use rustdb_planner::PhysicalPlan;
 use rustdb_sql::statement::SelectItem;
-use rustdb_sql::{BinOp, Expr, JoinKind, Value};
+use rustdb_sql::{BinOp, Expr, JoinKind, SetOp, Value};
 
 use crate::error::{ExecError, Result};
 use crate::eval::{eval, eval_with, is_truthy, SubqueryRunner};
@@ -343,22 +343,26 @@ impl Executor for DerivedScan {
     }
 }
 
-/// Concatenate two inputs (`UNION ALL`), optionally removing rows seen across
-/// either side (`UNION`). Output columns are the left input's.
-struct Union {
+/// Combine two inputs by a set operation. `UNION` streams left then right with
+/// optional dedup; `INTERSECT` / `EXCEPT` materialize the right side first to
+/// test membership, then stream the left side. Output columns are the left
+/// input's, and left-side order is preserved.
+struct SetOpExec {
     left: Box<dyn Executor>,
     right: Box<dyn Executor>,
     columns: Vec<String>,
+    op: SetOp,
     all: bool,
+    /// Rows already emitted (for dedup) and, for INTERSECT / EXCEPT, the
+    /// buffered result once the right side has been consumed.
     seen: HashSet<Vec<u8>>,
     on_left: bool,
+    buffered: Option<std::vec::IntoIter<Row>>,
 }
 
-impl Executor for Union {
-    fn columns(&self) -> &[String] {
-        &self.columns
-    }
-    fn next(&mut self) -> Result<Option<Row>> {
+impl SetOpExec {
+    /// Stream the next `UNION` / `UNION ALL` row.
+    fn next_union(&mut self) -> Result<Option<Row>> {
         loop {
             let row = if self.on_left {
                 let Some(r) = self.left.next()? else {
@@ -374,6 +378,76 @@ impl Executor for Union {
             };
             if self.all || self.seen.insert(group_key_bytes(&row)) {
                 return Ok(Some(row));
+            }
+        }
+    }
+
+    /// Materialize the `INTERSECT` / `EXCEPT` result: count the right side,
+    /// then walk the left side keeping rows by the operation's rule.
+    fn materialize_set(&mut self) -> Result<()> {
+        let mut right_counts: HashMap<Vec<u8>, usize> = HashMap::new();
+        while let Some(r) = self.right.next()? {
+            *right_counts.entry(group_key_bytes(&r)).or_default() += 1;
+        }
+        let mut out = Vec::new();
+        while let Some(r) = self.left.next()? {
+            let kb = group_key_bytes(&r);
+            if self.all {
+                // Multiset: INTERSECT ALL takes min(left, right) copies;
+                // EXCEPT ALL takes max(0, left - right) copies. Decrement the
+                // right count as left rows consume it.
+                let remaining = right_counts.get_mut(&kb);
+                let keep = match self.op {
+                    SetOp::Intersect => remaining.is_some_and(|c| {
+                        let take = *c > 0;
+                        if take {
+                            *c -= 1;
+                        }
+                        take
+                    }),
+                    SetOp::Except => match remaining {
+                        Some(c) if *c > 0 => {
+                            *c -= 1;
+                            false
+                        }
+                        _ => true,
+                    },
+                    SetOp::Union => true,
+                };
+                if keep {
+                    out.push(r);
+                }
+            } else {
+                // Distinct: emit each row at most once, keeping it when its
+                // presence in the right side matches the operation.
+                let in_right = right_counts.contains_key(&kb);
+                let keep = match self.op {
+                    SetOp::Intersect => in_right,
+                    SetOp::Except => !in_right,
+                    SetOp::Union => true,
+                };
+                if keep && self.seen.insert(kb) {
+                    out.push(r);
+                }
+            }
+        }
+        self.buffered = Some(out.into_iter());
+        Ok(())
+    }
+}
+
+impl Executor for SetOpExec {
+    fn columns(&self) -> &[String] {
+        &self.columns
+    }
+    fn next(&mut self) -> Result<Option<Row>> {
+        match self.op {
+            SetOp::Union => self.next_union(),
+            SetOp::Intersect | SetOp::Except => {
+                if self.buffered.is_none() {
+                    self.materialize_set()?;
+                }
+                Ok(self.buffered.as_mut().expect("materialized").next())
             }
         }
     }
@@ -1264,25 +1338,32 @@ fn build_with(
             Ok(Box::new(DerivedScan { input, columns }))
         }
         PhysicalPlan::Union {
-            all, left, right, ..
+            op,
+            all,
+            left,
+            right,
+            ..
         } => {
             let left = build_with(left, source, runner)?;
             let right = build_with(right, source, runner)?;
             let columns = left.columns().to_vec();
             if right.columns().len() != columns.len() {
                 return Err(ExecError::Unsupported(format!(
-                    "UNION requires matching column counts ({} vs {})",
+                    "{} requires matching column counts ({} vs {})",
+                    op.keyword(),
                     columns.len(),
                     right.columns().len()
                 )));
             }
-            Ok(Box::new(Union {
+            Ok(Box::new(SetOpExec {
                 left,
                 right,
                 columns,
+                op: *op,
                 all: *all,
                 seen: HashSet::new(),
                 on_left: true,
+                buffered: None,
             }))
         }
         PhysicalPlan::NestedLoopJoin {

@@ -9,7 +9,7 @@
 //! Every node carries `est_rows` and `est_cost` so EXPLAIN can show them and
 //! parent operators can cost themselves from their children.
 
-use rustdb_sql::{BinOp, Expr, JoinKind, SelectItem};
+use rustdb_sql::{BinOp, Expr, JoinKind, SelectItem, SetOp};
 
 use crate::catalog::Catalog;
 use crate::cost::{estimate_rows, index_scan_cost, sargable_index, selectivity, seq_scan_cost};
@@ -103,9 +103,11 @@ pub enum PhysicalPlan {
         /// Estimated cost.
         est_cost: f64,
     },
-    /// Combine two queries (`UNION` / `UNION ALL`).
+    /// Combine two queries (`UNION` / `INTERSECT` / `EXCEPT`, optional `ALL`).
     Union {
-        /// `UNION ALL` keeps duplicates; `UNION` removes them.
+        /// Which set operation.
+        op: SetOp,
+        /// `ALL` keeps duplicates; without it, duplicates are removed.
         all: bool,
         /// Left query plan.
         left: Box<Self>,
@@ -341,12 +343,18 @@ pub fn plan(logical: &LogicalPlan, catalog: &Catalog) -> Result<PhysicalPlan> {
                 est_cost,
             })
         }
-        LogicalPlan::Union { all, left, right } => {
+        LogicalPlan::Union {
+            op,
+            all,
+            left,
+            right,
+        } => {
             let l = plan(left, catalog)?;
             let r = plan(right, catalog)?;
             let est_rows = l.est_rows().saturating_add(r.est_rows());
             let est_cost = l.est_cost() + r.est_cost();
             Ok(PhysicalPlan::Union {
+                op: *op,
                 all: *all,
                 left: Box::new(l),
                 right: Box::new(r),

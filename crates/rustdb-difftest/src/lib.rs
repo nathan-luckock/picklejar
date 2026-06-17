@@ -129,6 +129,8 @@ fn generate(rng: &mut Rng) -> Program {
         gen_join(rng)
     } else if rng.chance(40) {
         gen_aggregate(rng)
+    } else if rng.chance(25) {
+        gen_set_op(rng)
     } else {
         gen_single(rng)
     };
@@ -223,6 +225,26 @@ fn gen_join(rng: &mut Rng) -> String {
         q.push_str(&gen_predicate(rng, &available, 0));
     }
     q
+}
+
+/// A set operation over two single-INT-column selects (so the sides are
+/// union-compatible). `ALL` is only paired with `UNION`: SQLite rejects
+/// `INTERSECT ALL` / `EXCEPT ALL`, which would skip the seed rather than test
+/// anything.
+fn gen_set_op(rng: &mut Rng) -> String {
+    let (op, allow_all) = match rng.below(3) {
+        0 => ("UNION", true),
+        1 => ("INTERSECT", false),
+        _ => ("EXCEPT", false),
+    };
+    let all = if allow_all && rng.chance(50) {
+        " ALL"
+    } else {
+        ""
+    };
+    let left = if rng.chance(50) { "id" } else { "n" };
+    let right = if rng.chance(50) { "id" } else { "m" };
+    format!("SELECT {left} FROM a {op}{all} SELECT {right} FROM b")
 }
 
 /// A projection list: `*` or a non-empty subset of the available columns.

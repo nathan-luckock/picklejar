@@ -302,6 +302,29 @@ impl fmt::Display for TableConstraint {
     }
 }
 
+/// A set operation combining two queries.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum SetOp {
+    /// `UNION`: rows in either side.
+    Union,
+    /// `INTERSECT`: rows in both sides.
+    Intersect,
+    /// `EXCEPT`: rows in the left side but not the right.
+    Except,
+}
+
+impl SetOp {
+    /// The SQL keyword for this operation.
+    #[must_use]
+    pub const fn keyword(self) -> &'static str {
+        match self {
+            Self::Union => "UNION",
+            Self::Intersect => "INTERSECT",
+            Self::Except => "EXCEPT",
+        }
+    }
+}
+
 /// A parsed SQL statement. Grows as SELECT and DML parsers land.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Statement {
@@ -397,22 +420,26 @@ pub enum Statement {
     Commit,
     /// `ROLLBACK`: abort the current transaction.
     Rollback,
-    /// `left UNION [ALL] right`. `left` and `right` are queries (a `Select` or
-    /// a nested `Union`). Without `all`, duplicate rows are removed. A trailing
-    /// `ORDER BY` / `LIMIT` / `OFFSET` applies to the whole union and lives on
-    /// the outermost node (inner nodes of a chain leave them empty).
+    /// `left {UNION|INTERSECT|EXCEPT} [ALL] right`. `left` and `right` are
+    /// queries (a `Select` or a nested set operation). Without `all`, duplicate
+    /// rows are removed. A trailing `ORDER BY` / `LIMIT` / `OFFSET` applies to
+    /// the whole result and lives on the outermost node (inner nodes of a chain
+    /// leave them empty). The variant is named `Union` for historical reasons;
+    /// `op` selects which set operation it is.
     Union {
-        /// `UNION ALL` keeps duplicates; `UNION` removes them.
+        /// Which set operation: `UNION`, `INTERSECT`, or `EXCEPT`.
+        op: SetOp,
+        /// `ALL` keeps duplicates; without it, duplicate rows are removed.
         all: bool,
         /// Left query.
         left: Box<Self>,
         /// Right query.
         right: Box<Self>,
-        /// ORDER BY over the union output (empty if none).
+        /// ORDER BY over the output (empty if none).
         order_by: Vec<OrderItem>,
-        /// LIMIT over the union (None if none).
+        /// LIMIT over the output (None if none).
         limit: Option<u64>,
-        /// OFFSET over the union (None if none).
+        /// OFFSET over the output (None if none).
         offset: Option<u64>,
     },
 }
@@ -623,6 +650,7 @@ impl fmt::Display for Statement {
             Self::Commit => f.write_str("COMMIT"),
             Self::Rollback => f.write_str("ROLLBACK"),
             Self::Union {
+                op,
                 all,
                 left,
                 right,
@@ -630,7 +658,11 @@ impl fmt::Display for Statement {
                 limit,
                 offset,
             } => {
-                let kw = if *all { "UNION ALL" } else { "UNION" };
+                let kw = if *all {
+                    format!("{} ALL", op.keyword())
+                } else {
+                    op.keyword().to_string()
+                };
                 write!(f, "{left} {kw} {right}")?;
                 if !order_by.is_empty() {
                     f.write_str(" ORDER BY ")?;
@@ -714,10 +746,13 @@ impl Parser {
     /// `ORDER BY` / `LIMIT` / `OFFSET` applying to the whole query.
     pub(crate) fn parse_query(&mut self) -> Result<Statement> {
         let mut query = Statement::Select(Box::new(self.parse_select()?));
-        while self.eat_keyword(Keyword::Union) {
+        // UNION / INTERSECT / EXCEPT chain left-associatively at equal
+        // precedence (matching SQLite's left-to-right grouping).
+        while let Some(op) = self.eat_set_op() {
             let all = self.eat_keyword(Keyword::All);
             let right = Statement::Select(Box::new(self.parse_select()?));
             query = Statement::Union {
+                op,
                 all,
                 left: Box::new(query),
                 right: Box::new(right),
@@ -750,6 +785,20 @@ impl Parser {
             _ => unreachable!("parse_query builds only Select or Union"),
         }
         Ok(query)
+    }
+
+    /// Consume a leading set-operation keyword (`UNION` / `INTERSECT` /
+    /// `EXCEPT`) if present, returning which one.
+    fn eat_set_op(&mut self) -> Option<SetOp> {
+        if self.eat_keyword(Keyword::Union) {
+            Some(SetOp::Union)
+        } else if self.eat_keyword(Keyword::Intersect) {
+            Some(SetOp::Intersect)
+        } else if self.eat_keyword(Keyword::Except) {
+            Some(SetOp::Except)
+        } else {
+            None
+        }
     }
 
     /// Parse one `SELECT` term, up to but not including any trailing `ORDER BY`
@@ -1388,6 +1437,7 @@ impl Statement {
                 returning: returning.clone(),
             },
             Self::Union {
+                op,
                 all,
                 left,
                 right,
@@ -1395,6 +1445,7 @@ impl Statement {
                 limit,
                 offset,
             } => Self::Union {
+                op: *op,
                 all: *all,
                 left: Box::new(left.substitute_params(params)),
                 right: Box::new(right.substitute_params(params)),
@@ -1553,6 +1604,24 @@ mod tests {
         round_trip("SELECT a FROM t UNION ALL SELECT b FROM u");
         // Left-associative chain.
         round_trip("SELECT a FROM t UNION SELECT b FROM u UNION ALL SELECT c FROM v");
+    }
+
+    #[test]
+    fn intersect_and_except_round_trip() {
+        round_trip("SELECT a FROM t INTERSECT SELECT b FROM u");
+        round_trip("SELECT a FROM t EXCEPT SELECT b FROM u");
+        round_trip("SELECT a FROM t INTERSECT ALL SELECT b FROM u");
+        round_trip("SELECT a FROM t EXCEPT ALL SELECT b FROM u");
+        // A mixed chain stays left-associative at equal precedence.
+        round_trip("SELECT a FROM t UNION SELECT b FROM u EXCEPT SELECT c FROM v");
+        let s = parse("SELECT a FROM t INTERSECT SELECT b FROM u");
+        assert!(matches!(
+            s,
+            Statement::Union {
+                op: SetOp::Intersect,
+                ..
+            }
+        ));
     }
 
     #[test]

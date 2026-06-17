@@ -27,6 +27,7 @@ pub fn bind(catalog: &Catalog, stmt: &Statement) -> Result<LogicalPlan> {
     match stmt {
         Statement::Select(select) => bind_select(catalog, select),
         Statement::Union {
+            op,
             all,
             left,
             right,
@@ -35,6 +36,7 @@ pub fn bind(catalog: &Catalog, stmt: &Statement) -> Result<LogicalPlan> {
             offset,
         } => {
             let mut plan = LogicalPlan::Union {
+                op: *op,
                 all: *all,
                 left: Box::new(bind(catalog, left)?),
                 right: Box::new(bind(catalog, right)?),

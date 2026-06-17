@@ -110,9 +110,18 @@ fn render(plan: &PhysicalPlan, depth: usize, out: &mut String) {
             render(input, depth + 1, out);
         }
         PhysicalPlan::Union {
-            all, left, right, ..
+            op,
+            all,
+            left,
+            right,
+            ..
         } => {
-            let _ = writeln!(out, "{pad}Union{}  {stats}", if *all { " ALL" } else { "" });
+            let _ = writeln!(
+                out,
+                "{pad}{}{}  {stats}",
+                op.keyword(),
+                if *all { " ALL" } else { "" }
+            );
             render(left, depth + 1, out);
             render(right, depth + 1, out);
         }

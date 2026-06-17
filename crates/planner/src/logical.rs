@@ -11,7 +11,7 @@
 
 use std::fmt;
 
-use rustdb_sql::{Expr, JoinKind, SelectItem};
+use rustdb_sql::{Expr, JoinKind, SelectItem, SetOp};
 
 /// A node in the logical plan tree.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -89,9 +89,12 @@ pub enum LogicalPlan {
         /// Child plan.
         input: Box<Self>,
     },
-    /// Combine two queries (`UNION` / `UNION ALL`).
+    /// Combine two queries (`UNION` / `INTERSECT` / `EXCEPT`, with optional
+    /// `ALL`).
     Union {
-        /// `UNION ALL` keeps duplicates; `UNION` removes them.
+        /// Which set operation.
+        op: SetOp,
+        /// `ALL` keeps duplicates; without it, duplicates are removed.
         all: bool,
         /// Left query plan.
         left: Box<Self>,
@@ -190,8 +193,13 @@ impl LogicalPlan {
                 writeln!(f, "{pad}Distinct")?;
                 input.fmt_indented(f, depth + 1)
             }
-            Self::Union { all, left, right } => {
-                writeln!(f, "{pad}Union{}", if *all { " ALL" } else { "" })?;
+            Self::Union {
+                op,
+                all,
+                left,
+                right,
+            } => {
+                writeln!(f, "{pad}{}{}", op.keyword(), if *all { " ALL" } else { "" })?;
                 left.fmt_indented(f, depth + 1)?;
                 right.fmt_indented(f, depth + 1)
             }
