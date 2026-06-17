@@ -1952,6 +1952,15 @@ mod tests {
     }
 
     #[test]
+    fn extract_desugars_to_date_part() {
+        // EXTRACT(field FROM expr) parses to DATE_PART('field', expr).
+        assert_eq!(
+            parse("SELECT EXTRACT(YEAR FROM ts) FROM t"),
+            parse("SELECT DATE_PART('year', ts) FROM t")
+        );
+    }
+
+    #[test]
     fn cast_round_trips() {
         // Both spellings parse; both print in the canonical CAST(...) form.
         round_trip("SELECT CAST(x AS INT) FROM t");

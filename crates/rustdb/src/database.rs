@@ -6638,6 +6638,43 @@ mod tests {
     }
 
     #[test]
+    fn date_part_trunc_and_extract() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE t (ts TIMESTAMP)").unwrap();
+        db.execute("INSERT INTO t VALUES (TIMESTAMP '2024-03-15 09:30:45')")
+            .unwrap();
+        let (_c, rows) = query(
+            &mut db,
+            "SELECT EXTRACT(year FROM ts), EXTRACT(month FROM ts), DATE_PART('day', ts), \
+             DATE_PART('hour', ts), DATE_PART('minute', ts) FROM t",
+        );
+        assert_eq!(
+            rows[0],
+            vec![
+                Value::Int(2024),
+                Value::Int(3),
+                Value::Int(15),
+                Value::Int(9),
+                Value::Int(30),
+            ]
+        );
+        // DATE_TRUNC floors to the start of the field, as a timestamp.
+        let (_c, t) = query(&mut db, "SELECT DATE_TRUNC('month', ts) FROM t");
+        assert_eq!(
+            t,
+            vec![vec![Value::Timestamp(parse_micros("2024-03-01 00:00:00"))]]
+        );
+        // EXTRACT desugars to DATE_PART, so a query can GROUP BY it.
+        db.execute("INSERT INTO t VALUES (TIMESTAMP '2024-03-20 12:00:00')")
+            .unwrap();
+        let (_c, g) = query(
+            &mut db,
+            "SELECT EXTRACT(month FROM ts), COUNT(*) FROM t GROUP BY EXTRACT(month FROM ts)",
+        );
+        assert_eq!(g, vec![vec![Value::Int(3), Value::Int(2)]]);
+    }
+
+    #[test]
     fn cast_converts_between_types() {
         let (_d, mut db) = db();
         db.execute("CREATE TABLE t (n INT, x FLOAT, s TEXT)")

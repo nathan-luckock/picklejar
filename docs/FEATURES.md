@@ -57,7 +57,9 @@ The complete engine and SQL surface. For the *why* behind each decision, see
   into a temporal column). Stored as an epoch offset (days / microseconds) so
   they compare, `ORDER BY`, and index as time, not text. The date math is
   in-tree (no external crate); a column named `date` still works, since the
-  type words are not reserved.
+  type words are not reserved. `EXTRACT(field FROM ts)` / `DATE_PART('field',
+  ts)` pull out a component (year, month, day, hour, minute, second, dow, doy)
+  and `DATE_TRUNC('field', ts)` floors to the start of one.
 - **Casts** — `CAST(expr AS type)` and the `expr::type` shorthand, converting
   between `INT` / `FLOAT` / `BOOL` / `TEXT` / `DATE` / `TIMESTAMP` (text is
   parsed, a float rounds to an int, any value renders to text, a timestamp

@@ -67,11 +67,19 @@ pub fn eval_with(
         Expr::Parameter(n) => Err(ExecError::Unsupported(format!("unbound parameter ${n}"))),
         Expr::Unary { op, expr } => eval_unary(*op, expr, row, columns, runner),
         Expr::Binary { op, left, right } => eval_binary(*op, left, right, row, columns, runner),
-        // A scalar function is computed here; anything else (an aggregate call,
-        // computed by the Aggregate operator below) resolves to that operator's
-        // output column by its rendered name.
-        Expr::Func { name, args, .. } => eval_scalar_func(name, args, row, columns, runner)?
-            .map_or_else(|| resolve(&expr.to_string(), row, columns), Ok),
+        // A function that appears verbatim as an output column is a materialized
+        // value (a GROUP BY key, or an aggregate result computed by the Aggregate
+        // operator) and resolves to it; recomputing would fail against a grouped
+        // row that no longer carries the inputs. Otherwise it is a scalar call.
+        Expr::Func { name, args, .. } => {
+            let key = expr.to_string();
+            if let Some(i) = columns.iter().position(|c| *c == key) {
+                Ok(row[i].clone())
+            } else {
+                eval_scalar_func(name, args, row, columns, runner)?
+                    .map_or_else(|| resolve(&key, row, columns), Ok)
+            }
+        }
         Expr::Cast { expr, ty } => cast(&eval_with(expr, row, columns, runner)?, *ty),
         Expr::Case {
             operand,
@@ -162,7 +170,7 @@ fn eval_scalar_func(
         | "SUBSTRING" | "TRIM" | "LTRIM" | "RTRIM" | "REPLACE" | "MOD" | "POWER" | "POW"
         | "SQRT" | "FLOOR" | "CEIL" | "CEILING" | "RIGHT" | "REPEAT" | "REVERSE" | "INITCAP"
         | "STRPOS" | "POSITION" | "SIGN" | "TRUNC" | "TRUNCATE" | "EXP" | "LN" | "LOG"
-        | "GREATEST" | "LEAST" => {
+        | "GREATEST" | "LEAST" | "DATE_PART" | "DATE_TRUNC" => {
             let vals = args
                 .iter()
                 .map(|a| eval_with(a, row, columns, runner))
@@ -268,9 +276,66 @@ fn apply_scalar(name: &str, vals: &[Value]) -> Result<Value> {
         ("LOG", [base, a]) => Value::Float(numeric(a)?.log(numeric(base)?)),
         // GREATEST / LEAST ignore NULLs and return NULL only if all are NULL.
         ("GREATEST" | "LEAST", parts) => greatest_least(name == "GREATEST", parts)?,
+        ("DATE_PART", [Value::Text(field), value]) => date_part(field, value)?,
+        ("DATE_TRUNC", [Value::Text(field), value]) => date_trunc(field, value)?,
         _ => return Err(bad()),
     };
     Ok(v)
+}
+
+/// Split a `DATE` or `TIMESTAMP` value into (epoch days, microseconds into the
+/// day). A `DATE` is at midnight.
+fn temporal_parts(v: &Value) -> Result<(i64, i64)> {
+    use rustdb_sql::datetime::MICROS_PER_DAY;
+    match v {
+        Value::Date(d) => Ok((*d, 0)),
+        Value::Timestamp(m) => Ok((m.div_euclid(MICROS_PER_DAY), m.rem_euclid(MICROS_PER_DAY))),
+        other => Err(ExecError::Type(format!(
+            "date/time function needs a DATE or TIMESTAMP, found {other:?}"
+        ))),
+    }
+}
+
+/// `DATE_PART(field, value)` / `EXTRACT(field FROM value)`: a numeric component
+/// of a temporal value.
+fn date_part(field: &str, v: &Value) -> Result<Value> {
+    use rustdb_sql::datetime::{civil_from_days, days_from_civil};
+    let (days, tod) = temporal_parts(v)?;
+    let (year, month, day) = civil_from_days(days);
+    let secs = tod / 1_000_000;
+    let n = match field.to_ascii_lowercase().as_str() {
+        "year" => year,
+        "month" => month,
+        "day" => day,
+        "hour" => secs / 3600,
+        "minute" => (secs / 60) % 60,
+        "second" => secs % 60,
+        // Day of week, Sunday = 0 (1970-01-01 was a Thursday, day 4).
+        "dow" => (days.rem_euclid(7) + 4) % 7,
+        // Day of year, 1-based.
+        "doy" => days - days_from_civil(year, 1, 1) + 1,
+        other => return Err(ExecError::Type(format!("unknown date part {other:?}"))),
+    };
+    Ok(Value::Int(n))
+}
+
+/// `DATE_TRUNC(field, value)`: the temporal value floored to the start of the
+/// given field, always returned as a `TIMESTAMP`.
+fn date_trunc(field: &str, v: &Value) -> Result<Value> {
+    use rustdb_sql::datetime::{civil_from_days, days_from_civil, MICROS_PER_DAY};
+    let (days, tod) = temporal_parts(v)?;
+    let (year, month, _) = civil_from_days(days);
+    let secs = tod / 1_000_000;
+    let micros = match field.to_ascii_lowercase().as_str() {
+        "year" => days_from_civil(year, 1, 1) * MICROS_PER_DAY,
+        "month" => days_from_civil(year, month, 1) * MICROS_PER_DAY,
+        "day" => days * MICROS_PER_DAY,
+        "hour" => days * MICROS_PER_DAY + (secs / 3600) * 3600 * 1_000_000,
+        "minute" => days * MICROS_PER_DAY + (secs / 60) * 60 * 1_000_000,
+        "second" => days * MICROS_PER_DAY + secs * 1_000_000,
+        other => return Err(ExecError::Type(format!("unknown date part {other:?}"))),
+    };
+    Ok(Value::Timestamp(micros))
 }
 
 /// `GREATEST` (when `want_greatest`) or `LEAST` over `vals`, ignoring NULLs and

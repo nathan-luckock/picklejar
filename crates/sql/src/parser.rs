@@ -501,6 +501,12 @@ impl Parser {
     /// a function (or window) call `name(...)`, a qualified column `name.col`,
     /// or a bare column reference.
     fn parse_ident_primary(&mut self, name: String) -> Result<Expr> {
+        // `EXTRACT(field FROM expr)` is special syntax (not a comma call); it
+        // desugars to `DATE_PART('field', expr)`. EXTRACT is not reserved, so it
+        // is recognized only in this `(` ... `FROM` shape.
+        if name.eq_ignore_ascii_case("extract") && matches!(self.peek(), TokenKind::LParen) {
+            return self.parse_extract();
+        }
         if self.eat(&TokenKind::LParen) {
             // Function call: name '(' [DISTINCT] [args] ')', e.g. SUM(total),
             // COUNT(*), or COUNT(DISTINCT col). The name is stored upper-cased.
@@ -530,6 +536,21 @@ impl Parser {
         } else {
             Ok(Expr::Column(name))
         }
+    }
+
+    /// Parse `EXTRACT(field FROM expr)`, desugaring it to the equivalent
+    /// `DATE_PART('field', expr)` function call.
+    fn parse_extract(&mut self) -> Result<Expr> {
+        self.expect(&TokenKind::LParen)?;
+        let field = self.parse_ident()?;
+        self.expect_keyword(Keyword::From)?;
+        let expr = self.parse_expr()?;
+        self.expect(&TokenKind::RParen)?;
+        Ok(Expr::Func {
+            name: "DATE_PART".to_string(),
+            distinct: false,
+            args: vec![Expr::Literal(Value::Text(field.to_ascii_lowercase())), expr],
+        })
     }
 
     /// Parse a data-type name (for `CAST(... AS type)` and column definitions).
