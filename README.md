@@ -131,6 +131,7 @@ cargo run --bin difftest -- --seed 42           # replay one exactly
 - **Auto-increment**: a `SERIAL` column fills in the next id (running max plus one) when an `INSERT` omits it; the set of serial columns survives a restart in a `.seq` sidecar.
 - **Constraints**: `CHECK` predicates and `FOREIGN KEY` referential integrity, enforced on write (a foreign key is `RESTRICT` on the parent side) and persisted across restarts.
 - **DML**: `INSERT` (with or without a column list), `UPDATE`, `DELETE`, each with an optional `RETURNING` projection over the affected rows.
+- **Upserts**: `INSERT ... ON CONFLICT [(cols)] DO NOTHING | DO UPDATE SET ... [WHERE ...]`, with `excluded.col` referring to the rejected row's proposed value.
 - **Queries**: projection and `*`, `WHERE` with SQL three-valued logic, `INNER` / `LEFT` / `CROSS JOIN`, `GROUP BY` with `COUNT` / `SUM` / `MIN` / `MAX` / `AVG` (and `DISTINCT` aggregates), `HAVING`, `DISTINCT`, `ORDER BY`, `LIMIT` / `OFFSET`, and `UNION` / `UNION ALL`.
 - **Subqueries**: scalar, `IN`, and `EXISTS`, both uncorrelated and correlated; derived tables (`FROM (SELECT ...)`); views expand to the same machinery.
 - **Expressions**: `INT` / `FLOAT` / `BOOL` / `TEXT`, arithmetic with int-to-float promotion, `IN` / `BETWEEN` / `LIKE` / `IS NULL`, `CASE`, string `||`, and a library of scalar functions.

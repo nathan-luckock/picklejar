@@ -352,6 +352,8 @@ pub enum Statement {
         columns: Vec<String>,
         /// One or more value rows; each row has one expression per column.
         rows: Vec<Vec<Expr>>,
+        /// `ON CONFLICT ...` clause (None if absent).
+        on_conflict: Option<OnConflict>,
         /// `RETURNING` projection over the inserted rows (empty if absent).
         returning: Vec<SelectItem>,
     },
@@ -415,6 +417,94 @@ pub enum Statement {
     },
 }
 
+/// The `ON CONFLICT` clause of an `INSERT`: what to do when a proposed row
+/// would violate a unique or primary-key constraint.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OnConflict {
+    /// The conflict-target columns named in `ON CONFLICT (a, b)`. Empty means
+    /// the action fires on a conflict in any unique column, which is the only
+    /// form Postgres allows with `DO NOTHING`.
+    pub target: Vec<String>,
+    /// What to do when a conflict is detected.
+    pub action: ConflictAction,
+}
+
+/// The action half of an `ON CONFLICT` clause.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ConflictAction {
+    /// `DO NOTHING`: skip the conflicting row without error.
+    Nothing,
+    /// `DO UPDATE SET ... [WHERE ...]`: update the existing row in place.
+    /// Assignment right-hand sides may reference `excluded.col`, which binds to
+    /// the rejected row's proposed value (Postgres `EXCLUDED`).
+    Update {
+        /// `(column, value)` assignments applied to the existing row.
+        assignments: Vec<(String, Expr)>,
+        /// Optional predicate; the update is skipped when it is false.
+        where_clause: Option<Expr>,
+    },
+}
+
+impl fmt::Display for OnConflict {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ON CONFLICT")?;
+        if !self.target.is_empty() {
+            write!(f, " ({})", self.target.join(", "))?;
+        }
+        match &self.action {
+            ConflictAction::Nothing => f.write_str(" DO NOTHING"),
+            ConflictAction::Update {
+                assignments,
+                where_clause,
+            } => {
+                f.write_str(" DO UPDATE SET ")?;
+                for (i, (col, val)) in assignments.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{col} = {val}")?;
+                }
+                if let Some(w) = where_clause {
+                    write!(f, " WHERE {w}")?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+impl OnConflict {
+    /// Bind positional parameters in a `DO UPDATE` action's expressions.
+    #[must_use]
+    fn substitute_params(&self, params: &[Value]) -> Self {
+        let action = match &self.action {
+            ConflictAction::Nothing => ConflictAction::Nothing,
+            ConflictAction::Update {
+                assignments,
+                where_clause,
+            } => ConflictAction::Update {
+                assignments: assignments
+                    .iter()
+                    .map(|(c, e)| (c.clone(), e.substitute_params(params)))
+                    .collect(),
+                where_clause: where_clause.as_ref().map(|w| w.substitute_params(params)),
+            },
+        };
+        Self {
+            target: self.target.clone(),
+            action,
+        }
+    }
+}
+
+/// Write a ` ON CONFLICT ...` clause, or nothing when absent.
+fn write_on_conflict(f: &mut fmt::Formatter<'_>, on_conflict: Option<&OnConflict>) -> fmt::Result {
+    if let Some(oc) = on_conflict {
+        write!(f, " {oc}")?;
+    }
+    Ok(())
+}
+
 /// Write a `RETURNING <items>` clause, or nothing when `returning` is empty.
 fn write_returning(f: &mut fmt::Formatter<'_>, returning: &[SelectItem]) -> fmt::Result {
     if returning.is_empty() {
@@ -464,6 +554,7 @@ impl fmt::Display for Statement {
                 table,
                 columns,
                 rows,
+                on_conflict,
                 returning,
             } => {
                 write!(f, "INSERT INTO {table}")?;
@@ -491,6 +582,7 @@ impl fmt::Display for Statement {
                     }
                     f.write_str(")")?;
                 }
+                write_on_conflict(f, on_conflict.as_ref())?;
                 write_returning(f, returning)
             }
             Self::Update {
@@ -1125,13 +1217,60 @@ impl Parser {
                 break;
             }
         }
+        let on_conflict = self.parse_on_conflict()?;
         let returning = self.parse_returning()?;
         Ok(Statement::Insert {
             table,
             columns,
             rows,
+            on_conflict,
             returning,
         })
+    }
+
+    /// Parse an optional `ON CONFLICT [(cols)] DO {NOTHING | UPDATE SET ...}`
+    /// clause (None if absent).
+    fn parse_on_conflict(&mut self) -> Result<Option<OnConflict>> {
+        if !self.eat_keyword(Keyword::On) {
+            return Ok(None);
+        }
+        self.expect_keyword(Keyword::Conflict)?;
+        // Optional conflict target: the columns whose unique constraint the
+        // action arbitrates. Omitted means any unique conflict triggers it.
+        let target = if self.eat(&TokenKind::LParen) {
+            let cols = self.parse_ident_list()?;
+            self.expect(&TokenKind::RParen)?;
+            cols
+        } else {
+            Vec::new()
+        };
+        self.expect_keyword(Keyword::Do)?;
+        let action = if self.eat_keyword(Keyword::Nothing) {
+            ConflictAction::Nothing
+        } else {
+            self.expect_keyword(Keyword::Update)?;
+            self.expect_keyword(Keyword::Set)?;
+            let mut assignments = Vec::new();
+            loop {
+                let col = self.parse_ident()?;
+                self.expect(&TokenKind::Eq)?;
+                let val = self.parse_expr()?;
+                assignments.push((col, val));
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
+            }
+            let where_clause = if self.eat_keyword(Keyword::Where) {
+                Some(self.parse_expr()?)
+            } else {
+                None
+            };
+            ConflictAction::Update {
+                assignments,
+                where_clause,
+            }
+        };
+        Ok(Some(OnConflict { target, action }))
     }
 
     /// Parse an optional `RETURNING <projection>` clause (empty if absent).
@@ -1213,6 +1352,7 @@ impl Statement {
                 table,
                 columns,
                 rows,
+                on_conflict,
                 returning,
             } => Self::Insert {
                 table: table.clone(),
@@ -1221,6 +1361,7 @@ impl Statement {
                     .iter()
                     .map(|r| r.iter().map(|e| e.substitute_params(params)).collect())
                     .collect(),
+                on_conflict: on_conflict.as_ref().map(|oc| oc.substitute_params(params)),
                 returning: returning.clone(),
             },
             Self::Update {
@@ -1657,6 +1798,7 @@ mod tests {
                     Expr::Literal(crate::ast::Value::Int(1)),
                     Expr::Literal(crate::ast::Value::Text("x".into())),
                 ]],
+                on_conflict: None,
                 returning: vec![],
             }
         );
@@ -1740,6 +1882,30 @@ mod tests {
             parse("update t set a=1 where b=2").to_string(),
             "UPDATE t SET a = 1 WHERE (b = 2)"
         );
+    }
+
+    #[test]
+    fn on_conflict_round_trips() {
+        round_trip("INSERT INTO t (id, n) VALUES (1, 2) ON CONFLICT DO NOTHING");
+        round_trip("INSERT INTO t (id, n) VALUES (1, 2) ON CONFLICT (id) DO NOTHING");
+        round_trip("INSERT INTO t (id, n) VALUES (1, 2) ON CONFLICT (id) DO UPDATE SET n = 5");
+        // EXCLUDED references and a guard predicate survive the round-trip, as
+        // does a trailing RETURNING after the conflict clause.
+        let s = round_trip(
+            "INSERT INTO t (id, n) VALUES (1, 2) ON CONFLICT (id) DO UPDATE SET n = excluded.n WHERE (t.n < excluded.n) RETURNING id",
+        );
+        let Statement::Insert {
+            on_conflict,
+            returning,
+            ..
+        } = s
+        else {
+            panic!("expected INSERT");
+        };
+        let oc = on_conflict.expect("has ON CONFLICT");
+        assert_eq!(oc.target, vec!["id".to_string()]);
+        assert!(matches!(oc.action, ConflictAction::Update { .. }));
+        assert_eq!(returning.len(), 1);
     }
 
     #[test]

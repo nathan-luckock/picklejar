@@ -361,8 +361,13 @@ table is persisted in a `.seq` sidecar and reloaded on open, so the counter
 continues across a restart without ever resurrecting a reused id.
 DML is `INSERT` (multi-row, omitted columns take their default), `UPDATE`, and
 `DELETE`, each accepting a `RETURNING <projection>` that turns the write into a
-result set over the affected rows. Transaction control is `BEGIN` / `COMMIT` /
-`ROLLBACK`. `SELECT` covers:
+result set over the affected rows. An `INSERT` may carry an
+`ON CONFLICT [(cols)] DO {NOTHING | UPDATE SET ... [WHERE ...]}` clause: a
+proposed row that would collide on a unique or primary-key column is either
+skipped (`DO NOTHING`) or upserted onto the existing row (`DO UPDATE`), where
+the `SET` and `WHERE` expressions may read the existing row by bare name and
+the rejected row through the `excluded.` qualifier (Postgres `EXCLUDED`).
+Transaction control is `BEGIN` / `COMMIT` / `ROLLBACK`. `SELECT` covers:
 
 - Projections with `AS` aliases, `*`, and arbitrary expressions.
 - `WHERE` over the full expression grammar.
@@ -543,7 +548,11 @@ transaction manager), an in-memory catalog, and a descriptor per table.
 backing `MvccTable`; `INSERT` encodes each row and stores it under an
 auto-increment rowid; `UPDATE` and `DELETE` scan and rewrite or tombstone the
 matching rows; `SELECT` binds, plans, and runs over the transaction's
-snapshot; `EXPLAIN` prints the cost-annotated plan.
+snapshot; `EXPLAIN` prints the cost-annotated plan. `INSERT` validates and
+builds every row first, then (when an `ON CONFLICT` clause is present) plans
+each one against a single snapshot of the live rows as an insert, a skip, or
+an update of the conflicting rowid before any write, so the decision is made
+with `&self` and the writes happen together under the mutable table borrow.
 
 ### Transactions
 
