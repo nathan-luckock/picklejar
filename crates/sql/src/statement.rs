@@ -1069,7 +1069,14 @@ impl Parser {
                 subquery: Some(Box::new(query)),
             });
         }
-        let name = self.parse_ident()?;
+        // A table name, optionally schema-qualified (`schema.table`, e.g.
+        // `information_schema.tables`). The qualified form is stored verbatim as
+        // a single dotted name.
+        let mut name = self.parse_ident()?;
+        if self.eat(&TokenKind::Dot) {
+            let part = self.parse_ident()?;
+            name = format!("{name}.{part}");
+        }
         Ok(TableRef {
             name,
             alias: self.parse_optional_alias(),
@@ -1706,6 +1713,19 @@ mod tests {
         round_trip("SELECT a FROM t UNION ALL SELECT b FROM u");
         // Left-associative chain.
         round_trip("SELECT a FROM t UNION SELECT b FROM u UNION ALL SELECT c FROM v");
+    }
+
+    #[test]
+    fn schema_qualified_table_round_trips() {
+        round_trip("SELECT table_name FROM information_schema.tables");
+        round_trip(
+            "SELECT t.table_name FROM information_schema.columns AS t WHERE (t.table_name = 'x')",
+        );
+        let s = parse("SELECT table_name FROM information_schema.tables");
+        let Statement::Select(sel) = s else {
+            panic!("expected SELECT");
+        };
+        assert_eq!(sel.from.name, "information_schema.tables");
     }
 
     #[test]

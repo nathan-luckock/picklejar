@@ -411,6 +411,15 @@ Transaction control is `BEGIN` / `COMMIT` / `ROLLBACK`. `SELECT` covers:
   path uses. A safety cap aborts a recursion that would exceed a million rows. A
   self-reference without `RECURSIVE`, a recursive CTE that is not a `UNION`, and
   a `WITH` column-rename list are each rejected.
+- Schema introspection: the read-only views `information_schema.tables`
+  (`table_name`, `table_type`) and `information_schema.columns` (`table_name`,
+  `column_name`, `ordinal_position`, `data_type`, `is_nullable`) are queryable
+  like any table, so a client can discover the schema. They are registered in
+  the catalog (so queries bind) but carry no physical store; the engine builds
+  their rows from the live catalog on each scan. A schema-qualified table name
+  (`information_schema.tables`) is parsed as a single dotted name, which also
+  keeps the system views out of the `FROM`-able space for ordinary DDL/DML
+  (those parse a single bare identifier).
 - `EXPLAIN` of any of the above.
 
 The expression grammar has four column types (`INT`, `FLOAT`, `BOOL`, `TEXT`),
