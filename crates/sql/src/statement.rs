@@ -214,7 +214,12 @@ impl fmt::Display for DataType {
 }
 
 /// A column definition in a `CREATE TABLE`.
+///
+/// The four boolean attributes (primary key, NOT NULL, UNIQUE, SERIAL) are
+/// independent SQL column flags, not a hidden state machine, so they stay as
+/// plain bools rather than being folded into an enum.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct ColumnDef {
     /// Column name.
     pub name: String,
@@ -228,11 +233,17 @@ pub struct ColumnDef {
     pub unique: bool,
     /// `DEFAULT <expr>` value for omitted columns (a constant expression).
     pub default: Option<Expr>,
+    /// `SERIAL`: an integer column that auto-increments when omitted on insert.
+    pub serial: bool,
 }
 
 impl fmt::Display for ColumnDef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} {}", self.name, self.ty)?;
+        if self.serial {
+            write!(f, "{} SERIAL", self.name)?;
+        } else {
+            write!(f, "{} {}", self.name, self.ty)?;
+        }
         if self.primary_key {
             f.write_str(" PRIMARY KEY")?;
         }
@@ -964,9 +975,16 @@ impl Parser {
     /// constraints normalized from inline `CHECK` / `REFERENCES` clauses.
     fn parse_column_def(&mut self) -> Result<(ColumnDef, Vec<TableConstraint>)> {
         let name = self.parse_ident()?;
+        // SERIAL is an auto-incrementing integer column.
+        let mut serial = false;
         let ty = match self.peek() {
             TokenKind::Keyword(Keyword::Int) => {
                 self.advance();
+                DataType::Int
+            }
+            TokenKind::Keyword(Keyword::Serial) => {
+                self.advance();
+                serial = true;
                 DataType::Int
             }
             TokenKind::Keyword(Keyword::Float) => {
@@ -983,7 +1001,9 @@ impl Parser {
             }
             other => {
                 return Err(SqlError::parse(
-                    format!("expected a column type (INT, FLOAT, BOOL, or TEXT), found {other:?}"),
+                    format!(
+                        "expected a column type (INT, SERIAL, FLOAT, BOOL, or TEXT), found {other:?}"
+                    ),
                     self.span(),
                 ));
             }
@@ -1030,6 +1050,7 @@ impl Parser {
                 not_null,
                 unique,
                 default,
+                serial,
             },
             inline,
         ))
@@ -1352,6 +1373,20 @@ mod tests {
     }
 
     #[test]
+    fn serial_column_round_trips() {
+        // SERIAL parses to an INT column flagged auto-increment and prints back
+        // as SERIAL, with the usual constraints attaching as on any column.
+        let stmt = round_trip("CREATE TABLE t (id SERIAL, name TEXT)");
+        let Statement::CreateTable { columns, .. } = stmt else {
+            panic!("expected CREATE TABLE");
+        };
+        assert!(columns[0].serial, "id is serial");
+        assert_eq!(columns[0].ty, DataType::Int, "serial is stored as INT");
+        assert!(!columns[1].serial, "name is not serial");
+        round_trip("CREATE TABLE t (id SERIAL PRIMARY KEY, name TEXT NOT NULL)");
+    }
+
+    #[test]
     fn constraint_round_trips() {
         // Column-level CHECK / REFERENCES normalize to table constraints, which
         // is the stable form the printer emits and re-parses to.
@@ -1432,6 +1467,7 @@ mod tests {
                     not_null: false,
                     unique: false,
                     default: None,
+                    serial: false,
                 }],
                 constraints: vec![],
             }

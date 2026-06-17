@@ -403,6 +403,47 @@ pub fn load_constraints(path: &Path) -> io::Result<Vec<Constraint>> {
     Ok(out)
 }
 
+/// Persist the serial (auto-increment) columns as `(table, column)` pairs, one
+/// per line, atomically.
+///
+/// # Errors
+///
+/// Returns an I/O error if the file cannot be written or renamed.
+pub fn save_sequences(path: &Path, columns: &[(String, String)]) -> io::Result<()> {
+    let mut out = String::new();
+    for (table, column) in columns {
+        let _ = writeln!(out, "{table} {column}");
+    }
+    let tmp = path.with_extension("seq.tmp");
+    fs::write(&tmp, out.as_bytes())?;
+    fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// Read the serial columns as `(table, column)` pairs. An absent file yields an
+/// empty list.
+///
+/// # Errors
+///
+/// Returns an I/O error if the file exists but cannot be read.
+pub fn load_sequences(path: &Path) -> io::Result<Vec<(String, String)>> {
+    let text = match fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let line = line.trim_end();
+        if line.is_empty() {
+            continue;
+        }
+        let (table, column) = line.split_once(' ').ok_or_else(invalid)?;
+        out.push((table.to_string(), column.to_string()));
+    }
+    Ok(out)
+}
+
 fn invalid() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, "malformed catalog metadata")
 }

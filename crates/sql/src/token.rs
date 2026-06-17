@@ -94,6 +94,7 @@ pub enum Keyword {
     Text,
     Float,
     Bool,
+    Serial,
 }
 
 impl Keyword {
@@ -169,6 +170,7 @@ impl Keyword {
             "end" => Self::End,
             "exists" => Self::Exists,
             "int" | "integer" => Self::Int,
+            "serial" | "bigserial" => Self::Serial,
             "text" | "varchar" => Self::Text,
             "float" | "real" | "double" => Self::Float,
             "bool" | "boolean" => Self::Bool,

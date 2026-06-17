@@ -349,11 +349,16 @@ Every AST node has a `Display` that prints canonical SQL, fully parenthesizing e
 
 ### Supported SQL surface
 
-DDL is `CREATE TABLE` (with `PRIMARY KEY` / `UNIQUE` / `NOT NULL` / `DEFAULT`
-per column, plus table-level `CHECK (predicate)` and single-column
+DDL is `CREATE TABLE` (with `PRIMARY KEY` / `UNIQUE` / `NOT NULL` / `DEFAULT` /
+`SERIAL` per column, plus table-level `CHECK (predicate)` and single-column
 `FOREIGN KEY (col) REFERENCES parent (col)`, both also accepted inline on a
 column), `CREATE INDEX`, `DROP TABLE`, `TRUNCATE TABLE`,
-`ALTER TABLE ... ADD COLUMN`, and `CREATE VIEW` / `DROP VIEW`.
+`ALTER TABLE ... ADD COLUMN`, and `CREATE VIEW` / `DROP VIEW`. A `SERIAL`
+column is an integer that auto-assigns the next value (the column's running
+maximum plus one) when an `INSERT` omits it, so an explicit value above the
+current maximum simply advances the sequence. The set of serial columns per
+table is persisted in a `.seq` sidecar and reloaded on open, so the counter
+continues across a restart without ever resurrecting a reused id.
 DML is `INSERT` (multi-row, omitted columns take their default), `UPDATE`, and
 `DELETE`, each accepting a `RETURNING <projection>` that turns the write into a
 result set over the affected rows. Transaction control is `BEGIN` / `COMMIT` /
@@ -571,7 +576,11 @@ engine reads the sidecar to rebuild the catalog and the per-table descriptors,
 so the existing on-disk pages are reachable again. The sidecar is written
 atomically (temp file, then rename), so an interrupted write never leaves a
 half-written catalog. This is what makes a table and its rows survive closing
-and reopening the database.
+and reopening the database. Three companion sidecars carry the schema that does
+not fit the fixed catalog record: `<base>.view` (view definitions), `<base>.cons`
+(`CHECK` and `FOREIGN KEY` constraints), and `<base>.seq` (the `(table, column)`
+pairs that are `SERIAL`). Each is written the same atomic way and reloaded on
+open.
 
 ### Secondary indexes
 

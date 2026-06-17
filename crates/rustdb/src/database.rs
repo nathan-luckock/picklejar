@@ -134,6 +134,9 @@ pub struct Database {
     views: HashMap<String, Statement>,
     /// Per-table `CHECK` and `FOREIGN KEY` constraints, enforced on writes.
     constraints: HashMap<String, TableConstraints>,
+    /// Per-table `SERIAL` (auto-increment) column names. When such a column is
+    /// omitted on insert, the engine assigns the next value (max so far + 1).
+    serial_cols: HashMap<String, Vec<String>>,
     /// The open explicit transaction, if the session ran `BEGIN`. In
     /// auto-commit mode (no explicit transaction) this is `None` and each
     /// statement runs in its own transaction.
@@ -147,6 +150,8 @@ pub struct Database {
     view_path: PathBuf,
     /// Sidecar file recording the `CHECK` and `FOREIGN KEY` constraints.
     cons_path: PathBuf,
+    /// Sidecar file recording the `SERIAL` columns.
+    seq_path: PathBuf,
 }
 
 impl std::fmt::Debug for Database {
@@ -172,6 +177,7 @@ impl Database {
         let txn_path = base.with_extension("txn");
         let view_path = base.with_extension("view");
         let cons_path = base.with_extension("cons");
+        let seq_path = base.with_extension("seq");
         let writer = WalWriter::open(&wal_path)?;
         let wal = WalSyncHandle::new(writer);
         let file = FileManager::open(base)?;
@@ -184,15 +190,18 @@ impl Database {
             tables: HashMap::new(),
             views: HashMap::new(),
             constraints: HashMap::new(),
+            serial_cols: HashMap::new(),
             current_txn: None,
             meta_path,
             txn_path,
             view_path,
             cons_path,
+            seq_path,
         };
         db.load_catalog()?;
         db.load_views()?;
         db.load_constraints()?;
+        db.load_serials()?;
         // Restore the transaction watermark so data committed in a previous
         // session stays visible (its xids would otherwise read as aborted).
         let (next_xid, aborted) = persist::load_txn(&db.txn_path)?;
@@ -214,9 +223,10 @@ impl Database {
                         primary_key: *primary_key,
                         not_null: *not_null,
                         unique: *unique,
-                        // The catalog does not use defaults; the engine restores
-                        // them into the table's descriptor from the sidecar.
+                        // The catalog does not use defaults or the serial flag;
+                        // the engine restores those from its own sidecars.
                         default: None,
+                        serial: false,
                     },
                 )
                 .collect();
@@ -348,6 +358,28 @@ impl Database {
             }
         }
         persist::save_constraints(&self.cons_path, &records)?;
+        Ok(())
+    }
+
+    /// Rebuild the serial-column registry from its sidecar.
+    fn load_serials(&mut self) -> Result<()> {
+        for (table, column) in persist::load_sequences(&self.seq_path)? {
+            self.serial_cols.entry(table).or_default().push(column);
+        }
+        Ok(())
+    }
+
+    /// Write the serial-column registry to its sidecar.
+    fn save_serials(&self) -> Result<()> {
+        let mut records: Vec<(String, String)> = Vec::new();
+        let mut tables: Vec<&String> = self.serial_cols.keys().collect();
+        tables.sort();
+        for table in tables {
+            for col in &self.serial_cols[table] {
+                records.push((table.clone(), col.clone()));
+            }
+        }
+        persist::save_sequences(&self.seq_path, &records)?;
         Ok(())
     }
 
@@ -624,6 +656,15 @@ impl Database {
             self.constraints.insert(name.clone(), table_constraints);
             self.save_constraints()?;
         }
+        let serials: Vec<String> = columns
+            .iter()
+            .filter(|c| c.serial)
+            .map(|c| c.name.clone())
+            .collect();
+        if !serials.is_empty() {
+            self.serial_cols.insert(name.clone(), serials);
+            self.save_serials()?;
+        }
         self.persist()?;
         Ok(QueryOutcome::Ddl)
     }
@@ -817,6 +858,9 @@ impl Database {
         if self.constraints.remove(name).is_some() {
             self.save_constraints()?;
         }
+        if self.serial_cols.remove(name).is_some() {
+            self.save_serials()?;
+        }
         self.persist()?;
         Ok(QueryOutcome::Ddl)
     }
@@ -985,6 +1029,41 @@ impl Database {
         Ok(false)
     }
 
+    /// Highest integer value stored in column `idx` of `table`, visible to
+    /// `txn`. Returns 0 when the table is empty or the column holds no
+    /// integers, so a serial column's first auto value is 1. Used to derive
+    /// the next SERIAL value (max + 1) without persisting a counter.
+    fn column_max_int(&self, txn: &Transaction, table: &str, idx: usize) -> Result<i64> {
+        let schema: Vec<DataType> = {
+            let meta = self
+                .catalog
+                .get_table(table)
+                .ok_or_else(|| DbError::UnknownTable(table.to_string()))?;
+            meta.columns.iter().map(|c| c.ty).collect()
+        };
+        let store = self
+            .tables
+            .get(table)
+            .ok_or_else(|| DbError::UnknownTable(table.to_string()))?;
+        let handle = MvccTable::open(
+            &self.pool,
+            self.wal.clone(),
+            &self.mgr,
+            store.index_root,
+            store.version_page,
+        );
+        let mut max = 0i64;
+        for (_key, bytes) in handle.scan(txn)? {
+            let row = decode_row(&bytes, &schema)?;
+            if let Some(Value::Int(n)) = row.get(idx) {
+                if *n > max {
+                    max = *n;
+                }
+            }
+        }
+        Ok(max)
+    }
+
     /// Register a view: store its defining query under `name`.
     ///
     /// The query is validated (expanded against existing views, subqueries
@@ -1068,6 +1147,23 @@ impl Database {
             .clone();
         let column_names: Vec<String> = col_meta.iter().map(|(n, _, _)| n.clone()).collect();
 
+        // Serial columns that this INSERT leaves unset get the next auto value
+        // (max existing + 1), assigned sequentially across the inserted rows.
+        // A column that is named in the INSERT keeps its explicit value, and
+        // the max-derivation picks up from there on the next insert.
+        let mut serial_next: Vec<(usize, i64)> = Vec::new();
+        if let Some(serials) = self.serial_cols.get(table) {
+            let omitted: Vec<usize> = serials
+                .iter()
+                .filter_map(|name| column_names.iter().position(|c| c == name))
+                .filter(|idx| !positions.contains(idx))
+                .collect();
+            for idx in omitted {
+                let start = self.column_max_int(txn, table, idx)? + 1;
+                serial_next.push((idx, start));
+            }
+        }
+
         // Pass 1: build each row and validate it (NOT NULL, CHECK, FOREIGN KEY)
         // before touching storage, so a violation rejects the statement before
         // any write. This also keeps the per-row checks (which read other tables
@@ -1087,6 +1183,11 @@ impl Database {
                 .collect();
             for (expr, &pos) in row.iter().zip(&positions) {
                 values[pos] = const_eval(expr)?;
+            }
+            // Assign the next value to each omitted SERIAL column.
+            for (idx, next) in &mut serial_next {
+                values[*idx] = Value::Int(*next);
+                *next += 1;
             }
             // NOT NULL.
             for (i, (name, not_null, _)) in col_meta.iter().enumerate() {
@@ -3374,6 +3475,84 @@ mod tests {
         );
         assert_eq!(names(&cols2), ["next"]);
         assert_eq!(r2, vec![vec![Value::Int(6)]]);
+    }
+
+    // --- SERIAL columns ---
+
+    #[test]
+    fn serial_auto_assigns_sequential_ids() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE t (id SERIAL, name TEXT)").unwrap();
+        // Omitting the serial column assigns 1, 2, 3 in insertion order, even
+        // across separate statements and within a multi-row insert.
+        db.execute("INSERT INTO t (name) VALUES ('a')").unwrap();
+        db.execute("INSERT INTO t (name) VALUES ('b'), ('c')")
+            .unwrap();
+        assert_eq!(
+            dump(&db, "t"),
+            vec![
+                vec![Value::Int(1), Value::Text("a".into())],
+                vec![Value::Int(2), Value::Text("b".into())],
+                vec![Value::Int(3), Value::Text("c".into())],
+            ]
+        );
+    }
+
+    #[test]
+    fn serial_explicit_value_advances_the_sequence() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE t (id SERIAL, name TEXT)").unwrap();
+        db.execute("INSERT INTO t (name) VALUES ('a')").unwrap();
+        // An explicit value above the running max is honored.
+        db.execute("INSERT INTO t (id, name) VALUES (10, 'b')")
+            .unwrap();
+        // The next omitted value derives from the new max, not the old count.
+        db.execute("INSERT INTO t (name) VALUES ('c')").unwrap();
+        assert_eq!(
+            dump(&db, "t"),
+            vec![
+                vec![Value::Int(1), Value::Text("a".into())],
+                vec![Value::Int(10), Value::Text("b".into())],
+                vec![Value::Int(11), Value::Text("c".into())],
+            ]
+        );
+    }
+
+    #[test]
+    fn serial_survives_reopen() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("test.db");
+        {
+            let mut db = Database::open(&path).expect("open");
+            db.execute("CREATE TABLE t (id SERIAL, name TEXT)").unwrap();
+            db.execute("INSERT INTO t (name) VALUES ('a'), ('b')")
+                .unwrap();
+        }
+        // After reopening, the serial registry is reloaded from the sidecar, so
+        // the next omitted value continues from the persisted max (3, not 1).
+        let mut db = Database::open(&path).expect("reopen");
+        db.execute("INSERT INTO t (name) VALUES ('c')").unwrap();
+        assert_eq!(
+            dump(&db, "t"),
+            vec![
+                vec![Value::Int(1), Value::Text("a".into())],
+                vec![Value::Int(2), Value::Text("b".into())],
+                vec![Value::Int(3), Value::Text("c".into())],
+            ]
+        );
+    }
+
+    #[test]
+    fn serial_pairs_with_returning() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE t (id SERIAL, name TEXT)").unwrap();
+        // RETURNING surfaces the value the engine chose for the serial column.
+        let (cols, rows) = query(
+            &mut db,
+            "INSERT INTO t (name) VALUES ('a'), ('b') RETURNING id",
+        );
+        assert_eq!(names(&cols), ["id"]);
+        assert_eq!(rows, vec![vec![Value::Int(1)], vec![Value::Int(2)]]);
     }
 
     // --- CHECK constraints ---

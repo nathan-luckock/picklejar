@@ -16,7 +16,7 @@ Most "build a database" projects stop at a key-value store or wrap an existing e
 - **It survives crashes, and that is proven reproducibly.** A write-ahead log and ARIES recovery (analysis, redo, undo with compensation records) guarantee no committed transaction is lost. Beyond a force-kill torture test, a **deterministic simulation tester** explores thousands of seeded, reproducible crash scenarios against a fault-injecting disk. It found and fixed a real recovery bug. See [Correctness and crash safety](#correctness-and-crash-safety).
 - **It is transactional.** MVCC gives every transaction a consistent snapshot; `BEGIN` / `COMMIT` / `ROLLBACK` work, and a reader never blocks a writer.
 - **It optimizes queries.** A cost-based planner chooses between a sequential scan and an index scan, and between a nested-loop and a hash join, from table statistics. `EXPLAIN` prints the annotated plan.
-- **It speaks a deep slice of SQL.** Joins, aggregates with `GROUP BY` / `HAVING`, `DISTINCT`, `UNION`, subqueries (scalar, `IN`, `EXISTS`, both uncorrelated and **correlated**), **derived tables**, and **views**, over typed columns with `PRIMARY KEY` / `UNIQUE` / `NOT NULL` / `DEFAULT`.
+- **It speaks a deep slice of SQL.** Joins, aggregates with `GROUP BY` / `HAVING`, `DISTINCT`, `UNION`, subqueries (scalar, `IN`, `EXISTS`, both uncorrelated and **correlated**), **derived tables**, and **views**, over typed columns with `PRIMARY KEY` / `UNIQUE` / `NOT NULL` / `DEFAULT` / `SERIAL`.
 
 Correctness is enforced by hundreds of unit tests, parser property tests, a forced-kill crash torture test, and thousands of deterministic crash-simulation seeds, all under `clippy -D warnings` and `rustfmt` in CI.
 
@@ -127,7 +127,8 @@ cargo run --bin difftest -- --seed 42           # replay one exactly
 
 ## Features
 
-- **DDL**: `CREATE TABLE` (with `PRIMARY KEY` / `UNIQUE` / `NOT NULL` / `DEFAULT`, plus `CHECK` and single-column `FOREIGN KEY` constraints), `DROP TABLE`, `TRUNCATE TABLE`, `ALTER TABLE ... ADD COLUMN`, `CREATE INDEX`, and `CREATE VIEW` / `DROP VIEW`.
+- **DDL**: `CREATE TABLE` (with `PRIMARY KEY` / `UNIQUE` / `NOT NULL` / `DEFAULT` / `SERIAL`, plus `CHECK` and single-column `FOREIGN KEY` constraints), `DROP TABLE`, `TRUNCATE TABLE`, `ALTER TABLE ... ADD COLUMN`, `CREATE INDEX`, and `CREATE VIEW` / `DROP VIEW`.
+- **Auto-increment**: a `SERIAL` column fills in the next id (running max plus one) when an `INSERT` omits it; the set of serial columns survives a restart in a `.seq` sidecar.
 - **Constraints**: `CHECK` predicates and `FOREIGN KEY` referential integrity, enforced on write (a foreign key is `RESTRICT` on the parent side) and persisted across restarts.
 - **DML**: `INSERT` (with or without a column list), `UPDATE`, `DELETE`, each with an optional `RETURNING` projection over the affected rows.
 - **Queries**: projection and `*`, `WHERE` with SQL three-valued logic, `INNER` / `LEFT` / `CROSS JOIN`, `GROUP BY` with `COUNT` / `SUM` / `MIN` / `MAX` / `AVG` (and `DISTINCT` aggregates), `HAVING`, `DISTINCT`, `ORDER BY`, `LIMIT` / `OFFSET`, and `UNION` / `UNION ALL`.
