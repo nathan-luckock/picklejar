@@ -292,6 +292,29 @@ impl Parser {
         Ok(args)
     }
 
+    /// Parse a window's `( [PARTITION BY ...] [ORDER BY ...] )`, with the
+    /// `OVER` keyword already consumed. Returns the partition keys and the
+    /// in-window order items (either may be empty).
+    fn parse_window_over(&mut self) -> Result<(Vec<Expr>, Vec<crate::statement::OrderItem>)> {
+        self.expect(&TokenKind::LParen)?;
+        let partition_by = if self.eat_keyword(Keyword::Partition) {
+            self.expect_keyword(Keyword::By)?;
+            let mut keys = Vec::new();
+            loop {
+                keys.push(self.parse_expr()?);
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
+            }
+            keys
+        } else {
+            Vec::new()
+        };
+        let order_by = self.parse_order_by()?;
+        self.expect(&TokenKind::RParen)?;
+        Ok((partition_by, order_by))
+    }
+
     /// Parse a `CASE` expression (the `CASE` keyword is already consumed).
     /// Supports both the searched form (`CASE WHEN cond THEN r ... END`) and
     /// the simple form (`CASE x WHEN v THEN r ... END`).
@@ -410,6 +433,17 @@ impl Parser {
                     let distinct = self.eat_keyword(Keyword::Distinct);
                     let args = self.parse_call_args()?;
                     self.expect(&TokenKind::RParen)?;
+                    // A trailing `OVER (...)` makes this a window function.
+                    if self.eat_keyword(Keyword::Over) {
+                        let (partition_by, order_by) = self.parse_window_over()?;
+                        return Ok(Expr::Window {
+                            func: name.to_ascii_uppercase(),
+                            distinct,
+                            args,
+                            partition_by,
+                            order_by,
+                        });
+                    }
                     Ok(Expr::Func {
                         name: name.to_ascii_uppercase(),
                         distinct,

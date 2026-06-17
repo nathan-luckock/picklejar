@@ -223,6 +223,22 @@ pub enum Expr {
     /// `EXISTS (SELECT ...)`: true if the subquery returns any row. Folded to a
     /// boolean before planning. `NOT EXISTS` is the prefix `NOT` over this.
     Exists(Box<crate::statement::Statement>),
+    /// A window function call: `func(args) OVER (PARTITION BY ... ORDER BY ...)`.
+    /// The Window operator appends one column per distinct window expression;
+    /// the projection then resolves it by its printed name, the same mechanism
+    /// aggregates use.
+    Window {
+        /// Upper-cased function name (e.g. `ROW_NUMBER`, `RANK`, `LAG`, `SUM`).
+        func: String,
+        /// `DISTINCT` argument (carried for symmetry with [`Self::Func`]).
+        distinct: bool,
+        /// Argument expressions (empty for `ROW_NUMBER` / `RANK`).
+        args: Vec<Self>,
+        /// `PARTITION BY` keys (empty means the whole input is one partition).
+        partition_by: Vec<Self>,
+        /// `ORDER BY` items inside the window (empty means unordered).
+        order_by: Vec<crate::statement::OrderItem>,
+    },
 }
 
 impl Expr {
@@ -283,6 +299,28 @@ impl Expr {
                 expr: Box::new(expr.substitute_params(params)),
                 query: Box::new(query.substitute_params(params)),
                 negated: *negated,
+            },
+            Self::Window {
+                func,
+                distinct,
+                args,
+                partition_by,
+                order_by,
+            } => Self::Window {
+                func: func.clone(),
+                distinct: *distinct,
+                args: args.iter().map(|a| a.substitute_params(params)).collect(),
+                partition_by: partition_by
+                    .iter()
+                    .map(|a| a.substitute_params(params))
+                    .collect(),
+                order_by: order_by
+                    .iter()
+                    .map(|o| crate::statement::OrderItem {
+                        expr: o.expr.substitute_params(params),
+                        desc: o.desc,
+                    })
+                    .collect(),
             },
             Self::Column(_) | Self::QualifiedColumn(..) | Self::Literal(_) | Self::Star => {
                 self.clone()
@@ -374,6 +412,58 @@ impl fmt::Display for Expr {
                 write!(f, "({expr} {kw} ({query}))")
             }
             Self::Exists(q) => write!(f, "EXISTS ({q})"),
+            Self::Window {
+                func,
+                distinct,
+                args,
+                partition_by,
+                order_by,
+            } => fmt_window(f, func, *distinct, args, partition_by, order_by),
         }
     }
+}
+
+/// Render a window-function call: `func([DISTINCT] args) OVER ([PARTITION BY
+/// ...] [ORDER BY ...])`.
+fn fmt_window(
+    f: &mut fmt::Formatter<'_>,
+    func: &str,
+    distinct: bool,
+    args: &[Expr],
+    partition_by: &[Expr],
+    order_by: &[crate::statement::OrderItem],
+) -> fmt::Result {
+    write!(f, "{func}(")?;
+    if distinct {
+        f.write_str("DISTINCT ")?;
+    }
+    for (i, a) in args.iter().enumerate() {
+        if i > 0 {
+            f.write_str(", ")?;
+        }
+        write!(f, "{a}")?;
+    }
+    f.write_str(") OVER (")?;
+    if !partition_by.is_empty() {
+        f.write_str("PARTITION BY ")?;
+        for (i, e) in partition_by.iter().enumerate() {
+            if i > 0 {
+                f.write_str(", ")?;
+            }
+            write!(f, "{e}")?;
+        }
+    }
+    if !order_by.is_empty() {
+        if !partition_by.is_empty() {
+            f.write_str(" ")?;
+        }
+        f.write_str("ORDER BY ")?;
+        for (i, o) in order_by.iter().enumerate() {
+            if i > 0 {
+                f.write_str(", ")?;
+            }
+            write!(f, "{o}")?;
+        }
+    }
+    f.write_str(")")
 }

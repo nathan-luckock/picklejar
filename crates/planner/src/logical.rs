@@ -59,6 +59,14 @@ pub enum LogicalPlan {
         /// Child plan.
         input: Box<Self>,
     },
+    /// Append one column per window function, computed over partitions of the
+    /// input (`func(args) OVER (PARTITION BY ... ORDER BY ...)`).
+    Window {
+        /// The window-function expressions (each an [`Expr::Window`]).
+        windows: Vec<Expr>,
+        /// Child plan.
+        input: Box<Self>,
+    },
     /// Sort rows by the given keys (`(expr, descending)`).
     Sort {
         /// Sort keys with their direction.
@@ -144,6 +152,15 @@ impl LogicalPlan {
                     .collect::<Vec<_>>()
                     .join(", ");
                 writeln!(f, "{pad}Aggregate GROUP BY [{keys}] AGG [{aggs}]")?;
+                input.fmt_indented(f, depth + 1)
+            }
+            Self::Window { windows, input } => {
+                let ws = windows
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                writeln!(f, "{pad}Window [{ws}]")?;
                 input.fmt_indented(f, depth + 1)
             }
             Self::Sort { keys, input } => {

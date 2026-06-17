@@ -119,6 +119,21 @@ fn bind_select(catalog: &Catalog, select: &Select) -> Result<LogicalPlan> {
         };
     }
 
+    // 3c. Window functions. Evaluated after GROUP BY / HAVING and before
+    //     ORDER BY and the projection, so a sort key or a projected expression
+    //     can reference a window result. The Window operator appends one column
+    //     per distinct window expression.
+    let windows = collect_windows(&select.projections);
+    if !windows.is_empty() {
+        for w in &windows {
+            resolve_expr(w, &scope)?;
+        }
+        plan = LogicalPlan::Window {
+            windows,
+            input: Box::new(plan),
+        };
+    }
+
     // 4. ORDER BY. Placed *below* the projection so a sort key can be any
     //    column in scope, not only the projected ones (SQL allows ORDER BY on
     //    columns absent from the SELECT list). The projection above preserves
@@ -282,6 +297,26 @@ fn resolve_expr(expr: &Expr, scope: &[ScopeEntry]) -> Result<()> {
             }
             Ok(())
         }
+        // A window function: validate the arguments, partition keys, and order
+        // keys against the scope. The window result itself is a computed column
+        // appended by the Window operator, not resolved here.
+        Expr::Window {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            for arg in args {
+                resolve_expr(arg, scope)?;
+            }
+            for key in partition_by {
+                resolve_expr(key, scope)?;
+            }
+            for item in order_by {
+                resolve_expr(&item.expr, scope)?;
+            }
+            Ok(())
+        }
         Expr::Case {
             operand,
             whens,
@@ -394,6 +429,53 @@ fn collect_aggs_in(expr: &Expr, out: &mut Vec<Expr>) {
     }
 }
 
+/// Collect the window-function calls in the projection list, deduplicated by
+/// their printed form (so the same window expression is computed once).
+fn collect_windows(projections: &[SelectItem]) -> Vec<Expr> {
+    let mut found: Vec<Expr> = Vec::new();
+    for item in projections {
+        if let SelectItem::Expr(e, _) = item {
+            collect_windows_in(e, &mut found);
+        }
+    }
+    found
+}
+
+/// Walk `expr`, pushing window-function calls into `out`. Does not descend into
+/// a window's own arguments or its `OVER` clause.
+fn collect_windows_in(expr: &Expr, out: &mut Vec<Expr>) {
+    match expr {
+        Expr::Window { .. } => push_unique(out, expr),
+        Expr::Func { args, .. } => {
+            for a in args {
+                collect_windows_in(a, out);
+            }
+        }
+        Expr::Binary { left, right, .. } => {
+            collect_windows_in(left, out);
+            collect_windows_in(right, out);
+        }
+        Expr::Unary { expr, .. } => collect_windows_in(expr, out),
+        Expr::Case {
+            operand,
+            whens,
+            else_result,
+        } => {
+            if let Some(op) = operand {
+                collect_windows_in(op, out);
+            }
+            for (when, then) in whens {
+                collect_windows_in(when, out);
+                collect_windows_in(then, out);
+            }
+            if let Some(e) = else_result {
+                collect_windows_in(e, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// A bare column must exist in at least one table in scope. Ambiguity
 /// (present in more than one) is tolerated here and resolved by the
 /// executor with full column mapping; only "exists nowhere" is an error.
@@ -494,6 +576,29 @@ mod tests {
         assert!(lines[3].starts_with("Aggregate GROUP BY"));
         assert!(lines[4].starts_with("Filter"));
         assert!(lines[5].starts_with("Scan orders"));
+    }
+
+    #[test]
+    fn window_node_sits_below_sort_and_project() {
+        // Project { Sort { Window { Scan } } }: the window is computed before
+        // the projection and the outer ORDER BY, both of which may read it.
+        let p = plan("SELECT id, ROW_NUMBER() OVER (ORDER BY total) FROM orders ORDER BY id");
+        let printed = p.to_string();
+        let lines: Vec<&str> = printed.lines().map(str::trim_start).collect();
+        assert!(lines[0].starts_with("Project"));
+        assert_eq!(lines[1], "Sort id");
+        assert!(lines[2].starts_with("Window ["));
+        assert!(lines[3].starts_with("Scan orders"));
+    }
+
+    #[test]
+    fn window_over_unknown_column_errors() {
+        let err = bind(
+            &catalog(),
+            &stmt("SELECT ROW_NUMBER() OVER (ORDER BY nope) FROM orders"),
+        )
+        .expect_err("err");
+        assert!(matches!(err, PlanError::UnknownColumn { column, .. } if column == "nope"));
     }
 
     #[test]

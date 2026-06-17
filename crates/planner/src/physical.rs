@@ -140,6 +140,17 @@ pub enum PhysicalPlan {
         /// Estimated cost.
         est_cost: f64,
     },
+    /// Window functions: append one column per window over input partitions.
+    Window {
+        /// The window-function expressions (each an [`Expr::Window`]).
+        windows: Vec<Expr>,
+        /// Child plan.
+        input: Box<Self>,
+        /// Estimated output rows (one per input row).
+        est_rows: u64,
+        /// Estimated cost.
+        est_cost: f64,
+    },
     /// Nested-loop join: scan the right input once per left row. Works for
     /// any join predicate; cost is the cross product.
     NestedLoopJoin {
@@ -190,6 +201,7 @@ impl PhysicalPlan {
             | Self::Union { est_rows, .. }
             | Self::DerivedScan { est_rows, .. }
             | Self::Aggregate { est_rows, .. }
+            | Self::Window { est_rows, .. }
             | Self::NestedLoopJoin { est_rows, .. }
             | Self::HashJoin { est_rows, .. } => *est_rows,
         }
@@ -209,6 +221,7 @@ impl PhysicalPlan {
             | Self::Union { est_cost, .. }
             | Self::DerivedScan { est_cost, .. }
             | Self::Aggregate { est_cost, .. }
+            | Self::Window { est_cost, .. }
             | Self::NestedLoopJoin { est_cost, .. }
             | Self::HashJoin { est_cost, .. } => *est_cost,
         }
@@ -280,6 +293,22 @@ pub fn plan(logical: &LogicalPlan, catalog: &Catalog) -> Result<PhysicalPlan> {
                 aggregates: aggregates.clone(),
                 input: Box::new(child),
                 est_rows,
+                est_cost,
+            })
+        }
+
+        LogicalPlan::Window { windows, input } => {
+            let child = plan(input, catalog)?;
+            let rows = child.est_rows();
+            // One output row per input row; partitioning and ordering cost is
+            // on the order of a sort, charged once per window expression.
+            #[allow(clippy::cast_precision_loss)]
+            let work = (windows.len() as f64) * (rows as f64) * (rows as f64 + 1.0).log2();
+            let est_cost = child.est_cost() + work;
+            Ok(PhysicalPlan::Window {
+                windows: windows.clone(),
+                input: Box::new(child),
+                est_rows: rows,
                 est_cost,
             })
         }
