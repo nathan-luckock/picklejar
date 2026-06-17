@@ -8,7 +8,9 @@ The complete engine and SQL surface. For the *why* behind each decision, see
 - **DDL** — `CREATE TABLE` (with `PRIMARY KEY` / `UNIQUE` / `NOT NULL` /
   `DEFAULT` / `SERIAL`, plus `CHECK` and single-column `FOREIGN KEY`
   constraints), `DROP TABLE`, `TRUNCATE TABLE`, `ALTER TABLE ... ADD COLUMN`,
-  `CREATE INDEX`, and `CREATE VIEW` / `DROP VIEW`.
+  `CREATE INDEX`, `CREATE VIEW` / `DROP VIEW`, and
+  `CREATE TABLE name AS <query>` (build and populate a table from a query
+  result, inferring its columns).
 - **Auto-increment** — a `SERIAL` column fills in the next id (running max plus
   one) when an `INSERT` omits it; the set of serial columns survives a restart
   in a `.seq` sidecar.

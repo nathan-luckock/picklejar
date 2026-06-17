@@ -359,6 +359,14 @@ pub enum Statement {
         /// normalized from column-level `CHECK` / `REFERENCES` clauses.
         constraints: Vec<TableConstraint>,
     },
+    /// `CREATE TABLE name AS <query>`: create a table from a query's result,
+    /// inferring its columns and populating it with the rows.
+    CreateTableAs {
+        /// New table name.
+        name: String,
+        /// The query whose result becomes the table.
+        query: Box<Self>,
+    },
     /// `DROP TABLE name`.
     DropTable {
         /// Table name.
@@ -624,6 +632,7 @@ impl fmt::Display for Statement {
                 table,
                 column,
             } => write!(f, "CREATE INDEX {name} ON {table} ({column})"),
+            Self::CreateTableAs { name, query } => write!(f, "CREATE TABLE {name} AS {query}"),
             Self::CreateView { name, query } => write!(f, "CREATE VIEW {name} AS {query}"),
             Self::DropView { name } => write!(f, "DROP VIEW {name}"),
             Self::Select(s) => write!(f, "{s}"),
@@ -1194,6 +1203,15 @@ impl Parser {
 
     fn parse_create_table_tail(&mut self) -> Result<Statement> {
         let name = self.parse_ident()?;
+        // `CREATE TABLE name AS <query>` builds the table from a query instead
+        // of an explicit column list.
+        if self.eat_keyword(Keyword::As) {
+            let query = self.parse_query()?;
+            return Ok(Statement::CreateTableAs {
+                name,
+                query: Box::new(query),
+            });
+        }
         self.expect(&TokenKind::LParen)?;
         let mut columns = Vec::new();
         let mut constraints = Vec::new();
@@ -1631,6 +1649,10 @@ impl Statement {
                 name: name.clone(),
                 query: Box::new(query.substitute_params(params)),
             },
+            Self::CreateTableAs { name, query } => Self::CreateTableAs {
+                name: name.clone(),
+                query: Box::new(query.substitute_params(params)),
+            },
             // DDL and transaction control carry no expressions to bind.
             other => other.clone(),
         }
@@ -1723,6 +1745,16 @@ mod tests {
         round_trip("ALTER TABLE t ADD COLUMN c INT DEFAULT 0");
         round_trip("ALTER TABLE t ADD COLUMN flag BOOL NOT NULL DEFAULT TRUE");
         round_trip("TRUNCATE TABLE t");
+    }
+
+    #[test]
+    fn create_table_as_round_trips() {
+        round_trip("CREATE TABLE big AS SELECT id FROM t WHERE (n > 5)");
+        round_trip("CREATE TABLE c AS SELECT a FROM t UNION SELECT b FROM u");
+        assert!(matches!(
+            parse("CREATE TABLE x AS SELECT id FROM t"),
+            Statement::CreateTableAs { name, .. } if name == "x"
+        ));
     }
 
     #[test]

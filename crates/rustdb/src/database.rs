@@ -499,6 +499,10 @@ impl Database {
             // DDL auto-commits: it persists immediately regardless of any open
             // transaction.
             Statement::CreateTable { .. } => self.create_table(&stmt),
+            Statement::CreateTableAs {
+                ref name,
+                ref query,
+            } => self.create_table_as(name, query),
             Statement::CreateIndex { .. } => {
                 self.catalog.apply(&stmt)?;
                 self.persist()?;
@@ -713,6 +717,96 @@ impl Database {
         }
         self.persist()?;
         Ok(QueryOutcome::Ddl)
+    }
+
+    /// `CREATE TABLE name AS <query>`: run the query, infer a column per result
+    /// column (name from the projection, type from the data), create the table,
+    /// and bulk-load the rows.
+    fn create_table_as(&mut self, name: &str, query: &Statement) -> Result<QueryOutcome> {
+        if self.catalog.get_table(name).is_some() || self.views.contains_key(name) {
+            return Err(DbError::Constraint(format!("table {name} already exists")));
+        }
+        // Run the query under a read snapshot.
+        let txn = self.mgr.begin();
+        let (columns, rows) = self.run_query_collect(&txn, query)?;
+        self.mgr.commit(&txn);
+
+        // Infer a column per result column.
+        let coldefs: Vec<ColumnDef> = columns
+            .iter()
+            .enumerate()
+            .map(|(i, col)| ColumnDef {
+                name: ctas_column_name(col),
+                ty: column_type(&rows, i),
+                primary_key: false,
+                not_null: false,
+                unique: false,
+                default: None,
+                serial: false,
+            })
+            .collect();
+        let schema: Vec<DataType> = coldefs.iter().map(|c| c.ty).collect();
+
+        // Create the (empty) table, then bulk-load the rows. The inferred
+        // columns carry no constraints, so there are no secondary indexes to
+        // maintain.
+        let create = Statement::CreateTable {
+            name: name.to_string(),
+            columns: coldefs,
+            constraints: Vec::new(),
+        };
+        self.create_table(&create)?;
+        let writer = self.mgr.begin();
+        let store = self.tables.get_mut(name).expect("just created");
+        let handle = MvccTable::open(
+            &self.pool,
+            self.wal.clone(),
+            &self.mgr,
+            store.index_root,
+            store.version_page,
+        );
+        let mut rowid: u64 = 0;
+        for values in &rows {
+            handle.insert(&writer, rowid, &encode_row(values, &schema)?)?;
+            rowid += 1;
+        }
+        store.index_root = handle.index_root();
+        store.version_page = handle.version_page();
+        store.next_rowid = rowid;
+        self.mgr.commit(&writer);
+        self.catalog.set_row_count(name, rowid)?;
+        self.persist()?;
+        Ok(QueryOutcome::Mutation {
+            affected: rows.len(),
+        })
+    }
+
+    /// Run a query statement (a `SELECT`, set operation, or `WITH`) under `txn`
+    /// and return its columns and rows. Handles CTE expansion so the same forms
+    /// `run_select` accepts work here too.
+    fn run_query_collect(
+        &self,
+        txn: &Transaction,
+        stmt: &Statement,
+    ) -> Result<(Vec<String>, Vec<Vec<Value>>)> {
+        match expand_ctes(stmt.clone())? {
+            // A recursive WITH is evaluated by the materializing path.
+            with @ Statement::With { .. } => {
+                let Statement::With { ctes, body, .. } = &with else {
+                    unreachable!("matched With");
+                };
+                match self.run_with_ctes(txn, ctes, body)? {
+                    QueryOutcome::Rows { columns, rows } => Ok((columns, rows)),
+                    other => Err(DbError::Unsupported(format!(
+                        "CREATE TABLE AS expected rows, got {other:?}"
+                    ))),
+                }
+            }
+            plain => {
+                let folded = self.fold_query(txn, &plain)?;
+                self.execute_query(txn, &folded)
+            }
+        }
     }
 
     /// Resolve and validate a table's parsed constraints: every check is kept as
@@ -2495,6 +2589,26 @@ fn find_equality(predicate: &Expr, col: &str) -> Option<Value> {
     }
 }
 
+/// The column name a `CREATE TABLE AS` gives a result column: the bare name
+/// (after any qualifier), so `t.id` becomes `id`.
+fn ctas_column_name(col: &str) -> String {
+    col.rsplit('.').next().unwrap_or(col).to_string()
+}
+
+/// Infer a column's type from the first non-NULL value in `rows` at index `i`,
+/// defaulting to `INT` for an all-NULL or empty column.
+fn column_type(rows: &[Vec<Value>], i: usize) -> DataType {
+    rows.iter()
+        .find_map(|r| match r.get(i) {
+            Some(Value::Int(_)) => Some(DataType::Int),
+            Some(Value::Float(_)) => Some(DataType::Float),
+            Some(Value::Text(_)) => Some(DataType::Text),
+            Some(Value::Bool(_)) => Some(DataType::Bool),
+            _ => None,
+        })
+        .unwrap_or(DataType::Int)
+}
+
 /// A table's freshly computed `(column name, statistics)` list.
 type ColumnStatList = Vec<(String, ColumnStats)>;
 
@@ -4245,6 +4359,63 @@ mod tests {
         let err = db.execute("VACUUM t").unwrap_err();
         assert!(matches!(err, DbError::Unsupported(_)), "got {err:?}");
         db.execute("ROLLBACK").unwrap();
+    }
+
+    // --- CREATE TABLE AS SELECT ---
+
+    #[test]
+    fn create_table_as_copies_query_result() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE src (id INT, n INT, label TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO src VALUES (1, 10, 'a'), (2, 20, 'b'), (3, 30, 'c')")
+            .unwrap();
+        let out = db
+            .execute("CREATE TABLE big AS SELECT id, label FROM src WHERE n >= 20")
+            .unwrap();
+        assert_eq!(out, QueryOutcome::Mutation { affected: 2 });
+        // The new table holds the projected, filtered rows.
+        let (cols, rows) = query(&mut db, "SELECT id, label FROM big ORDER BY id");
+        assert_eq!(names(&cols), ["id", "label"]);
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Int(2), Value::Text("b".into())],
+                vec![Value::Int(3), Value::Text("c".into())],
+            ]
+        );
+        // Its columns are typed from the data (id INT, label TEXT).
+        let (_c, types) = query(
+            &mut db,
+            "SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 'big' ORDER BY ordinal_position",
+        );
+        assert_eq!(
+            types,
+            vec![
+                vec![Value::Text("id".into()), Value::Text("integer".into())],
+                vec![Value::Text("label".into()), Value::Text("text".into())],
+            ]
+        );
+    }
+
+    #[test]
+    fn create_table_as_survives_reopen_and_rejects_duplicates() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("test.db");
+        {
+            let mut db = Database::open(&path).expect("open");
+            db.execute("CREATE TABLE src (id INT)").unwrap();
+            db.execute("INSERT INTO src VALUES (7), (8)").unwrap();
+            db.execute("CREATE TABLE copy AS SELECT id FROM src")
+                .unwrap();
+            // A second CREATE of the same name is rejected.
+            assert!(db
+                .execute("CREATE TABLE copy AS SELECT id FROM src")
+                .is_err());
+        }
+        let mut db = Database::open(&path).expect("reopen");
+        let (_c, rows) = query(&mut db, "SELECT id FROM copy ORDER BY id");
+        assert_eq!(rows, vec![vec![Value::Int(7)], vec![Value::Int(8)]]);
     }
 
     // --- subqueries (uncorrelated scalar and IN) ---
