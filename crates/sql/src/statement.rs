@@ -249,15 +249,60 @@ impl fmt::Display for ColumnDef {
     }
 }
 
+/// A single-column foreign-key reference: `column` of this table must match
+/// `parent_column` of `parent_table` (or be NULL).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ForeignKey {
+    /// The referencing column in this table.
+    pub column: String,
+    /// The referenced (parent) table.
+    pub parent_table: String,
+    /// The referenced column in the parent table.
+    pub parent_column: String,
+}
+
+impl fmt::Display for ForeignKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "FOREIGN KEY ({}) REFERENCES {} ({})",
+            self.column, self.parent_table, self.parent_column
+        )
+    }
+}
+
+/// A table-level constraint in a `CREATE TABLE`. Column-level `CHECK` and
+/// `REFERENCES` are normalized into these at parse time, so a table carries a
+/// single uniform list of constraints.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TableConstraint {
+    /// `CHECK (predicate)`: a row is rejected if the predicate is false.
+    Check(Expr),
+    /// `FOREIGN KEY (col) REFERENCES parent (col)`.
+    ForeignKey(ForeignKey),
+}
+
+impl fmt::Display for TableConstraint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Check(e) => write!(f, "CHECK ({e})"),
+            Self::ForeignKey(fk) => write!(f, "{fk}"),
+        }
+    }
+}
+
 /// A parsed SQL statement. Grows as SELECT and DML parsers land.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Statement {
-    /// `CREATE TABLE name (cols...)`.
+    /// `CREATE TABLE name (cols..., constraints...)`.
     CreateTable {
         /// Table name.
         name: String,
         /// Column definitions.
         columns: Vec<ColumnDef>,
+        /// Table-level constraints (`CHECK`, `FOREIGN KEY`), including any
+        /// normalized from column-level `CHECK` / `REFERENCES` clauses.
+        constraints: Vec<TableConstraint>,
     },
     /// `DROP TABLE name`.
     DropTable {
@@ -357,13 +402,20 @@ impl fmt::Display for Statement {
     #[allow(clippy::too_many_lines)]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::CreateTable { name, columns } => {
+            Self::CreateTable {
+                name,
+                columns,
+                constraints,
+            } => {
                 write!(f, "CREATE TABLE {name} (")?;
                 for (i, c) in columns.iter().enumerate() {
                     if i > 0 {
                         f.write_str(", ")?;
                     }
                     write!(f, "{c}")?;
+                }
+                for con in constraints {
+                    write!(f, ", {con}")?;
                 }
                 f.write_str(")")
             }
@@ -492,7 +544,9 @@ impl Parser {
                 let table = self.parse_ident()?;
                 self.expect_keyword(Keyword::Add)?;
                 self.eat_keyword(Keyword::Column); // optional COLUMN keyword
-                let column = self.parse_column_def()?;
+                                                   // Inline constraints on an added column are not yet enforced;
+                                                   // accept the column definition and ignore them.
+                let (column, _inline) = self.parse_column_def()?;
                 Statement::AlterTableAddColumn { table, column }
             }
             TokenKind::Keyword(Keyword::Select) => self.parse_query()?,
@@ -818,8 +872,24 @@ impl Parser {
         let name = self.parse_ident()?;
         self.expect(&TokenKind::LParen)?;
         let mut columns = Vec::new();
+        let mut constraints = Vec::new();
         loop {
-            columns.push(self.parse_column_def()?);
+            // A leading CONSTRAINT name, CHECK, or FOREIGN starts a table-level
+            // constraint; anything else is a column definition (which may carry
+            // its own inline CHECK / REFERENCES, normalized to table level).
+            if self.eat_keyword(Keyword::Constraint) {
+                let _name = self.parse_ident()?; // optional constraint name, ignored
+                constraints.push(self.parse_table_constraint()?);
+            } else if matches!(
+                self.peek(),
+                TokenKind::Keyword(Keyword::Check | Keyword::Foreign)
+            ) {
+                constraints.push(self.parse_table_constraint()?);
+            } else {
+                let (column, inline) = self.parse_column_def()?;
+                columns.push(column);
+                constraints.extend(inline);
+            }
             if !self.eat(&TokenKind::Comma) {
                 break;
             }
@@ -831,10 +901,44 @@ impl Parser {
                 self.span(),
             ));
         }
-        Ok(Statement::CreateTable { name, columns })
+        Ok(Statement::CreateTable {
+            name,
+            columns,
+            constraints,
+        })
     }
 
-    fn parse_column_def(&mut self) -> Result<ColumnDef> {
+    /// Parse a table-level `CHECK (expr)` or `FOREIGN KEY (col) REFERENCES
+    /// parent (col)`.
+    fn parse_table_constraint(&mut self) -> Result<TableConstraint> {
+        if self.eat_keyword(Keyword::Check) {
+            self.expect(&TokenKind::LParen)?;
+            let expr = self.parse_expr()?;
+            self.expect(&TokenKind::RParen)?;
+            Ok(TableConstraint::Check(expr))
+        } else if self.eat_keyword(Keyword::Foreign) {
+            self.expect_keyword(Keyword::Key)?;
+            self.expect(&TokenKind::LParen)?;
+            let column = self.parse_ident()?;
+            self.expect(&TokenKind::RParen)?;
+            Ok(TableConstraint::ForeignKey(self.parse_references(column)?))
+        } else {
+            Err(SqlError::parse(
+                "expected CHECK or FOREIGN KEY",
+                self.span(),
+            ))
+        }
+    }
+
+    /// Parse the `REFERENCES parent (col)` tail, given the referencing column.
+    fn parse_references(&mut self, column: String) -> Result<ForeignKey> {
+        self.expect_keyword(Keyword::References)?;
+        self.parse_references_tail(column)
+    }
+
+    /// Parse a column definition, returning it together with any table-level
+    /// constraints normalized from inline `CHECK` / `REFERENCES` clauses.
+    fn parse_column_def(&mut self) -> Result<(ColumnDef, Vec<TableConstraint>)> {
         let name = self.parse_ident()?;
         let ty = match self.peek() {
             TokenKind::Keyword(Keyword::Int) => {
@@ -866,6 +970,7 @@ impl Parser {
         let mut not_null = false;
         let mut unique = false;
         let mut default = None;
+        let mut inline: Vec<TableConstraint> = Vec::new();
         loop {
             if self.eat_keyword(Keyword::Primary) {
                 self.expect_keyword(Keyword::Key)?;
@@ -877,17 +982,46 @@ impl Parser {
                 unique = true;
             } else if self.eat_keyword(Keyword::Default) {
                 default = Some(self.parse_expr()?);
+            } else if self.eat_keyword(Keyword::Check) {
+                self.expect(&TokenKind::LParen)?;
+                let expr = self.parse_expr()?;
+                self.expect(&TokenKind::RParen)?;
+                inline.push(TableConstraint::Check(expr));
+            } else if self.eat_keyword(Keyword::References) {
+                // Column-level `REFERENCES parent (col)`: the referencing column
+                // is this column. `parse_references` expects to consume the
+                // REFERENCES keyword, so feed it back via a dedicated tail.
+                inline.push(TableConstraint::ForeignKey(
+                    self.parse_references_tail(name.clone())?,
+                ));
             } else {
                 break;
             }
         }
-        Ok(ColumnDef {
-            name,
-            ty,
-            primary_key,
-            not_null,
-            unique,
-            default,
+        Ok((
+            ColumnDef {
+                name,
+                ty,
+                primary_key,
+                not_null,
+                unique,
+                default,
+            },
+            inline,
+        ))
+    }
+
+    /// Parse the `parent (col)` part of a column-level `REFERENCES`, after the
+    /// `REFERENCES` keyword has already been consumed.
+    fn parse_references_tail(&mut self, column: String) -> Result<ForeignKey> {
+        let parent_table = self.parse_ident()?;
+        self.expect(&TokenKind::LParen)?;
+        let parent_column = self.parse_ident()?;
+        self.expect(&TokenKind::RParen)?;
+        Ok(ForeignKey {
+            column,
+            parent_table,
+            parent_column,
         })
     }
 
@@ -1041,6 +1175,16 @@ mod tests {
     }
 
     #[test]
+    fn constraint_round_trips() {
+        // Column-level CHECK / REFERENCES normalize to table constraints, which
+        // is the stable form the printer emits and re-parses to.
+        round_trip("CREATE TABLE t (id INT, n INT CHECK (n > 0))");
+        round_trip("CREATE TABLE t (lo INT, hi INT, CHECK (lo <= hi))");
+        round_trip("CREATE TABLE c (id INT, pid INT REFERENCES p (id))");
+        round_trip("CREATE TABLE c (id INT, pid INT, FOREIGN KEY (pid) REFERENCES p (id))");
+    }
+
+    #[test]
     fn subquery_round_trips() {
         round_trip("SELECT a FROM t WHERE x > (SELECT MAX(y) FROM u)");
         round_trip("SELECT (SELECT COUNT(*) FROM u) FROM t");
@@ -1112,6 +1256,7 @@ mod tests {
                     unique: false,
                     default: None,
                 }],
+                constraints: vec![],
             }
         );
     }
@@ -1119,7 +1264,7 @@ mod tests {
     #[test]
     fn create_table_multi_column_with_pk() {
         let s = round_trip("CREATE TABLE parts (id INT PRIMARY KEY, name TEXT)");
-        let Statement::CreateTable { name, columns } = s else {
+        let Statement::CreateTable { name, columns, .. } = s else {
             panic!("wrong variant");
         };
         assert_eq!(name, "parts");

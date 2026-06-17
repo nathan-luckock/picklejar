@@ -306,6 +306,103 @@ pub fn load_views(path: &Path) -> io::Result<Vec<(String, String)>> {
     Ok(views)
 }
 
+/// A persisted table constraint.
+#[derive(Debug, Clone)]
+pub enum Constraint {
+    /// `CHECK (predicate)` on `table`; `sql` is the predicate's canonical SQL.
+    Check {
+        /// Table the check belongs to.
+        table: String,
+        /// The predicate as single-line SQL.
+        sql: String,
+    },
+    /// A single-column foreign key on `table`.
+    ForeignKey {
+        /// Child table.
+        table: String,
+        /// Referencing column in the child table.
+        column: String,
+        /// Referenced (parent) table.
+        parent_table: String,
+        /// Referenced column in the parent table.
+        parent_column: String,
+    },
+}
+
+/// Persist constraints, one per line.
+///
+/// A check is `<table> C <check sql>`; a foreign key is
+/// `<table> F <column> <parent_table> <parent_column>`. Identifiers are
+/// whitespace-free, and a check's SQL is the rest of its line.
+///
+/// # Errors
+///
+/// Returns an I/O error if the file cannot be written or renamed.
+pub fn save_constraints(path: &Path, constraints: &[Constraint]) -> io::Result<()> {
+    let mut out = String::new();
+    for c in constraints {
+        match c {
+            Constraint::Check { table, sql } => {
+                let _ = writeln!(out, "{table} C {sql}");
+            }
+            Constraint::ForeignKey {
+                table,
+                column,
+                parent_table,
+                parent_column,
+            } => {
+                let _ = writeln!(out, "{table} F {column} {parent_table} {parent_column}");
+            }
+        }
+    }
+    let tmp = path.with_extension("cons.tmp");
+    fs::write(&tmp, out.as_bytes())?;
+    fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// Read constraints. An absent file yields an empty list.
+///
+/// # Errors
+///
+/// Returns an I/O error if the file exists but cannot be read or parsed.
+pub fn load_constraints(path: &Path) -> io::Result<Vec<Constraint>> {
+    let text = match fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let line = line.trim_end();
+        if line.is_empty() {
+            continue;
+        }
+        let (table, rest) = line.split_once(' ').ok_or_else(invalid)?;
+        let (kind, body) = rest.split_once(' ').ok_or_else(invalid)?;
+        match kind {
+            "C" => out.push(Constraint::Check {
+                table: table.to_string(),
+                sql: body.to_string(),
+            }),
+            "F" => {
+                let parts: Vec<&str> = body.split_whitespace().collect();
+                let [column, parent_table, parent_column] = parts[..] else {
+                    return Err(invalid());
+                };
+                out.push(Constraint::ForeignKey {
+                    table: table.to_string(),
+                    column: column.to_string(),
+                    parent_table: parent_table.to_string(),
+                    parent_column: parent_column.to_string(),
+                });
+            }
+            _ => return Err(invalid()),
+        }
+    }
+    Ok(out)
+}
+
 fn invalid() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, "malformed catalog metadata")
 }

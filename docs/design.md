@@ -349,9 +349,11 @@ Every AST node has a `Display` that prints canonical SQL, fully parenthesizing e
 
 ### Supported SQL surface
 
-DDL is `CREATE TABLE` (with `PRIMARY KEY` / `UNIQUE` / `NOT NULL` constraints
-and `DEFAULT <constant>` per column), `CREATE INDEX`, `DROP TABLE`,
-`TRUNCATE TABLE`, `ALTER TABLE ... ADD COLUMN`, and `CREATE VIEW` / `DROP VIEW`.
+DDL is `CREATE TABLE` (with `PRIMARY KEY` / `UNIQUE` / `NOT NULL` / `DEFAULT`
+per column, plus table-level `CHECK (predicate)` and single-column
+`FOREIGN KEY (col) REFERENCES parent (col)`, both also accepted inline on a
+column), `CREATE INDEX`, `DROP TABLE`, `TRUNCATE TABLE`,
+`ALTER TABLE ... ADD COLUMN`, and `CREATE VIEW` / `DROP VIEW`.
 DML is `INSERT` (multi-row, omitted columns take their default), `UPDATE`, and
 `DELETE`. Transaction control is `BEGIN` / `COMMIT` / `ROLLBACK`. `SELECT`
 covers:
@@ -381,6 +383,21 @@ three-valued NULL handling, the predicates `IN` / `BETWEEN` / `LIKE` /
 (`||`), and the scalar functions `LENGTH`, `UPPER`, `LOWER`, `TRIM` / `LTRIM` /
 `RTRIM`, `SUBSTR`, `REPLACE`, `ABS`, `ROUND`, `FLOOR`, `CEIL`, `MOD`, `POWER`,
 `SQRT`, `CONCAT`, `COALESCE`, and `NULLIF`.
+
+**Constraint enforcement.** `NOT NULL` and `UNIQUE` are enforced by the storage
+glue on each write. `CHECK` and `FOREIGN KEY` are enforced by the engine: a
+column-level `CHECK` / `REFERENCES` is normalized to a table constraint at parse
+time, so a table carries one uniform constraint list. On `INSERT` / `UPDATE`,
+each row is built and validated (NOT NULL, then `CHECK`, then foreign-key
+existence) in a pass that precedes any write, so a violation rejects the
+statement cleanly. A `CHECK` rejects a row only when its predicate is definitely
+false (NULL is unknown and passes), matching SQL. A foreign key requires its
+(non-NULL) referencing value to exist in the parent, and is `RESTRICT` on the
+parent side: deleting a referenced row, changing a referenced key, or dropping a
+referenced table is rejected while a child still points at it. Constraints are
+validated when the table is created (the parent table and column must exist) and
+persisted to a `<base>.cons` sidecar, so they survive a reopen. `ON DELETE` /
+`ON UPDATE CASCADE` and multi-column foreign keys are deferred.
 
 ### Scope and deferrals
 

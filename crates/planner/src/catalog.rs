@@ -115,7 +115,7 @@ impl Catalog {
     /// Non-DDL statements are an [`PlanError::Unsupported`] error.
     pub fn apply(&mut self, stmt: &Statement) -> Result<()> {
         match stmt {
-            Statement::CreateTable { name, columns } => self.create_table(name, columns),
+            Statement::CreateTable { name, columns, .. } => self.create_table(name, columns),
             Statement::DropTable { name } => self.drop_table(name),
             Statement::CreateIndex {
                 name,

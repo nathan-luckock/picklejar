@@ -35,7 +35,9 @@ use rustdb_planner::{bind, explain, plan, Catalog, ColumnStats};
 
 use crate::correlated;
 use crate::correlated::{CorrelatedRunner, MaterializedSource};
-use rustdb_sql::statement::{ColumnDef, DataType, Join, OrderItem, Select, SelectItem, TableRef};
+use rustdb_sql::statement::{
+    ColumnDef, DataType, Join, OrderItem, Select, SelectItem, TableConstraint, TableRef,
+};
 use rustdb_sql::{BinOp, Expr, Parser, Statement, UnOp, Value};
 use rustdb_storage::{BufferPool, FileManager, PageId};
 use rustdb_txn::{MvccTable, Transaction, TransactionManager};
@@ -99,6 +101,27 @@ pub enum QueryOutcome {
     Message(&'static str),
 }
 
+/// A single-column foreign key on a table, resolved for enforcement.
+#[derive(Debug, Clone)]
+struct ForeignKeyMeta {
+    /// The referencing column in this (child) table.
+    column: String,
+    /// The referenced (parent) table.
+    parent_table: String,
+    /// The referenced column in the parent table.
+    parent_column: String,
+}
+
+/// The constraints attached to one table, beyond the per-column NOT NULL /
+/// UNIQUE handled by the storage layer.
+#[derive(Debug, Clone, Default)]
+struct TableConstraints {
+    /// `CHECK` predicates, rejected when a row makes one false.
+    checks: Vec<Expr>,
+    /// Foreign keys this table declares (it is the child).
+    foreign_keys: Vec<ForeignKeyMeta>,
+}
+
 /// An embedded rustdb instance.
 pub struct Database {
     pool: BufferPool,
@@ -109,6 +132,8 @@ pub struct Database {
     /// Stored views by name: the defining query, normalized. A view reference
     /// in a FROM/JOIN clause is expanded to this query as a derived table.
     views: HashMap<String, Statement>,
+    /// Per-table `CHECK` and `FOREIGN KEY` constraints, enforced on writes.
+    constraints: HashMap<String, TableConstraints>,
     /// The open explicit transaction, if the session ran `BEGIN`. In
     /// auto-commit mode (no explicit transaction) this is `None` and each
     /// statement runs in its own transaction.
@@ -120,6 +145,8 @@ pub struct Database {
     txn_path: PathBuf,
     /// Sidecar file recording the views as `(name, sql)` pairs.
     view_path: PathBuf,
+    /// Sidecar file recording the `CHECK` and `FOREIGN KEY` constraints.
+    cons_path: PathBuf,
 }
 
 impl std::fmt::Debug for Database {
@@ -144,6 +171,7 @@ impl Database {
         let meta_path = base.with_extension("meta");
         let txn_path = base.with_extension("txn");
         let view_path = base.with_extension("view");
+        let cons_path = base.with_extension("cons");
         let writer = WalWriter::open(&wal_path)?;
         let wal = WalSyncHandle::new(writer);
         let file = FileManager::open(base)?;
@@ -155,13 +183,16 @@ impl Database {
             catalog: Catalog::new(),
             tables: HashMap::new(),
             views: HashMap::new(),
+            constraints: HashMap::new(),
             current_txn: None,
             meta_path,
             txn_path,
             view_path,
+            cons_path,
         };
         db.load_catalog()?;
         db.load_views()?;
+        db.load_constraints()?;
         // Restore the transaction watermark so data committed in a previous
         // session stays visible (its xids would otherwise read as aborted).
         let (next_xid, aborted) = persist::load_txn(&db.txn_path)?;
@@ -192,6 +223,7 @@ impl Database {
             self.catalog.apply(&Statement::CreateTable {
                 name: r.name.clone(),
                 columns,
+                constraints: vec![],
             })?;
             for (index, column) in &r.indexes {
                 self.catalog.apply(&Statement::CreateIndex {
@@ -260,6 +292,62 @@ impl Database {
             .collect();
         views.sort();
         persist::save_views(&self.view_path, &views)?;
+        Ok(())
+    }
+
+    /// Rebuild the constraint registry from its sidecar, re-parsing each check
+    /// predicate. A malformed entry is skipped rather than failing the open.
+    fn load_constraints(&mut self) -> Result<()> {
+        for c in persist::load_constraints(&self.cons_path)? {
+            match c {
+                persist::Constraint::Check { table, sql } => {
+                    if let Ok(expr) = Parser::from_sql(&sql).and_then(|mut p| p.parse_expr()) {
+                        self.constraints.entry(table).or_default().checks.push(expr);
+                    }
+                }
+                persist::Constraint::ForeignKey {
+                    table,
+                    column,
+                    parent_table,
+                    parent_column,
+                } => self
+                    .constraints
+                    .entry(table)
+                    .or_default()
+                    .foreign_keys
+                    .push(ForeignKeyMeta {
+                        column,
+                        parent_table,
+                        parent_column,
+                    }),
+            }
+        }
+        Ok(())
+    }
+
+    /// Write the constraint registry to its sidecar.
+    fn save_constraints(&self) -> Result<()> {
+        let mut records = Vec::new();
+        let mut tables: Vec<&String> = self.constraints.keys().collect();
+        tables.sort();
+        for table in tables {
+            let tc = &self.constraints[table];
+            for check in &tc.checks {
+                records.push(persist::Constraint::Check {
+                    table: table.clone(),
+                    sql: check.to_string(),
+                });
+            }
+            for fk in &tc.foreign_keys {
+                records.push(persist::Constraint::ForeignKey {
+                    table: table.clone(),
+                    column: fk.column.clone(),
+                    parent_table: fk.parent_table.clone(),
+                    parent_column: fk.parent_column.clone(),
+                });
+            }
+        }
+        persist::save_constraints(&self.cons_path, &records)?;
         Ok(())
     }
 
@@ -477,9 +565,17 @@ impl Database {
     // --- statement handlers ---
 
     fn create_table(&mut self, stmt: &Statement) -> Result<QueryOutcome> {
-        let Statement::CreateTable { name, columns } = stmt else {
+        let Statement::CreateTable {
+            name,
+            columns,
+            constraints,
+        } = stmt
+        else {
             unreachable!("guarded by execute");
         };
+        // Validate and resolve the table-level constraints before creating
+        // anything, so a bad reference rejects the whole statement.
+        let table_constraints = self.build_constraints(name, columns, constraints)?;
         // The catalog rejects a duplicate table, keeping it the single source
         // of truth for which tables exist.
         self.catalog.apply(stmt)?;
@@ -521,8 +617,54 @@ impl Database {
             defaults,
         };
         self.tables.insert(name.clone(), store);
+        if !table_constraints.checks.is_empty() || !table_constraints.foreign_keys.is_empty() {
+            self.constraints.insert(name.clone(), table_constraints);
+            self.save_constraints()?;
+        }
         self.persist()?;
         Ok(QueryOutcome::Ddl)
+    }
+
+    /// Resolve and validate a table's parsed constraints: every check is kept as
+    /// a predicate; every foreign key must name a column of this table and an
+    /// existing parent table and column.
+    fn build_constraints(
+        &self,
+        table: &str,
+        columns: &[ColumnDef],
+        parsed: &[TableConstraint],
+    ) -> Result<TableConstraints> {
+        let mut out = TableConstraints::default();
+        let has_col = |c: &str| columns.iter().any(|col| col.name == c);
+        for con in parsed {
+            match con {
+                TableConstraint::Check(expr) => out.checks.push(expr.clone()),
+                TableConstraint::ForeignKey(fk) => {
+                    if !has_col(&fk.column) {
+                        return Err(DbError::UnknownColumn {
+                            table: table.to_string(),
+                            column: fk.column.clone(),
+                        });
+                    }
+                    let parent = self
+                        .catalog
+                        .get_table(&fk.parent_table)
+                        .ok_or_else(|| DbError::UnknownTable(fk.parent_table.clone()))?;
+                    if !parent.columns.iter().any(|c| c.name == fk.parent_column) {
+                        return Err(DbError::UnknownColumn {
+                            table: fk.parent_table.clone(),
+                            column: fk.parent_column.clone(),
+                        });
+                    }
+                    out.foreign_keys.push(ForeignKeyMeta {
+                        column: fk.column.clone(),
+                        parent_table: fk.parent_table.clone(),
+                        parent_column: fk.parent_column.clone(),
+                    });
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Remove every row of `table` by replacing its storage with fresh, empty
@@ -660,10 +802,184 @@ impl Database {
     }
 
     fn drop_table(&mut self, stmt: &Statement, name: &str) -> Result<QueryOutcome> {
+        // Reject the drop if another table still has a foreign key into this one
+        // (RESTRICT). The table's own constraints are dropped with it.
+        if let Some(child) = self.referencing_table(name) {
+            return Err(DbError::Constraint(format!(
+                "cannot drop table {name}: it is referenced by a foreign key on {child}"
+            )));
+        }
         self.catalog.apply(stmt)?;
         self.tables.remove(name);
+        if self.constraints.remove(name).is_some() {
+            self.save_constraints()?;
+        }
         self.persist()?;
         Ok(QueryOutcome::Ddl)
+    }
+
+    /// The name of some other table holding a foreign key into `parent`, if any.
+    fn referencing_table(&self, parent: &str) -> Option<String> {
+        self.constraints.iter().find_map(|(child, tc)| {
+            (child != parent && tc.foreign_keys.iter().any(|fk| fk.parent_table == parent))
+                .then(|| child.clone())
+        })
+    }
+
+    /// Reject `row` if it makes any of `table`'s `CHECK` predicates false.
+    /// `columns` are the table's column names, aligned with `row`. A predicate
+    /// that is NULL (unknown) passes, matching SQL `CHECK` semantics.
+    fn enforce_checks(&self, table: &str, columns: &[String], row: &[Value]) -> Result<()> {
+        let Some(tc) = self.constraints.get(table) else {
+            return Ok(());
+        };
+        for check in &tc.checks {
+            if matches!(eval(check, row, columns)?, Value::Bool(false)) {
+                return Err(DbError::Constraint(format!(
+                    "new row for {table} violates CHECK ({check})"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Reject `row` if a foreign-key column points at a parent row that does not
+    /// exist. A NULL referencing value is allowed (it references nothing).
+    fn enforce_fk_child(
+        &self,
+        txn: &Transaction,
+        table: &str,
+        columns: &[String],
+        row: &[Value],
+    ) -> Result<()> {
+        let Some(tc) = self.constraints.get(table) else {
+            return Ok(());
+        };
+        for fk in &tc.foreign_keys {
+            let Some(idx) = columns.iter().position(|c| c == &fk.column) else {
+                continue;
+            };
+            let value = &row[idx];
+            if matches!(value, Value::Null) {
+                continue;
+            }
+            if !self.column_has_value(txn, &fk.parent_table, &fk.parent_column, value)? {
+                return Err(DbError::Constraint(format!(
+                    "foreign key violation: {table}.{} references a missing {}.{}",
+                    fk.column, fk.parent_table, fk.parent_column
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Reject the change to a parent `row` if a child still references the value
+    /// being removed (foreign-key `RESTRICT`). Used on `DELETE`, and on `UPDATE`
+    /// when a referenced column changes.
+    fn enforce_fk_restrict(
+        &self,
+        txn: &Transaction,
+        parent_table: &str,
+        parent_columns: &[String],
+        parent_row: &[Value],
+    ) -> Result<()> {
+        for (child_table, tc) in &self.constraints {
+            for fk in &tc.foreign_keys {
+                if fk.parent_table != parent_table {
+                    continue;
+                }
+                let Some(pidx) = parent_columns.iter().position(|c| c == &fk.parent_column) else {
+                    continue;
+                };
+                let value = &parent_row[pidx];
+                if matches!(value, Value::Null) {
+                    continue;
+                }
+                if self.column_has_value(txn, child_table, &fk.column, value)? {
+                    return Err(DbError::Constraint(format!(
+                        "foreign key violation: {child_table}.{} still references {parent_table}.{}",
+                        fk.column, fk.parent_column
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Reject an `UPDATE` of a parent `table` that changes a referenced column
+    /// to a new value while a child still references the old one (`RESTRICT`).
+    fn enforce_fk_parent_update(
+        &self,
+        txn: &Transaction,
+        table: &str,
+        columns: &[String],
+        old_row: &[Value],
+        new_row: &[Value],
+    ) -> Result<()> {
+        for (child_table, tc) in &self.constraints {
+            for fk in &tc.foreign_keys {
+                if fk.parent_table != table {
+                    continue;
+                }
+                let Some(pidx) = columns.iter().position(|c| c == &fk.parent_column) else {
+                    continue;
+                };
+                let old = &old_row[pidx];
+                // Only a real change to the referenced value can orphan a child.
+                if old == &new_row[pidx] || matches!(old, Value::Null) {
+                    continue;
+                }
+                if self.column_has_value(txn, child_table, &fk.column, old)? {
+                    return Err(DbError::Constraint(format!(
+                        "foreign key violation: changing {table}.{} would orphan {child_table}.{}",
+                        fk.parent_column, fk.column
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether any visible row of `table` has `column` equal to `value`.
+    fn column_has_value(
+        &self,
+        txn: &Transaction,
+        table: &str,
+        column: &str,
+        value: &Value,
+    ) -> Result<bool> {
+        let (idx, schema) = {
+            let meta = self
+                .catalog
+                .get_table(table)
+                .ok_or_else(|| DbError::UnknownTable(table.to_string()))?;
+            let idx = meta
+                .column_index(column)
+                .ok_or_else(|| DbError::UnknownColumn {
+                    table: table.to_string(),
+                    column: column.to_string(),
+                })?;
+            let schema: Vec<DataType> = meta.columns.iter().map(|c| c.ty).collect();
+            (idx, schema)
+        };
+        let store = self
+            .tables
+            .get(table)
+            .ok_or_else(|| DbError::UnknownTable(table.to_string()))?;
+        let handle = MvccTable::open(
+            &self.pool,
+            self.wal.clone(),
+            &self.mgr,
+            store.index_root,
+            store.version_page,
+        );
+        for (_key, bytes) in handle.scan(txn)? {
+            let row = decode_row(&bytes, &schema)?;
+            if row.get(idx).is_some_and(|v| v == value) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Register a view: store its defining query under `name`.
@@ -739,6 +1055,47 @@ impl Database {
             (schema, positions, col_meta)
         };
 
+        // Snapshot the per-column defaults and names for the validation pass.
+        let defaults: Vec<Option<Value>> = self
+            .tables
+            .get(table)
+            .ok_or_else(|| DbError::UnknownTable(table.to_string()))?
+            .defaults
+            .clone();
+        let column_names: Vec<String> = col_meta.iter().map(|(n, _, _)| n.clone()).collect();
+
+        // Pass 1: build each row and validate it (NOT NULL, CHECK, FOREIGN KEY)
+        // before touching storage, so a violation rejects the statement before
+        // any write. This also keeps the per-row checks (which read other tables
+        // through `&self`) clear of the mutable table borrow taken below.
+        let mut built: Vec<Vec<Value>> = Vec::with_capacity(rows.len());
+        for row in rows {
+            if row.len() != positions.len() {
+                return Err(DbError::ValueCount {
+                    expected: positions.len(),
+                    got: row.len(),
+                });
+            }
+            // Build a full row: each column starts at its DEFAULT (NULL when it
+            // has none), then the named columns are overwritten.
+            let mut values: Vec<Value> = (0..schema.len())
+                .map(|i| defaults.get(i).cloned().flatten().unwrap_or(Value::Null))
+                .collect();
+            for (expr, &pos) in row.iter().zip(&positions) {
+                values[pos] = const_eval(expr)?;
+            }
+            // NOT NULL.
+            for (i, (name, not_null, _)) in col_meta.iter().enumerate() {
+                if *not_null && matches!(values[i], Value::Null) {
+                    return Err(DbError::Constraint(format!("column {name} cannot be NULL")));
+                }
+            }
+            self.enforce_checks(table, &column_names, &values)?;
+            self.enforce_fk_child(txn, table, &column_names, &values)?;
+            built.push(values);
+        }
+
+        // Pass 2: enforce UNIQUE and write the validated rows.
         let store = self
             .tables
             .get_mut(table)
@@ -771,34 +1128,7 @@ impl Database {
         }
 
         let mut affected = 0;
-        for row in rows {
-            if row.len() != positions.len() {
-                return Err(DbError::ValueCount {
-                    expected: positions.len(),
-                    got: row.len(),
-                });
-            }
-            // Build a full row: each column starts at its DEFAULT (NULL when it
-            // has none), then the named columns are overwritten.
-            let mut values: Vec<Value> = (0..schema.len())
-                .map(|i| {
-                    store
-                        .defaults
-                        .get(i)
-                        .cloned()
-                        .flatten()
-                        .unwrap_or(Value::Null)
-                })
-                .collect();
-            for (expr, &pos) in row.iter().zip(&positions) {
-                values[pos] = const_eval(expr)?;
-            }
-            // NOT NULL.
-            for (i, (name, not_null, _)) in col_meta.iter().enumerate() {
-                if *not_null && matches!(values[i], Value::Null) {
-                    return Err(DbError::Constraint(format!("column {name} cannot be NULL")));
-                }
-            }
+        for values in built {
             // UNIQUE (NULLs do not conflict).
             for (slot, &col) in unique_cols.iter().enumerate() {
                 if !matches!(values[col], Value::Null) {
@@ -1169,19 +1499,26 @@ impl Database {
             (schema, columns, targets, not_null)
         };
 
-        let store = self
-            .tables
-            .get_mut(table)
-            .ok_or_else(|| DbError::UnknownTable(table.to_string()))?;
-        let handle = MvccTable::open(
+        // Read anchors immutably for the validation scan (constraint checks
+        // read other tables through `&self`).
+        let (index_root, version_page) = {
+            let s = self
+                .tables
+                .get(table)
+                .ok_or_else(|| DbError::UnknownTable(table.to_string()))?;
+            (s.index_root, s.version_page)
+        };
+        let read = MvccTable::open(
             &self.pool,
             self.wal.clone(),
             &self.mgr,
-            store.index_root,
-            store.version_page,
+            index_root,
+            version_page,
         );
-        let mut affected = 0;
-        for (key, bytes) in handle.scan(txn)? {
+
+        // Pass 1: find matching rows and validate the new versions.
+        let mut updates: Vec<(u64, Vec<Value>)> = Vec::new();
+        for (key, bytes) in read.scan(txn)? {
             let row = decode_row(&bytes, &schema)?;
             if let Some(pred) = where_clause {
                 if !is_truthy(&eval(pred, &row, &columns)?) {
@@ -1202,6 +1539,26 @@ impl Database {
                     )));
                 }
             }
+            self.enforce_checks(table, &columns, &new_row)?;
+            self.enforce_fk_child(txn, table, &columns, &new_row)?;
+            self.enforce_fk_parent_update(txn, table, &columns, &row, &new_row)?;
+            updates.push((key, new_row));
+        }
+
+        // Pass 2: apply the validated updates.
+        let store = self
+            .tables
+            .get_mut(table)
+            .ok_or_else(|| DbError::UnknownTable(table.to_string()))?;
+        let handle = MvccTable::open(
+            &self.pool,
+            self.wal.clone(),
+            &self.mgr,
+            store.index_root,
+            store.version_page,
+        );
+        let mut affected = 0;
+        for (key, new_row) in updates {
             handle.update(txn, key, &encode_row(&new_row, &schema)?)?;
             // Point each indexed column's key at this rowid's new value. Old
             // values are left in the tree (upsert only, never delete) and are
@@ -1234,6 +1591,37 @@ impl Database {
             (schema, columns)
         };
 
+        // Read anchors immutably for the validation scan.
+        let (index_root, version_page) = {
+            let s = self
+                .tables
+                .get(table)
+                .ok_or_else(|| DbError::UnknownTable(table.to_string()))?;
+            (s.index_root, s.version_page)
+        };
+        let read = MvccTable::open(
+            &self.pool,
+            self.wal.clone(),
+            &self.mgr,
+            index_root,
+            version_page,
+        );
+
+        // Pass 1: find matching rows; reject any deletion a child still
+        // references (foreign-key RESTRICT).
+        let mut keys: Vec<u64> = Vec::new();
+        for (key, bytes) in read.scan(txn)? {
+            let row = decode_row(&bytes, &schema)?;
+            if let Some(pred) = where_clause {
+                if !is_truthy(&eval(pred, &row, &columns)?) {
+                    continue;
+                }
+            }
+            self.enforce_fk_restrict(txn, table, &columns, &row)?;
+            keys.push(key);
+        }
+
+        // Pass 2: delete.
         let store = self
             .tables
             .get_mut(table)
@@ -1246,13 +1634,7 @@ impl Database {
             store.version_page,
         );
         let mut affected = 0;
-        for (key, bytes) in handle.scan(txn)? {
-            if let Some(pred) = where_clause {
-                let row = decode_row(&bytes, &schema)?;
-                if !is_truthy(&eval(pred, &row, &columns)?) {
-                    continue;
-                }
-            }
+        for key in keys {
             handle.delete(txn, key)?;
             affected += 1;
         }
@@ -2887,6 +3269,106 @@ mod tests {
                 vec![Value::Int(2), Value::Int(5)],
             ]
         );
+    }
+
+    // --- CHECK constraints ---
+
+    #[test]
+    fn check_rejects_violating_insert_and_update() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE t (id INT, n INT CHECK (n > 0))")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 5)").unwrap();
+        // A violating insert is rejected; the boundary (0) too.
+        assert!(db.execute("INSERT INTO t VALUES (2, -1)").is_err());
+        assert!(db.execute("INSERT INTO t VALUES (3, 0)").is_err());
+        // NULL makes the predicate unknown, which passes (SQL CHECK semantics).
+        db.execute("INSERT INTO t VALUES (4, NULL)").unwrap();
+        // A violating update is rejected and the row is left intact.
+        assert!(db.execute("UPDATE t SET n = -9 WHERE id = 1").is_err());
+        let (_c, rows) = query(&mut db, "SELECT n FROM t WHERE id = 1");
+        assert_eq!(rows, vec![vec![Value::Int(5)]]);
+    }
+
+    #[test]
+    fn check_table_level_spans_columns() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE t (lo INT, hi INT, CHECK (lo <= hi))")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 5)").unwrap();
+        assert!(db.execute("INSERT INTO t VALUES (9, 2)").is_err());
+    }
+
+    // --- FOREIGN KEY constraints ---
+
+    fn seed_fk(db: &mut Database) {
+        db.execute("CREATE TABLE p (id INT PRIMARY KEY, name TEXT)")
+            .unwrap();
+        db.execute("CREATE TABLE c (id INT, pid INT REFERENCES p (id))")
+            .unwrap();
+        db.execute("INSERT INTO p VALUES (1, 'a'), (2, 'b')")
+            .unwrap();
+    }
+
+    #[test]
+    fn fk_insert_requires_existing_parent() {
+        let (_d, mut db) = db();
+        seed_fk(&mut db);
+        db.execute("INSERT INTO c VALUES (10, 1)").unwrap();
+        // A child pointing at a non-existent parent is rejected.
+        assert!(db.execute("INSERT INTO c VALUES (11, 99)").is_err());
+        // A NULL reference is allowed.
+        db.execute("INSERT INTO c VALUES (12, NULL)").unwrap();
+        // Updating a child to a bad parent is rejected too.
+        assert!(db.execute("UPDATE c SET pid = 77 WHERE id = 10").is_err());
+    }
+
+    #[test]
+    fn fk_restrict_blocks_parent_delete_and_key_update() {
+        let (_d, mut db) = db();
+        seed_fk(&mut db);
+        db.execute("INSERT INTO c VALUES (10, 1)").unwrap();
+        // The referenced parent cannot be deleted or have its key changed.
+        assert!(db.execute("DELETE FROM p WHERE id = 1").is_err());
+        assert!(db.execute("UPDATE p SET id = 5 WHERE id = 1").is_err());
+        // An unreferenced parent can be deleted.
+        db.execute("DELETE FROM p WHERE id = 2").unwrap();
+        let (_c, rows) = query(&mut db, "SELECT id FROM p ORDER BY id");
+        assert_eq!(rows, vec![vec![Value::Int(1)]]);
+    }
+
+    #[test]
+    fn fk_create_validates_parent_and_blocks_drop() {
+        let (_d, mut db) = db();
+        seed_fk(&mut db);
+        db.execute("INSERT INTO c VALUES (10, 1)").unwrap();
+        // A foreign key to a missing table is rejected at creation.
+        assert!(db
+            .execute("CREATE TABLE bad (x INT, FOREIGN KEY (x) REFERENCES ghost (id))")
+            .is_err());
+        // A referenced table cannot be dropped while a child points at it.
+        assert!(db.execute("DROP TABLE p").is_err());
+    }
+
+    #[test]
+    fn fk_and_check_survive_reopen() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cons.db");
+        {
+            let mut db = Database::open(&path).expect("open");
+            db.execute("CREATE TABLE p (id INT PRIMARY KEY)").unwrap();
+            db.execute("CREATE TABLE c (id INT, pid INT REFERENCES p (id), q INT CHECK (q >= 0))")
+                .unwrap();
+            db.execute("INSERT INTO p VALUES (1)").unwrap();
+            db.execute("INSERT INTO c VALUES (1, 1, 5)").unwrap();
+        }
+        let mut db = Database::open(&path).expect("reopen");
+        // Both constraints are still enforced after reopen.
+        assert!(db.execute("INSERT INTO c VALUES (2, 99, 5)").is_err());
+        assert!(db.execute("INSERT INTO c VALUES (3, 1, -1)").is_err());
+        assert!(db.execute("DROP TABLE p").is_err());
+        // A valid row still inserts.
+        db.execute("INSERT INTO c VALUES (4, 1, 0)").unwrap();
     }
 
     // --- TRUNCATE ---
