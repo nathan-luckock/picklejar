@@ -440,6 +440,12 @@ pub enum Statement {
         /// Target table, or `None` for all tables.
         table: Option<String>,
     },
+    /// `VACUUM [table]`: compact a table, reclaiming dead row versions and index
+    /// bloat. `None` vacuums every table.
+    Vacuum {
+        /// Target table, or `None` for all tables.
+        table: Option<String>,
+    },
     /// `ALTER TABLE t ADD COLUMN c TYPE ...`: append a column.
     AlterTableAddColumn {
         /// Target table.
@@ -697,6 +703,10 @@ impl fmt::Display for Statement {
                 Some(t) => write!(f, "ANALYZE {t}"),
                 None => f.write_str("ANALYZE"),
             },
+            Self::Vacuum { table } => match table {
+                Some(t) => write!(f, "VACUUM {t}"),
+                None => f.write_str("VACUUM"),
+            },
             Self::AlterTableAddColumn { table, column } => {
                 write!(f, "ALTER TABLE {table} ADD COLUMN {column}")
             }
@@ -777,6 +787,15 @@ impl Parser {
                     None
                 };
                 Statement::Analyze { table }
+            }
+            TokenKind::Keyword(Keyword::Vacuum) => {
+                self.advance();
+                let table = if matches!(self.peek(), TokenKind::Ident(_)) {
+                    Some(self.parse_ident()?)
+                } else {
+                    None
+                };
+                Statement::Vacuum { table }
             }
             TokenKind::Keyword(Keyword::Alter) => {
                 self.advance();
@@ -1718,6 +1737,17 @@ mod tests {
             parse("ANALYZE"),
             Statement::Analyze { table: None }
         ));
+    }
+
+    #[test]
+    fn vacuum_round_trips() {
+        round_trip("VACUUM t");
+        round_trip("VACUUM");
+        assert!(matches!(
+            parse("VACUUM orders"),
+            Statement::Vacuum { table: Some(t) } if t == "orders"
+        ));
+        assert!(matches!(parse("VACUUM"), Statement::Vacuum { table: None }));
     }
 
     #[test]

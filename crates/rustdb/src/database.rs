@@ -512,6 +512,7 @@ impl Database {
             Statement::DropView { ref name } => self.drop_view(name),
             Statement::Truncate { ref table } => self.truncate_table(table),
             Statement::Analyze { ref table } => self.run_analyze(table.as_deref()),
+            Statement::Vacuum { ref table } => self.run_vacuum(table.as_deref()),
             Statement::AlterTableAddColumn {
                 ref table,
                 ref column,
@@ -831,6 +832,112 @@ impl Database {
             }
         }
         Ok(QueryOutcome::Message("ANALYZE"))
+    }
+
+    /// `VACUUM`: compact one table or all of them, reclaiming the space held by
+    /// dead row versions and stale secondary-index entries.
+    ///
+    /// Because the engine is single-threaded, a vacuum runs with no other live
+    /// snapshot, so it is safe to keep only each row's currently visible version
+    /// and discard the rest. It rewrites the table's live rows into a fresh MVCC
+    /// store with rebuilt indexes (a compacting, `VACUUM FULL`-style rewrite),
+    /// which is why it is refused inside an open transaction whose older
+    /// snapshot the rewrite would invalidate.
+    fn run_vacuum(&mut self, table: Option<&str>) -> Result<QueryOutcome> {
+        if self.current_txn.is_some() {
+            return Err(DbError::Unsupported(
+                "VACUUM cannot run inside a transaction block".into(),
+            ));
+        }
+        let targets: Vec<String> = if let Some(t) = table {
+            if !self.tables.contains_key(t) {
+                return Err(DbError::UnknownTable(t.to_string()));
+            }
+            vec![t.to_string()]
+        } else {
+            let mut all: Vec<String> = self.tables.keys().cloned().collect();
+            all.sort();
+            all
+        };
+        for name in &targets {
+            self.vacuum_table(name)?;
+        }
+        self.persist()?;
+        Ok(QueryOutcome::Message("VACUUM"))
+    }
+
+    /// Rewrite `name`'s currently visible rows into a fresh MVCC store and fresh
+    /// secondary indexes, then swap the new storage in. Dead versions and stale
+    /// index entries are simply left behind in the old (now unreferenced) pages.
+    fn vacuum_table(&mut self, name: &str) -> Result<()> {
+        let schema: Vec<DataType> = self
+            .catalog
+            .get_table(name)
+            .ok_or_else(|| DbError::UnknownTable(name.to_string()))?
+            .columns
+            .iter()
+            .map(|c| c.ty)
+            .collect();
+
+        // 1. Read the live rows under a fresh snapshot (latest committed values).
+        let reader = self.mgr.begin();
+        let (rows, sec_cols) = {
+            let store = self
+                .tables
+                .get(name)
+                .ok_or_else(|| DbError::UnknownTable(name.to_string()))?;
+            let handle = MvccTable::open(
+                &self.pool,
+                self.wal.clone(),
+                &self.mgr,
+                store.index_root,
+                store.version_page,
+            );
+            let rows: Vec<Vec<Value>> = handle
+                .scan(&reader)?
+                .into_iter()
+                .map(|(_k, bytes)| decode_row(&bytes, &schema))
+                .collect::<std::result::Result<_, _>>()?;
+            let sec_cols: Vec<usize> = store.secondary.iter().map(|s| s.column).collect();
+            (rows, sec_cols)
+        };
+        self.mgr.commit(&reader);
+
+        // 2. Fresh storage plus a fresh secondary index per previously indexed
+        //    column.
+        let new_table = MvccTable::create(&self.pool, self.wal.clone(), &self.mgr)?;
+        let mut secondary: Vec<SecondaryIndex> = Vec::with_capacity(sec_cols.len());
+        for column in sec_cols {
+            secondary.push(SecondaryIndex {
+                column,
+                root: Index::create(&self.pool)?.root(),
+            });
+        }
+
+        // 3. Re-insert each live row, rebuilding the indexes as we go.
+        let writer = self.mgr.begin();
+        let mut rowid: u64 = 0;
+        for values in rows {
+            new_table.insert(&writer, rowid, &encode_row(&values, &schema)?)?;
+            for sec in &mut secondary {
+                let index = Index::open(&self.pool, sec.root);
+                index.put(&values[sec.column], rowid)?;
+                sec.root = index.root();
+            }
+            rowid += 1;
+        }
+        self.mgr.commit(&writer);
+
+        // 4. Swap in the compacted storage.
+        let index_root = new_table.index_root();
+        let version_page = new_table.version_page();
+        let store = self.tables.get_mut(name).expect("present");
+        store.index_root = index_root;
+        store.version_page = version_page;
+        store.next_rowid = rowid;
+        store.secondary = secondary;
+        self.catalog.set_row_count(name, rowid)?;
+        Ok(())
     }
 
     /// Append a column to a table, rewriting every existing row into fresh
@@ -4065,6 +4172,79 @@ mod tests {
             other => panic!("expected explain, got {other:?}"),
         };
         assert!(!bare.contains("Execution:"), "plan was:\n{bare}");
+    }
+
+    // --- VACUUM ---
+
+    #[test]
+    fn vacuum_keeps_visible_rows_and_rewrites_storage() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, n INT)")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)")
+            .unwrap();
+        db.execute("UPDATE t SET n = 99 WHERE id = 2").unwrap(); // a dead version
+        db.execute("DELETE FROM t WHERE id = 3").unwrap(); // a tombstone
+        let before = db.tables.get("t").unwrap().version_page;
+        assert_eq!(
+            db.execute("VACUUM t").unwrap(),
+            QueryOutcome::Message("VACUUM")
+        );
+        let after = db.tables.get("t").unwrap().version_page;
+        assert_ne!(before, after, "VACUUM rewrites into fresh storage");
+        // The live data is exactly the current visible rows.
+        let (_c, rows) = query(&mut db, "SELECT id, n FROM t ORDER BY id");
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Int(1), Value::Int(10)],
+                vec![Value::Int(2), Value::Int(99)],
+            ]
+        );
+    }
+
+    #[test]
+    fn vacuum_rebuilds_a_usable_index() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, n INT)")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 10), (2, 20)").unwrap();
+        db.execute("VACUUM t").unwrap();
+        // A point lookup on the rebuilt primary index still finds the row.
+        let (_c, rows) = query(&mut db, "SELECT n FROM t WHERE id = 2");
+        assert_eq!(rows, vec![vec![Value::Int(20)]]);
+    }
+
+    #[test]
+    fn vacuum_survives_reopen() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("test.db");
+        {
+            let mut db = Database::open(&path).expect("open");
+            db.execute("CREATE TABLE t (id INT, n INT)").unwrap();
+            db.execute("INSERT INTO t VALUES (1, 1), (2, 2)").unwrap();
+            db.execute("UPDATE t SET n = 5 WHERE id = 1").unwrap();
+            db.execute("VACUUM").unwrap();
+        }
+        let mut db = Database::open(&path).expect("reopen");
+        let (_c, rows) = query(&mut db, "SELECT id, n FROM t ORDER BY id");
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Int(1), Value::Int(5)],
+                vec![Value::Int(2), Value::Int(2)],
+            ]
+        );
+    }
+
+    #[test]
+    fn vacuum_inside_transaction_is_rejected() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE t (id INT)").unwrap();
+        db.execute("BEGIN").unwrap();
+        let err = db.execute("VACUUM t").unwrap_err();
+        assert!(matches!(err, DbError::Unsupported(_)), "got {err:?}");
+        db.execute("ROLLBACK").unwrap();
     }
 
     // --- subqueries (uncorrelated scalar and IN) ---

@@ -47,6 +47,11 @@ The complete engine and SQL surface. For the *why* behind each decision, see
   statistics (distinct count and integer min/max) so the cost model estimates
   selectivity from data instead of defaults; a range bound now uses the
   column's observed `[min, max]` span.
+- **`VACUUM [table]`** — compact a table by rewriting only its currently
+  visible rows into fresh MVCC storage with rebuilt indexes, reclaiming the
+  space held by dead row versions (from updates and deletes) and stale index
+  entries. Refused inside a transaction block, since the rewrite would
+  invalidate an older snapshot.
 
 ## Engine
 

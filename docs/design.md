@@ -319,7 +319,14 @@ Every write logs an `Update` WAL record (WAL-before-page) so versions are durabl
 
 - **Write-write conflict detection** (first-committer-wins / Serializable, SSI) is a Sprint 6 stretch. Sprint 5 delivers snapshot-stable concurrent **reads** (requirement M5).
 - **MVCC-aware crash recovery** (rebuilding the index, undoing versions) integrates with the executor in a later sprint. Writes are WAL-logged today.
-- **Version GC / vacuum** (reclaiming dead versions) is deferred; dead versions accumulate in the chain for now.
+- **Version GC / vacuum.** `VACUUM [table]` reclaims the space held by dead
+  versions and stale index entries by rewriting a table's currently visible
+  rows into a fresh MVCC store with rebuilt secondary indexes (a compacting,
+  `VACUUM FULL`-style rewrite). This is safe and simple because the engine is
+  single-threaded, so a vacuum runs with no other live snapshot to invalidate;
+  it is refused inside a transaction block for the same reason. Incremental,
+  opportunistic GC (pruning chains in place behind a global visibility horizon)
+  is the natural follow-up once the engine is multi-threaded.
 
 The page header's `reserved: u32` field remains available for an on-page version-chain optimization; the current implementation stores the chain pointer inside the version payload instead.
 
