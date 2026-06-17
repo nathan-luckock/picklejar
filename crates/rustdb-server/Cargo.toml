@@ -6,17 +6,28 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "HTTP/JSON API server for the rustdb engine, the backend for the studio UI."
+description = "Servers for the rustdb engine: a PostgreSQL wire-protocol server and an HTTP/JSON API for the studio UI."
+
+[lib]
+name = "rustdb_server"
+path = "src/lib.rs"
 
 [[bin]]
 name = "rustdb-server"
 path = "src/main.rs"
+
+[[bin]]
+name = "rustdb-pg"
+path = "src/bin/rustdb-pg.rs"
 
 [dependencies]
 rustdb.workspace = true
 clap.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
 
 [lints]
 workspace = true
