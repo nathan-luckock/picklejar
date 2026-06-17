@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 use rustdb_executor::eval::{eval, is_truthy};
 use rustdb_executor::{decode_row, encode_row, run, Relation, TableSource};
 use rustdb_planner::{bind, explain, plan, Catalog, ColumnStats};
-use rustdb_sql::statement::{ColumnDef, DataType, Join, OrderItem, Select, SelectItem};
+use rustdb_sql::statement::{ColumnDef, DataType, Join, OrderItem, Select, SelectItem, TableRef};
 use rustdb_sql::{BinOp, Expr, Parser, Statement, UnOp, Value};
 use rustdb_storage::{BufferPool, FileManager, PageId};
 use rustdb_txn::{MvccTable, Transaction, TransactionManager};
@@ -834,7 +834,7 @@ impl Database {
             .map(|j| {
                 Ok(Join {
                     kind: j.kind,
-                    table: j.table.clone(),
+                    table: self.fold_table_ref(txn, &j.table)?,
                     on: self.fold_expr(txn, &j.on)?,
                 })
             })
@@ -842,7 +842,7 @@ impl Database {
         Ok(Select {
             distinct: s.distinct,
             projections,
-            from: s.from.clone(),
+            from: self.fold_table_ref(txn, &s.from)?,
             joins,
             where_clause: s
                 .where_clause
@@ -862,6 +862,22 @@ impl Database {
             order_by: self.fold_order_keys(txn, &s.order_by)?,
             limit: s.limit,
             offset: s.offset,
+        })
+    }
+
+    /// Fold any subqueries nested inside a `FROM`/join relation. A derived table
+    /// `(SELECT ...) AS x` has its inner query folded so its own uncorrelated
+    /// subqueries are resolved before binding.
+    fn fold_table_ref(&self, txn: &Transaction, table: &TableRef) -> Result<TableRef> {
+        let subquery = table
+            .subquery
+            .as_ref()
+            .map(|q| self.fold_query(txn, q).map(Box::new))
+            .transpose()?;
+        Ok(TableRef {
+            name: table.name.clone(),
+            alias: table.alias.clone(),
+            subquery,
         })
     }
 
@@ -2366,6 +2382,81 @@ mod tests {
             "SELECT name FROM emp WHERE NOT EXISTS (SELECT 1 FROM dept WHERE region = 'north') ORDER BY name LIMIT 1",
         );
         assert_eq!(name_set(&empty_ok), vec!["a"]);
+    }
+
+    // --- derived tables (FROM subquery) ---
+
+    #[test]
+    fn derived_table_filters_and_projects() {
+        let (_d, mut db) = db();
+        seed_emp(&mut db);
+        // A derived table feeds an outer filter; columns are visible under the
+        // alias and bare.
+        let (cols, rows) = query(
+            &mut db,
+            "SELECT e.name, e.salary FROM (SELECT name, salary FROM emp WHERE salary >= 80) AS e WHERE e.salary < 100 ORDER BY e.name",
+        );
+        // A qualified reference projects under the bare column name, as in Postgres.
+        assert_eq!(names(&cols), ["name", "salary"]);
+        assert_eq!(rows, vec![vec![Value::Text("c".into()), Value::Int(80)]]);
+    }
+
+    #[test]
+    fn derived_table_aggregate_then_filter() {
+        let (_d, mut db) = db();
+        seed_emp(&mut db);
+        // Aggregate per dept inside the derived table, then keep big departments.
+        let (_c, rows) = query(
+            &mut db,
+            "SELECT d.dept, d.total FROM (SELECT dept, SUM(salary) AS total FROM emp GROUP BY dept) AS d WHERE d.total > 120 ORDER BY d.dept",
+        );
+        assert_eq!(rows, vec![vec![Value::Text("eng".into()), Value::Int(160)]]);
+    }
+
+    #[test]
+    fn derived_table_joined_to_base_table() {
+        let (_d, mut db) = db();
+        seed_emp(&mut db);
+        // Join a derived table against a base table on the dept name.
+        let (_c, rows) = query(
+            &mut db,
+            "SELECT e.name, d.region FROM (SELECT name, dept FROM emp WHERE salary > 50) AS e INNER JOIN dept AS d ON e.dept = d.name ORDER BY e.name",
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Text("a".into()), Value::Text("west".into())],
+                vec![Value::Text("b".into()), Value::Text("west".into())],
+                vec![Value::Text("c".into()), Value::Text("east".into())],
+            ]
+        );
+    }
+
+    #[test]
+    fn derived_table_with_inner_subquery() {
+        let (_d, mut db) = db();
+        seed_emp(&mut db);
+        // The derived table's own (uncorrelated) scalar subquery is folded
+        // before binding: above-average earners, then re-filtered outside.
+        let (_c, rows) = query(
+            &mut db,
+            "SELECT e.name FROM (SELECT name FROM emp WHERE salary > (SELECT AVG(salary) FROM emp)) AS e ORDER BY e.name",
+        );
+        assert_eq!(name_set(&rows), vec!["a", "c"]);
+    }
+
+    #[test]
+    fn derived_table_explains() {
+        let (_d, mut db) = db();
+        seed_emp(&mut db);
+        let plan = match db
+            .execute("EXPLAIN SELECT e.name FROM (SELECT name FROM emp) AS e")
+            .unwrap()
+        {
+            QueryOutcome::Explain(p) => p,
+            other => panic!("expected explain, got {other:?}"),
+        };
+        assert!(plan.contains("DerivedScan AS e"), "plan was:\n{plan}");
     }
 
     // --- ALTER TABLE ADD COLUMN ---

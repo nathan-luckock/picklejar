@@ -107,6 +107,10 @@ fn render(plan: &PhysicalPlan, depth: usize, out: &mut String) {
             render(left, depth + 1, out);
             render(right, depth + 1, out);
         }
+        PhysicalPlan::DerivedScan { plan, alias, .. } => {
+            let _ = writeln!(out, "{pad}DerivedScan AS {alias}  {stats}");
+            render(plan, depth + 1, out);
+        }
         PhysicalPlan::Aggregate {
             group_by,
             aggregates,

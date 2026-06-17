@@ -19,15 +19,21 @@ use crate::token::{Keyword, TokenKind};
 /// A reference to a table in a FROM or JOIN clause, with optional alias.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TableRef {
-    /// Table name.
+    /// Table name (empty for a derived table).
     pub name: String,
-    /// Optional alias (`t` in `FROM table AS t`).
+    /// Optional alias (`t` in `FROM table AS t`; required for a derived table).
     pub alias: Option<String>,
+    /// A derived table: `FROM (SELECT ...) AS t`. `None` for a named table.
+    pub subquery: Option<Box<Statement>>,
 }
 
 impl fmt::Display for TableRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.name)?;
+        if let Some(sub) = &self.subquery {
+            write!(f, "({sub})")?;
+        } else {
+            f.write_str(&self.name)?;
+        }
         if let Some(a) = &self.alias {
             write!(f, " AS {a}")?;
         }
@@ -595,6 +601,7 @@ impl Parser {
             table: TableRef {
                 name: String::new(),
                 alias: None,
+                subquery: None,
             },
             on: Expr::Literal(crate::ast::Value::Bool(true)),
         };
@@ -717,10 +724,25 @@ impl Parser {
 
     /// Parse a table reference with an optional alias.
     fn parse_table_ref(&mut self) -> Result<TableRef> {
+        // A derived table: `(SELECT ...) [AS] alias`.
+        if matches!(self.peek(), TokenKind::LParen) {
+            self.advance();
+            let query = self.parse_query()?;
+            self.expect(&TokenKind::RParen)?;
+            let alias = self.parse_optional_alias().ok_or_else(|| {
+                SqlError::parse("a derived table requires an alias".to_string(), self.span())
+            })?;
+            return Ok(TableRef {
+                name: String::new(),
+                alias: Some(alias),
+                subquery: Some(Box::new(query)),
+            });
+        }
         let name = self.parse_ident()?;
         Ok(TableRef {
             name,
             alias: self.parse_optional_alias(),
+            subquery: None,
         })
     }
 
@@ -1003,6 +1025,14 @@ mod tests {
     fn count_distinct_round_trips() {
         round_trip("SELECT COUNT(DISTINCT col) FROM t");
         round_trip("SELECT g, SUM(DISTINCT n) FROM t GROUP BY g");
+    }
+
+    #[test]
+    fn derived_table_round_trips() {
+        round_trip("SELECT e.a FROM (SELECT a FROM t) AS e");
+        round_trip("SELECT e.a FROM (SELECT a FROM t WHERE x > 0) AS e WHERE e.a < 10");
+        round_trip("SELECT e.a, d.b FROM (SELECT a, k FROM t) AS e INNER JOIN u AS d ON e.k = d.k");
+        round_trip("SELECT g.n FROM (SELECT dept, SUM(n) AS n FROM t GROUP BY dept) AS g");
     }
 
     #[test]

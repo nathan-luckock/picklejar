@@ -514,6 +514,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustdb-server"
+version = "0.0.1"
+dependencies = [
+ "clap",
+ "rustdb",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "rustdb-sql"
 version = "0.0.1"
 dependencies = [

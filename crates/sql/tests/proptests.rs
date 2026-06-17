@@ -76,7 +76,11 @@ fn expr() -> impl Strategy<Value = Expr> {
 }
 
 fn table_ref() -> impl Strategy<Value = TableRef> {
-    (ident(), proptest::option::of(ident())).prop_map(|(name, alias)| TableRef { name, alias })
+    (ident(), proptest::option::of(ident())).prop_map(|(name, alias)| TableRef {
+        name,
+        alias,
+        subquery: None,
+    })
 }
 
 fn select_item() -> impl Strategy<Value = SelectItem> {

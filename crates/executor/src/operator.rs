@@ -311,6 +311,23 @@ impl Executor for Distinct {
     }
 }
 
+/// A derived table: pass the subquery's rows through unchanged, but present its
+/// columns re-qualified under the table alias (`x.col`), so the outer query can
+/// reference them as `x.col` or by bare name.
+struct DerivedScan {
+    input: Box<dyn Executor>,
+    columns: Vec<String>,
+}
+
+impl Executor for DerivedScan {
+    fn columns(&self) -> &[String] {
+        &self.columns
+    }
+    fn next(&mut self) -> Result<Option<Row>> {
+        self.input.next()
+    }
+}
+
 /// Concatenate two inputs (`UNION ALL`), optionally removing rows seen across
 /// either side (`UNION`). Output columns are the left input's.
 struct Union {
@@ -782,6 +799,15 @@ pub fn build(plan: &PhysicalPlan, source: &dyn TableSource) -> Result<Box<dyn Ex
             input: build(input, source)?,
             seen: HashSet::new(),
         })),
+        PhysicalPlan::DerivedScan { plan, alias, .. } => {
+            let input = build(plan, source)?;
+            let columns = input
+                .columns()
+                .iter()
+                .map(|c| format!("{alias}.{}", strip_qualifier(c)))
+                .collect();
+            Ok(Box::new(DerivedScan { input, columns }))
+        }
         PhysicalPlan::Union {
             all, left, right, ..
         } => {

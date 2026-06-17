@@ -8,15 +8,16 @@
 
 use rustdb_sql::{Expr, Select, SelectItem, Statement, TableRef, Value};
 
-use crate::catalog::{Catalog, TableMeta};
+use crate::catalog::Catalog;
 use crate::error::{PlanError, Result};
 use crate::logical::LogicalPlan;
 
-/// One table visible in a query: the name used to qualify its columns
-/// (alias if present, else table name) and its catalog metadata.
-struct ScopeEntry<'c> {
+/// One relation visible in a query: the name used to qualify its columns
+/// (alias if present, else table name) and the bare names of those columns. A
+/// derived table contributes its computed output column names here.
+struct ScopeEntry {
     qualifier: String,
-    meta: &'c TableMeta,
+    columns: Vec<String>,
 }
 
 /// Bind a statement to a logical plan. Only `SELECT` is supported here; DDL
@@ -62,7 +63,7 @@ pub fn bind(catalog: &Catalog, stmt: &Statement) -> Result<LogicalPlan> {
 
 fn bind_select(catalog: &Catalog, select: &Select) -> Result<LogicalPlan> {
     // 1. Build the scope (FROM + joins) and the join tree.
-    let mut scope: Vec<ScopeEntry<'_>> = Vec::new();
+    let mut scope: Vec<ScopeEntry> = Vec::new();
     let mut plan = scan_table(catalog, &select.from, &mut scope)?;
     for join in &select.joins {
         let right = scan_table(catalog, &join.table, &mut scope)?;
@@ -168,13 +169,31 @@ fn bind_select(catalog: &Catalog, select: &Select) -> Result<LogicalPlan> {
     Ok(plan)
 }
 
-/// Build a Scan for `table_ref`, checking the table exists and adding it to
-/// `scope`.
-fn scan_table<'c>(
-    catalog: &'c Catalog,
+/// Build a scan for `table_ref` (a base table or a derived table), checking it
+/// resolves and adding its columns to `scope`.
+fn scan_table(
+    catalog: &Catalog,
     table_ref: &TableRef,
-    scope: &mut Vec<ScopeEntry<'c>>,
+    scope: &mut Vec<ScopeEntry>,
 ) -> Result<LogicalPlan> {
+    // A derived table: bind the subquery and expose its output columns under
+    // the alias.
+    if let Some(sub) = &table_ref.subquery {
+        let alias = table_ref
+            .alias
+            .clone()
+            .ok_or_else(|| PlanError::Unsupported("a derived table requires an alias".into()))?;
+        let plan = bind(catalog, sub)?;
+        let columns = query_columns(catalog, sub)?;
+        scope.push(ScopeEntry {
+            qualifier: alias.clone(),
+            columns,
+        });
+        return Ok(LogicalPlan::DerivedScan {
+            plan: Box::new(plan),
+            alias,
+        });
+    }
     let meta = catalog
         .get_table(&table_ref.name)
         .ok_or_else(|| PlanError::UnknownTable(table_ref.name.clone()))?;
@@ -184,7 +203,7 @@ fn scan_table<'c>(
         .unwrap_or_else(|| table_ref.name.clone());
     scope.push(ScopeEntry {
         qualifier: qualifier.clone(),
-        meta,
+        columns: meta.columns.iter().map(|c| c.name.clone()).collect(),
     });
     Ok(LogicalPlan::Scan {
         table: table_ref.name.clone(),
@@ -192,8 +211,59 @@ fn scan_table<'c>(
     })
 }
 
+/// Compute the output column names a query produces, mirroring how the executor
+/// names projected columns (alias, else the column's bare name, else the
+/// expression's printed form; `*` expands to the FROM relations' columns).
+fn query_columns(catalog: &Catalog, stmt: &Statement) -> Result<Vec<String>> {
+    match stmt {
+        Statement::Select(s) => {
+            let mut from_cols = table_ref_columns(catalog, &s.from)?;
+            for j in &s.joins {
+                from_cols.extend(table_ref_columns(catalog, &j.table)?);
+            }
+            let mut out = Vec::new();
+            for item in &s.projections {
+                match item {
+                    SelectItem::Star => out.extend(from_cols.iter().cloned()),
+                    SelectItem::Expr(e, alias) => out.push(projected_name(e, alias.as_deref())),
+                }
+            }
+            Ok(out)
+        }
+        // A union takes its column names from the left query.
+        Statement::Union { left, .. } => query_columns(catalog, left),
+        other => Err(PlanError::Unsupported(format!(
+            "cannot derive columns of: {other}"
+        ))),
+    }
+}
+
+/// The bare columns a `FROM` item contributes (a base table's columns, or a
+/// derived table's output names).
+fn table_ref_columns(catalog: &Catalog, table_ref: &TableRef) -> Result<Vec<String>> {
+    if let Some(sub) = &table_ref.subquery {
+        query_columns(catalog, sub)
+    } else {
+        let meta = catalog
+            .get_table(&table_ref.name)
+            .ok_or_else(|| PlanError::UnknownTable(table_ref.name.clone()))?;
+        Ok(meta.columns.iter().map(|c| c.name.clone()).collect())
+    }
+}
+
+/// The output name of a projected expression (mirrors the executor's rule).
+fn projected_name(expr: &Expr, alias: Option<&str>) -> String {
+    if let Some(a) = alias {
+        return a.to_string();
+    }
+    match expr {
+        Expr::Column(name) | Expr::QualifiedColumn(_, name) => name.clone(),
+        other => other.to_string(),
+    }
+}
+
 /// Validate that every column reference in `expr` resolves against `scope`.
-fn resolve_expr(expr: &Expr, scope: &[ScopeEntry<'_>]) -> Result<()> {
+fn resolve_expr(expr: &Expr, scope: &[ScopeEntry]) -> Result<()> {
     match expr {
         Expr::Literal(_) | Expr::Star => Ok(()),
         Expr::Column(name) => resolve_bare_column(name, scope),
@@ -323,8 +393,8 @@ fn collect_aggs_in(expr: &Expr, out: &mut Vec<Expr>) {
 /// A bare column must exist in at least one table in scope. Ambiguity
 /// (present in more than one) is tolerated here and resolved by the
 /// executor with full column mapping; only "exists nowhere" is an error.
-fn resolve_bare_column(name: &str, scope: &[ScopeEntry<'_>]) -> Result<()> {
-    let found = scope.iter().any(|e| e.meta.column_index(name).is_some());
+fn resolve_bare_column(name: &str, scope: &[ScopeEntry]) -> Result<()> {
+    let found = scope.iter().any(|e| e.columns.iter().any(|c| c == name));
     if found {
         Ok(())
     } else {
@@ -341,12 +411,12 @@ fn resolve_bare_column(name: &str, scope: &[ScopeEntry<'_>]) -> Result<()> {
 
 /// A qualified column `q.c` must name an in-scope table (by alias or name)
 /// that has column `c`.
-fn resolve_qualified_column(qualifier: &str, column: &str, scope: &[ScopeEntry<'_>]) -> Result<()> {
+fn resolve_qualified_column(qualifier: &str, column: &str, scope: &[ScopeEntry]) -> Result<()> {
     let entry = scope
         .iter()
         .find(|e| e.qualifier == qualifier)
         .ok_or_else(|| PlanError::UnknownTable(qualifier.to_string()))?;
-    if entry.meta.column_index(column).is_some() {
+    if entry.columns.iter().any(|c| c == column) {
         Ok(())
     } else {
         Err(PlanError::UnknownColumn {

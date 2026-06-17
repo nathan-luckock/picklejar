@@ -90,6 +90,14 @@ pub enum LogicalPlan {
         /// Right query plan.
         right: Box<Self>,
     },
+    /// A derived table: a subquery used as a `FROM` relation, its output columns
+    /// re-qualified under `alias`.
+    DerivedScan {
+        /// The subquery's plan.
+        plan: Box<Self>,
+        /// The alias qualifying the derived columns.
+        alias: String,
+    },
 }
 
 impl LogicalPlan {
@@ -169,6 +177,10 @@ impl LogicalPlan {
                 writeln!(f, "{pad}Union{}", if *all { " ALL" } else { "" })?;
                 left.fmt_indented(f, depth + 1)?;
                 right.fmt_indented(f, depth + 1)
+            }
+            Self::DerivedScan { plan, alias } => {
+                writeln!(f, "{pad}DerivedScan AS {alias}")?;
+                plan.fmt_indented(f, depth + 1)
             }
         }
     }

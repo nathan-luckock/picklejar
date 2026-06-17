@@ -116,6 +116,17 @@ pub enum PhysicalPlan {
         /// Estimated cost.
         est_cost: f64,
     },
+    /// A derived table: a subquery used as a `FROM` relation, re-qualified.
+    DerivedScan {
+        /// The subquery's plan.
+        plan: Box<Self>,
+        /// The alias qualifying the derived columns.
+        alias: String,
+        /// Estimated output rows.
+        est_rows: u64,
+        /// Estimated cost.
+        est_cost: f64,
+    },
     /// Group-by aggregate.
     Aggregate {
         /// Grouping keys.
@@ -177,6 +188,7 @@ impl PhysicalPlan {
             | Self::Limit { est_rows, .. }
             | Self::Distinct { est_rows, .. }
             | Self::Union { est_rows, .. }
+            | Self::DerivedScan { est_rows, .. }
             | Self::Aggregate { est_rows, .. }
             | Self::NestedLoopJoin { est_rows, .. }
             | Self::HashJoin { est_rows, .. } => *est_rows,
@@ -195,6 +207,7 @@ impl PhysicalPlan {
             | Self::Limit { est_cost, .. }
             | Self::Distinct { est_cost, .. }
             | Self::Union { est_cost, .. }
+            | Self::DerivedScan { est_cost, .. }
             | Self::Aggregate { est_cost, .. }
             | Self::NestedLoopJoin { est_cost, .. }
             | Self::HashJoin { est_cost, .. } => *est_cost,
@@ -308,6 +321,17 @@ pub fn plan(logical: &LogicalPlan, catalog: &Catalog) -> Result<PhysicalPlan> {
                 all: *all,
                 left: Box::new(l),
                 right: Box::new(r),
+                est_rows,
+                est_cost,
+            })
+        }
+        LogicalPlan::DerivedScan { plan: inner, alias } => {
+            let child = plan(inner, catalog)?;
+            let est_rows = child.est_rows();
+            let est_cost = child.est_cost();
+            Ok(PhysicalPlan::DerivedScan {
+                plan: Box::new(child),
+                alias: alias.clone(),
                 est_rows,
                 est_cost,
             })
