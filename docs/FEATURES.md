@@ -121,6 +121,12 @@ tour, see the [README](../README.md).
 - **Concurrency control** - MVCC with snapshot isolation and version chains.
 - **Interfaces** - an embeddable library, a `psql`-style CLI, and a
   PostgreSQL-wire-protocol server (simple + extended, with `$N` parameters).
+- **Authentication** - the wire server defaults to trust (any user) but accepts
+  `--user` / `--password` to require SCRAM-SHA-256 (the modern PostgreSQL
+  mechanism): the password is never sent or stored, only a salted one-way
+  verifier, and the client proves knowledge of it through a challenge-response
+  exchange. The SHA-256, HMAC, and PBKDF2 primitives are in-tree (no external
+  crypto crate).
 - **Concurrency** - the wire server handles many client connections at once: the
   single-threaded engine runs as an actor on its own thread, and each connection
   gets its own thread and session handle. Transaction exclusivity keeps explicit

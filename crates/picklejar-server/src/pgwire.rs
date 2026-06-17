@@ -7,7 +7,8 @@
 //! many connections run concurrently against the single-threaded engine.
 //!
 //! Implemented: the startup handshake (with SSL/GSS politely declined), trust
-//! authentication, the **simple query protocol** (`Query` -> `RowDescription` /
+//! and SCRAM-SHA-256 authentication, the **simple query protocol** (`Query` ->
+//! `RowDescription` /
 //! `DataRow` / `CommandComplete` / `ReadyForQuery`, with `ErrorResponse` on
 //! failure), and the **extended query protocol** (`Parse` / `Bind` /
 //! `Describe` / `Execute` / `Close` / `Sync` / `Flush`) with positional `$N`
@@ -28,6 +29,7 @@ use picklejar::{QueryOutcome, Value};
 use picklejar_sql::{Parser, Statement};
 
 use crate::engine::Engine;
+use crate::scram::{self, Auth};
 
 /// `int8` (64-bit integer) type OID.
 const INT8_OID: i32 = 20;
@@ -62,16 +64,33 @@ const CANCEL_REQUEST: i32 = 80_877_102;
 ///
 /// Returns an I/O error if the socket cannot be read or written.
 pub fn serve<S: Read + Write>(db: &mut dyn Engine, stream: &mut S) -> io::Result<()> {
-    if startup(db, stream)? {
+    serve_with_auth(db, stream, &Auth::Trust)
+}
+
+/// Serve one client connection, authenticating it according to `auth`.
+///
+/// With [`Auth::Trust`] this is identical to [`serve`]; with [`Auth::Scram`] the
+/// connection must pass a SCRAM-SHA-256 exchange before any query is accepted.
+///
+/// # Errors
+///
+/// Returns an I/O error if the socket cannot be read or written.
+pub fn serve_with_auth<S: Read + Write>(
+    db: &mut dyn Engine,
+    stream: &mut S,
+    auth: &Auth,
+) -> io::Result<()> {
+    if startup(db, stream, auth)? {
         query_loop(db, stream)?;
     }
     Ok(())
 }
 
 /// Run the startup handshake. Returns `true` once an authenticated 3.0 session
-/// is ready for queries, or `false` if the client closed the connection or only
-/// probed for SSL/cancel.
-fn startup<S: Read + Write>(db: &dyn Engine, stream: &mut S) -> io::Result<bool> {
+/// is ready for queries, or `false` if the client closed the connection, failed
+/// authentication, or only probed for SSL/cancel.
+fn startup<S: Read + Write>(db: &dyn Engine, stream: &mut S, auth: &Auth) -> io::Result<bool> {
+    let startup_params: Vec<u8>;
     loop {
         let Some(len) = read_i32_opt(stream)? else {
             return Ok(false);
@@ -90,7 +109,10 @@ fn startup<S: Read + Write>(db: &dyn Engine, stream: &mut S) -> io::Result<bool>
             }
             // A cancel request carries no session; acknowledge by closing.
             CANCEL_REQUEST => return Ok(false),
-            PROTOCOL_3_0 => break,
+            PROTOCOL_3_0 => {
+                startup_params = payload[4..].to_vec();
+                break;
+            }
             other => {
                 send_error(stream, &format!("unsupported protocol version {other}"))?;
                 return Ok(false);
@@ -98,7 +120,15 @@ fn startup<S: Read + Write>(db: &dyn Engine, stream: &mut S) -> io::Result<bool>
         }
     }
 
-    // Trust authentication: AuthenticationOk.
+    // Authenticate before advertising the session.
+    if let Auth::Scram(creds) = auth {
+        let user = startup_param(&startup_params, "user");
+        if !authenticate_scram(stream, creds, user.as_deref())? {
+            return Ok(false);
+        }
+    }
+
+    // AuthenticationOk.
     write_message(stream, b'R', &0i32.to_be_bytes())?;
     // A few parameters clients like to see at startup.
     for (key, val) in [
@@ -117,6 +147,108 @@ fn startup<S: Read + Write>(db: &dyn Engine, stream: &mut S) -> io::Result<bool>
     write_message(stream, b'K', &key_data)?;
     ready_for_query(db, stream)?;
     Ok(true)
+}
+
+/// Look up a startup parameter (e.g. `user`) in the `key\0value\0` list that
+/// follows the protocol version, returning its value if present.
+fn startup_param(params: &[u8], key: &str) -> Option<String> {
+    let mut off = 0;
+    loop {
+        let k = read_cstr(params, &mut off);
+        if k.is_empty() {
+            return None;
+        }
+        let v = read_cstr(params, &mut off);
+        if k == key {
+            return Some(v);
+        }
+    }
+}
+
+/// Run the SCRAM-SHA-256 exchange. Returns `Ok(true)` when the client proves the
+/// password, `Ok(false)` (after an `ErrorResponse`) when it fails or the socket
+/// closes. The `AuthenticationOk` that follows is sent by the caller.
+fn authenticate_scram<S: Read + Write>(
+    stream: &mut S,
+    creds: &scram::Credentials,
+    user: Option<&str>,
+) -> io::Result<bool> {
+    // AuthenticationSASL: the mechanism list, each name a C string, then a final
+    // empty string.
+    let mut body = 10i32.to_be_bytes().to_vec();
+    body.extend_from_slice(b"SCRAM-SHA-256\0\0");
+    write_message(stream, b'R', &body)?;
+
+    // SASLInitialResponse: selected mechanism, the response length, then the
+    // client-first-message.
+    let Some((b'p', payload)) = read_frontend(stream)? else {
+        return Ok(false);
+    };
+    let mut off = 0;
+    let mechanism = read_cstr(&payload, &mut off);
+    if mechanism != "SCRAM-SHA-256" {
+        send_error(stream, "unsupported SASL mechanism")?;
+        return Ok(false);
+    }
+    off += 4; // skip the i32 initial-response length; the rest is the message.
+    let client_first = &payload[off.min(payload.len())..];
+    let Some(cf) = scram::parse_client_first(client_first) else {
+        send_error(stream, "malformed SCRAM client-first message")?;
+        return Ok(false);
+    };
+
+    // The startup `user` is authoritative; reject a mismatch up front.
+    if user.is_some_and(|u| u != creds.username) {
+        send_error(
+            stream,
+            &format!(
+                "password authentication failed for user {:?}",
+                creds.username
+            ),
+        )?;
+        return Ok(false);
+    }
+
+    // AuthenticationSASLContinue: the server-first-message.
+    let combined_nonce = format!("{}{}", cf.client_nonce, scram::nonce());
+    let server_first = scram::server_first(&combined_nonce, &creds.salt, creds.iterations);
+    let mut cont = 11i32.to_be_bytes().to_vec();
+    cont.extend_from_slice(server_first.as_bytes());
+    write_message(stream, b'R', &cont)?;
+
+    // SASLResponse: the client-final-message.
+    let Some((b'p', client_final)) = read_frontend(stream)? else {
+        return Ok(false);
+    };
+    let Ok(server_final) = scram::verify_client_final(
+        creds,
+        &cf.bare,
+        &server_first,
+        &client_final,
+        &combined_nonce,
+    ) else {
+        send_error(stream, "password authentication failed")?;
+        return Ok(false);
+    };
+    // AuthenticationSASLFinal carries the server signature.
+    let mut done = 12i32.to_be_bytes().to_vec();
+    done.extend_from_slice(server_final.as_bytes());
+    write_message(stream, b'R', &done)?;
+    Ok(true)
+}
+
+/// Read one framed frontend message (tag + length + body), or `None` at a clean
+/// EOF. Used during the authentication phase, before the main query loop.
+fn read_frontend<S: Read>(stream: &mut S) -> io::Result<Option<(u8, Vec<u8>)>> {
+    let mut tag = [0u8; 1];
+    if !read_exact_opt(stream, &mut tag)? {
+        return Ok(None);
+    }
+    let len = read_i32(stream)?;
+    let body_len = usize::try_from(len).unwrap_or(0).saturating_sub(4);
+    let mut payload = vec![0u8; body_len];
+    stream.read_exact(&mut payload)?;
+    Ok(Some((tag[0], payload)))
 }
 
 /// A prepared statement: its raw SQL and the parameter type OIDs from `Parse`.
@@ -1004,6 +1136,153 @@ mod tests {
             .iter()
             .any(|(t, p)| *t == b'R' && p == &0i32.to_be_bytes()));
         assert!(msgs.iter().any(|(t, p)| *t == b'Z' && p == b"I"));
+    }
+
+    /// Read one framed backend message (tag + length + body) from a socket.
+    fn read_tagged<R: Read>(s: &mut R) -> (u8, Vec<u8>) {
+        let mut head = [0u8; 5];
+        s.read_exact(&mut head).expect("read header");
+        let len = u32::from_be_bytes([head[1], head[2], head[3], head[4]]) as usize;
+        let mut body = vec![0u8; len - 4];
+        s.read_exact(&mut body).expect("read body");
+        (head[0], body)
+    }
+
+    /// Frame and send one tagged frontend message.
+    fn write_tagged<W: Write>(s: &mut W, tag: u8, body: &[u8]) {
+        let mut msg = vec![tag];
+        msg.extend_from_slice(&i32::try_from(body.len() + 4).unwrap().to_be_bytes());
+        msg.extend_from_slice(body);
+        s.write_all(&msg).unwrap();
+    }
+
+    /// Pull the value of a SCRAM attribute (`key=value`) out of a message.
+    fn scram_attr(msg: &str, key: &str) -> String {
+        let prefix = format!("{key}=");
+        msg.split(',')
+            .find_map(|a| a.strip_prefix(&prefix))
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// Drive the client side of a SCRAM-SHA-256 exchange to completion, then a
+    /// trivial query. Returns `true` if the server reached `ReadyForQuery`.
+    fn client_scram(s: &mut std::net::TcpStream, user: &str, password: &str) -> bool {
+        use crate::sha256::{hmac_sha256, pbkdf2, sha256};
+
+        // StartupMessage with the user parameter.
+        let mut body = PROTOCOL_3_0.to_be_bytes().to_vec();
+        body.extend_from_slice(b"user\0");
+        body.extend_from_slice(user.as_bytes());
+        body.extend_from_slice(b"\0\0");
+        let mut msg = i32::try_from(body.len() + 4)
+            .unwrap()
+            .to_be_bytes()
+            .to_vec();
+        msg.extend_from_slice(&body);
+        s.write_all(&msg).unwrap();
+
+        // AuthenticationSASL (R, 10).
+        let (tag, p) = read_tagged(s);
+        assert_eq!(tag, b'R');
+        assert_eq!(i32::from_be_bytes([p[0], p[1], p[2], p[3]]), 10);
+
+        // SASLInitialResponse with the client-first-message.
+        let cnonce = "fixedClientNonce01";
+        let bare = format!("n={user},r={cnonce}");
+        let client_first = format!("n,,{bare}");
+        let mut ir = b"SCRAM-SHA-256\0".to_vec();
+        ir.extend_from_slice(&i32::try_from(client_first.len()).unwrap().to_be_bytes());
+        ir.extend_from_slice(client_first.as_bytes());
+        write_tagged(s, b'p', &ir);
+
+        // AuthenticationSASLContinue (R, 11) carries the server-first-message.
+        let (tag, p) = read_tagged(s);
+        assert_eq!(tag, b'R');
+        assert_eq!(i32::from_be_bytes([p[0], p[1], p[2], p[3]]), 11);
+        let server_first = String::from_utf8(p[4..].to_vec()).unwrap();
+        let combined = scram_attr(&server_first, "r");
+        let salt = crate::scram::b64_decode(&scram_attr(&server_first, "s")).unwrap();
+        let iters: u32 = scram_attr(&server_first, "i").parse().unwrap();
+
+        // Compute the client proof from the password.
+        let salted = pbkdf2(password.as_bytes(), &salt, iters);
+        let client_key = hmac_sha256(&salted, b"Client Key");
+        let stored_key = sha256(&client_key);
+        let without_proof = format!("c=biws,r={combined}");
+        let auth_message = format!("{bare},{server_first},{without_proof}");
+        let client_sig = hmac_sha256(&stored_key, auth_message.as_bytes());
+        let mut proof = [0u8; 32];
+        for (pf, (&ck, &cs)) in proof
+            .iter_mut()
+            .zip(client_key.iter().zip(client_sig.iter()))
+        {
+            *pf = ck ^ cs;
+        }
+        let client_final = format!("{without_proof},p={}", crate::scram::b64_encode(&proof));
+        write_tagged(s, b'p', client_final.as_bytes());
+
+        // Either SASLFinal (R, 12) on success or ErrorResponse on failure.
+        let (tag, _) = read_tagged(s);
+        if tag == b'E' {
+            return false;
+        }
+        assert_eq!(tag, b'R');
+        loop {
+            let (tag, _) = read_tagged(s);
+            match tag {
+                b'Z' => {
+                    write_tagged(s, b'X', &[]); // Terminate so the server returns.
+                    return true;
+                }
+                b'E' => return false,
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn scram_authentication_accepts_and_rejects() {
+        use std::net::{TcpListener, TcpStream};
+        use std::time::Duration;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("scram.db");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        // The engine is single-threaded; serve the two connections in sequence
+        // on a dedicated thread that owns the database.
+        let server = std::thread::spawn(move || {
+            let mut db = Database::open(&db_path).unwrap();
+            for _ in 0..2 {
+                let (mut sock, _) = listener.accept().unwrap();
+                let creds = crate::scram::Credentials::with_salt(
+                    "postgres",
+                    "s3cret",
+                    b"0123456789abcdef".to_vec(),
+                    4096,
+                );
+                let _ = serve_with_auth(&mut db, &mut sock, &Auth::Scram(creds));
+            }
+        });
+
+        let mut good = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        good.set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        assert!(
+            client_scram(&mut good, "postgres", "s3cret"),
+            "correct password should authenticate"
+        );
+
+        let mut bad = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        bad.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        assert!(
+            !client_scram(&mut bad, "postgres", "wrong"),
+            "wrong password should be rejected"
+        );
+
+        server.join().unwrap();
     }
 
     #[test]

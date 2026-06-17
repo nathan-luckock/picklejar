@@ -13,10 +13,13 @@
 use std::net::TcpListener;
 use std::thread;
 
+use std::sync::Arc;
+
 use clap::Parser as ClapParser;
 use picklejar::Database;
 use picklejar_server::engine::EngineActor;
 use picklejar_server::pgwire;
+use picklejar_server::scram::{Auth, Credentials};
 
 #[derive(Debug, ClapParser)]
 #[command(
@@ -31,6 +34,13 @@ struct Args {
     /// TCP port to listen on.
     #[arg(short, long, default_value_t = 5433)]
     port: u16,
+    /// Account name a client must connect as when a password is set.
+    #[arg(short, long, default_value = "postgres")]
+    user: String,
+    /// Require SCRAM-SHA-256 authentication with this password. Omitted means
+    /// trust authentication (any user, no password).
+    #[arg(long)]
+    password: Option<String>,
 }
 
 fn main() {
@@ -54,11 +64,23 @@ fn main() {
             std::process::exit(1);
         }
     };
+    // Derive the SCRAM verifier once (shared across connections) when a password
+    // is configured; otherwise accept any user with trust authentication.
+    let auth = Arc::new(match &args.password {
+        Some(pw) => Auth::Scram(Credentials::new(&args.user, pw)),
+        None => Auth::Trust,
+    });
+    let auth_note = if args.password.is_some() {
+        format!("SCRAM-SHA-256 as user {}", args.user)
+    } else {
+        "trust (no password)".to_string()
+    };
     println!(
-        "picklejar-pg listening on 127.0.0.1:{port} (database {db_path})\n\
-         connect with: psql -h 127.0.0.1 -p {port} -U postgres",
+        "picklejar-pg listening on 127.0.0.1:{port} (database {db_path}, auth: {auth_note})\n\
+         connect with: psql -h 127.0.0.1 -p {port} -U {user}",
         port = args.port,
         db_path = args.database,
+        user = args.user,
     );
 
     // Hand each accepted connection its own thread and session handle.
@@ -66,8 +88,9 @@ fn main() {
         match stream {
             Ok(mut stream) => {
                 let mut session = actor.session();
+                let auth = Arc::clone(&auth);
                 thread::spawn(move || {
-                    if let Err(e) = pgwire::serve(&mut session, &mut stream) {
+                    if let Err(e) = pgwire::serve_with_auth(&mut session, &mut stream, &auth) {
                         eprintln!("connection error: {e}");
                     }
                 });

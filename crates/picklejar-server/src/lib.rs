@@ -8,3 +8,5 @@
 
 pub mod engine;
 pub mod pgwire;
+pub mod scram;
+pub mod sha256;
