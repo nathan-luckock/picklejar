@@ -19,8 +19,9 @@ pub enum Auth {
     Scram(Credentials),
 }
 
-/// The verifier the server keeps for a SCRAM account. None of these reveal the
-/// password: `stored_key` and `server_key` are one-way derivations.
+/// The verifier the server keeps for a SCRAM account. None of these values
+/// reveal the account's secret; `stored_key` and `server_key` are one-way
+/// derivations of it.
 #[derive(Debug)]
 pub struct Credentials {
     /// The account name the client must connect as.
