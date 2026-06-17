@@ -354,8 +354,11 @@ constraints), `CREATE INDEX`, and `DROP TABLE`. DML is `INSERT` (multi-row),
 - Projections with `AS` aliases, `*`, and arbitrary expressions.
 - `WHERE` over the full expression grammar.
 - `INNER JOIN` and `LEFT JOIN` with `ON`.
-- `GROUP BY` with `COUNT` / `SUM` / `MIN` / `MAX` / `AVG`, and `HAVING`.
+- `GROUP BY` with `COUNT` / `SUM` / `MIN` / `MAX` / `AVG` (including
+  `COUNT(DISTINCT ...)`), and `HAVING`.
 - `DISTINCT`, `ORDER BY` (multi-key, `ASC` / `DESC`), `LIMIT`, and `OFFSET`.
+- `UNION` and `UNION ALL`, with a trailing `ORDER BY` / `LIMIT` over the union.
+- Uncorrelated scalar subqueries `(SELECT ...)` and `expr [NOT] IN (SELECT ...)`.
 - `EXPLAIN` of any of the above.
 
 The expression grammar has four column types (`INT`, `FLOAT`, `BOOL`, `TEXT`),
@@ -368,7 +371,7 @@ three-valued NULL handling, the predicates `IN` / `BETWEEN` / `LIKE` /
 ### Scope and deferrals
 
 - The parser is **schema-free**: it enforces grammar only. Semantic checks (INSERT column/value arity, unknown columns, type errors) are the planner's job, since they need the catalog.
-- Subqueries, set operations (`UNION`), `COUNT(DISTINCT ...)`, window functions, CTEs, and right/full outer joins are deferred. They are additive: each is a new node or expression form on the same parse/bind/plan/execute pipeline the features above already use.
+- Correlated subqueries, `EXISTS`, derived tables in `FROM`, `INTERSECT` / `EXCEPT`, window functions, CTEs, and right/full outer joins are deferred. They are additive: each is a new node or expression form on the same parse/bind/plan/execute pipeline the features above already use. The supported (uncorrelated) subqueries are constant-folded before planning; the deferred forms need the outer row in scope, a larger change.
 
 ---
 
