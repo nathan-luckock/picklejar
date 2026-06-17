@@ -390,6 +390,13 @@ impl Parser {
                 self.advance();
                 self.parse_case()
             }
+            TokenKind::Keyword(Keyword::Exists) => {
+                self.advance();
+                self.expect(&TokenKind::LParen)?;
+                let query = self.parse_query()?;
+                self.expect(&TokenKind::RParen)?;
+                Ok(Expr::Exists(Box::new(query)))
+            }
             TokenKind::Ident(name) => {
                 self.advance();
                 if self.eat(&TokenKind::LParen) {

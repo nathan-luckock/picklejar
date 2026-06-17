@@ -711,6 +711,11 @@ impl Database {
                 let values = self.column_subquery(txn, query)?;
                 Ok(in_list_expr(&lhs, &values, *negated))
             }
+            Expr::Exists(query) => {
+                let folded = self.fold_query(txn, query)?;
+                let (_cols, rows) = self.execute_query(txn, &folded)?;
+                Ok(Expr::Literal(Value::Bool(!rows.is_empty())))
+            }
             Expr::Binary { op, left, right } => Ok(Expr::Binary {
                 op: *op,
                 left: Box::new(self.fold_expr(txn, left)?),
@@ -2159,5 +2164,60 @@ mod tests {
             "SELECT name FROM emp WHERE salary > (SELECT AVG(salary) FROM dept WHERE dept = region)",
         );
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn exists_and_not_exists() {
+        let (_d, mut db) = db();
+        seed_emp(&mut db);
+        // EXISTS over a non-empty subquery is true (returns all rows).
+        let (_c, all) = query(
+            &mut db,
+            "SELECT name FROM emp WHERE EXISTS (SELECT 1 FROM dept) ORDER BY name",
+        );
+        assert_eq!(name_set(&all), vec!["a", "b", "c", "d"]);
+        // NOT EXISTS over an empty subquery is true; over a non-empty one,
+        // false (no rows).
+        let (_c, none) = query(
+            &mut db,
+            "SELECT name FROM emp WHERE NOT EXISTS (SELECT 1 FROM dept)",
+        );
+        assert!(none.is_empty());
+        let (_c, empty_ok) = query(
+            &mut db,
+            "SELECT name FROM emp WHERE NOT EXISTS (SELECT 1 FROM dept WHERE region = 'north') ORDER BY name LIMIT 1",
+        );
+        assert_eq!(name_set(&empty_ok), vec!["a"]);
+    }
+
+    // --- more built-in functions ---
+
+    #[test]
+    fn string_and_math_functions() {
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE t (s TEXT, n INT, x FLOAT)")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES ('  Hello World  ', 17, 2.5)")
+            .unwrap();
+        let (_c, rows) = query(
+            &mut db,
+            "SELECT SUBSTR(TRIM(s), 1, 5), REPLACE(TRIM(s), 'World', 'SQL'), MOD(n, 5), POWER(x, 2), SQRT(x), FLOOR(x), CEIL(x) FROM t",
+        );
+        assert_eq!(
+            rows[0],
+            vec![
+                Value::Text("Hello".into()),
+                Value::Text("Hello SQL".into()),
+                Value::Int(2),
+                Value::Float(6.25),
+                Value::Float(2.5_f64.sqrt()),
+                Value::Float(2.0),
+                Value::Float(3.0),
+            ]
+        );
+        // NULL propagation: SUBSTR of a NULL is NULL.
+        db.execute("INSERT INTO t (n) VALUES (1)").unwrap();
+        let (_c, nulls) = query(&mut db, "SELECT SUBSTR(s, 1, 2) FROM t WHERE n = 1");
+        assert_eq!(nulls, vec![vec![Value::Null]]);
     }
 }

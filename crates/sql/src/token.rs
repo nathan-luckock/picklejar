@@ -76,6 +76,7 @@ pub enum Keyword {
     Then,
     Else,
     End,
+    Exists,
     // Column types.
     Int,
     Text,
@@ -142,6 +143,7 @@ impl Keyword {
             "then" => Self::Then,
             "else" => Self::Else,
             "end" => Self::End,
+            "exists" => Self::Exists,
             "int" | "integer" => Self::Int,
             "text" | "varchar" => Self::Text,
             "float" | "real" | "double" => Self::Float,

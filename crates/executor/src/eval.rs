@@ -43,9 +43,11 @@ pub fn eval(expr: &Expr, row: &[Value], columns: &[String]) -> Result<Value> {
             columns,
         ),
         // The engine folds subqueries to literals before execution.
-        Expr::Subquery(_) | Expr::InSubquery { .. } => Err(ExecError::Unsupported(
-            "subquery reached the evaluator (should have been folded)".into(),
-        )),
+        Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists(_) => {
+            Err(ExecError::Unsupported(
+                "subquery reached the evaluator (should have been folded)".into(),
+            ))
+        }
     }
 }
 
@@ -102,7 +104,9 @@ fn eval_scalar_func(
             }
             Ok(Some(Value::Null))
         }
-        "LENGTH" | "UPPER" | "LOWER" | "ABS" | "ROUND" | "CONCAT" | "NULLIF" => {
+        "LENGTH" | "UPPER" | "LOWER" | "ABS" | "ROUND" | "CONCAT" | "NULLIF" | "SUBSTR"
+        | "SUBSTRING" | "TRIM" | "LTRIM" | "RTRIM" | "REPLACE" | "MOD" | "POWER" | "POW"
+        | "SQRT" | "FLOOR" | "CEIL" | "CEILING" => {
             let vals = args
                 .iter()
                 .map(|a| eval(a, row, columns))
@@ -114,8 +118,17 @@ fn eval_scalar_func(
 }
 
 /// Apply a fixed-arity scalar function to already-evaluated arguments.
-#[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
 fn apply_scalar(name: &str, vals: &[Value]) -> Result<Value> {
+    // NULL propagates through the value functions; CONCAT skips NULLs and
+    // NULLIF compares them, so they opt out of the blanket rule.
+    if !matches!(name, "CONCAT" | "NULLIF") && vals.iter().any(|v| matches!(v, Value::Null)) {
+        return Ok(Value::Null);
+    }
     let bad = || ExecError::Type(format!("{name} applied to wrong argument types"));
     let v = match (name, vals) {
         ("LENGTH", [Value::Text(s)]) => {
@@ -123,9 +136,35 @@ fn apply_scalar(name: &str, vals: &[Value]) -> Result<Value> {
         }
         ("UPPER", [Value::Text(s)]) => Value::Text(s.to_uppercase()),
         ("LOWER", [Value::Text(s)]) => Value::Text(s.to_lowercase()),
+        ("TRIM", [Value::Text(s)]) => Value::Text(s.trim().to_string()),
+        ("LTRIM", [Value::Text(s)]) => Value::Text(s.trim_start().to_string()),
+        ("RTRIM", [Value::Text(s)]) => Value::Text(s.trim_end().to_string()),
+        ("REPLACE", [Value::Text(s), Value::Text(from), Value::Text(to)]) => {
+            Value::Text(s.replace(from.as_str(), to))
+        }
+        ("SUBSTR" | "SUBSTRING", [Value::Text(s), Value::Int(start)]) => {
+            let from = (*start).max(1) as usize - 1;
+            Value::Text(s.chars().skip(from).collect())
+        }
+        ("SUBSTR" | "SUBSTRING", [Value::Text(s), Value::Int(start), Value::Int(len)]) => {
+            let from = (*start).max(1) as usize - 1;
+            let take = (*len).max(0) as usize;
+            Value::Text(s.chars().skip(from).take(take).collect())
+        }
         ("ABS", [Value::Int(n)]) => Value::Int(n.wrapping_abs()),
         ("ABS", [Value::Float(x)]) => Value::Float(x.abs()),
-        ("ROUND", [Value::Int(n)]) => Value::Int(*n),
+        ("MOD", [Value::Int(a), Value::Int(b)]) => {
+            if *b == 0 {
+                return Err(ExecError::Type("modulo by zero".into()));
+            }
+            Value::Int(a.wrapping_rem(*b))
+        }
+        ("POWER" | "POW", [a, b]) => Value::Float(numeric(a)?.powf(numeric(b)?)),
+        ("SQRT", [a]) => Value::Float(numeric(a)?.sqrt()),
+        // Integer floor / ceil / round (no fractional part) are no-ops.
+        ("FLOOR" | "CEIL" | "CEILING" | "ROUND", [Value::Int(n)]) => Value::Int(*n),
+        ("FLOOR", [Value::Float(x)]) => Value::Float(x.floor()),
+        ("CEIL" | "CEILING", [Value::Float(x)]) => Value::Float(x.ceil()),
         ("ROUND", [Value::Float(x)]) => Value::Float(x.round()),
         ("ROUND", [Value::Float(x), Value::Int(d)]) => {
             let f = 10f64.powi(i32::try_from(*d).unwrap_or(0));
@@ -138,21 +177,7 @@ fn apply_scalar(name: &str, vals: &[Value]) -> Result<Value> {
                 a.clone()
             }
         }
-        ("CONCAT", parts) => {
-            let mut s = String::new();
-            for p in parts {
-                match p {
-                    Value::Null => {} // NULL contributes nothing
-                    Value::Text(t) => s.push_str(t),
-                    Value::Int(n) => s.push_str(&n.to_string()),
-                    Value::Float(x) => s.push_str(&x.to_string()),
-                    Value::Bool(b) => s.push_str(&b.to_string()),
-                }
-            }
-            Value::Text(s)
-        }
-        // A NULL argument to a one-argument function yields NULL.
-        ("LENGTH" | "UPPER" | "LOWER" | "ABS" | "ROUND", [Value::Null, ..]) => Value::Null,
+        ("CONCAT", parts) => Value::Text(parts.iter().map(value_text).collect()),
         _ => return Err(bad()),
     };
     Ok(v)

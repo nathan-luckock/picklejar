@@ -217,6 +217,9 @@ pub enum Expr {
         /// `NOT IN` when true.
         negated: bool,
     },
+    /// `EXISTS (SELECT ...)`: true if the subquery returns any row. Folded to a
+    /// boolean before planning. `NOT EXISTS` is the prefix `NOT` over this.
+    Exists(Box<crate::statement::Statement>),
 }
 
 impl Expr {
@@ -302,6 +305,7 @@ impl fmt::Display for Expr {
                 let kw = if *negated { "NOT IN" } else { "IN" };
                 write!(f, "({expr} {kw} ({query}))")
             }
+            Self::Exists(q) => write!(f, "EXISTS ({q})"),
         }
     }
 }

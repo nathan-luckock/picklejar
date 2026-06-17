@@ -913,6 +913,8 @@ mod tests {
         round_trip("SELECT (SELECT COUNT(*) FROM u) FROM t");
         round_trip("SELECT a FROM t WHERE x IN (SELECT y FROM u)");
         round_trip("SELECT a FROM t WHERE x NOT IN (SELECT y FROM u WHERE z > 0)");
+        round_trip("SELECT a FROM t WHERE EXISTS (SELECT 1 FROM u)");
+        round_trip("SELECT a FROM t WHERE NOT EXISTS (SELECT 1 FROM u WHERE u.k = 1)");
     }
 
     #[test]
