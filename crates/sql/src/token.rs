@@ -65,6 +65,7 @@ pub enum Keyword {
     Primary,
     Key,
     Unique,
+    Default,
     True,
     False,
     // Predicates.
@@ -134,6 +135,7 @@ impl Keyword {
             "primary" => Self::Primary,
             "key" => Self::Key,
             "unique" => Self::Unique,
+            "default" => Self::Default,
             "true" => Self::True,
             "false" => Self::False,
             "in" => Self::In,
