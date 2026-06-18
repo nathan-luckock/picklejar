@@ -411,7 +411,8 @@ the next one possible.
    into a regenerable, content-hashed artifact. Together they are the "nobody has
    done this" claim, made concrete.
 
-**Next:** corrupt the WAL stream as well as the heap, replication and
+**Next:** the radiation model now corrupts every persistent file (heap, WAL, and
+the checksummed metadata sidecars), so what remains is replication and
 point-in-time recovery, and model-checking the core recovery and isolation
 invariants. Beyond that, redundancy and scrubbing (2C), radiation rates (3A),
 model checking (3C), and partition and power tolerance (3D), deepen the moat and the

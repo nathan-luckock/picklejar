@@ -33,7 +33,7 @@ every task to a pull request that is squash-merged once the checks
 | 12 | Security: roles, GRANT/REVOKE, ownership, SCRAM auth, row-level security | Shipped |
 | 13 | AI memory layer: VECTOR type, distance operators + KNN, RLS-filtered similarity, the vecsim simulator, HNSW index | Shipped |
 | 14 | Reliability for unreachable hardware: HNSW wired into SQL with a cached, RLS-safe index; corruption detection and self-healing; the metamorphic oracle; the `vecert` certificate; the orbital radiation fault model in the live simulator | Shipped |
-| 15 | WAL-stream fault model, replication and point-in-time recovery, model-checking the recovery and isolation invariants | Planned |
+| 15 | Whole-footprint radiation (heap, WAL, and checksummed metadata sidecars); replication and point-in-time recovery, model-checking the recovery and isolation invariants | In progress |
 
 ## What shipped, by sprint
 
@@ -157,7 +157,8 @@ cannot be physically serviced (orbital and edge data centers).
    a metamorphic oracle and the `vecert` certificate make the proof concrete; and
    the live simulator irradiates a committed workload at an orbit's upset rate and
    proves it is never served silently corrupted.
-4. Next: corrupt the WAL stream as well as the heap, replication and
+4. Next: the radiation model now corrupts every persistent file (heap, WAL, and
+   the checksummed metadata sidecars), so what remains is replication and
    point-in-time recovery, and model-checking the recovery and isolation
    invariants; then the deployment story for unreachable infrastructure.
 
