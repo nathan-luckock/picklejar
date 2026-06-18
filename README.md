@@ -171,6 +171,7 @@ certificate hash: ...  (regenerate from this commit to verify)
 
 | | |
 |---|---|
+| [docs/why-from-scratch.md](docs/why-from-scratch.md) | why this is not just Postgres + pgvector: the objection answered honestly |
 | [docs/ROADMAP.md](docs/ROADMAP.md) | where this is headed: from a crash-proven vector engine to flight-certifiable AI memory |
 | [docs/design.md](docs/design.md) | every design decision, with the alternatives considered and rejected |
 | [docs/FEATURES.md](docs/FEATURES.md) | the complete SQL surface and engine features |
