@@ -34,7 +34,8 @@ every task to a pull request that is squash-merged once the checks
 | 13 | AI memory layer: VECTOR type, distance operators + KNN, RLS-filtered similarity, the vecsim simulator, HNSW index | Shipped |
 | 14 | Reliability for unreachable hardware: HNSW wired into SQL with a cached, RLS-safe index; corruption detection and self-healing; the metamorphic oracle; the `vecert` certificate; the orbital radiation fault model in the live simulator | Shipped |
 | 15 | Mass-efficient self-healing: from-scratch Reed-Solomon erasure coding; a self-healing block store; whole-footprint radiation (heap, WAL, sidecars); the live heap reconstructing corrupt pages from parity on `open_resilient` | Shipped |
-| 16 | Replication and point-in-time recovery; model-checking the recovery and isolation invariants | Planned |
+| 16 | Operability of self-healing (PROTECT statement, pjscrub, pg_fault_log); snapshot backup and replication (Database::backup, pjbackup) | Shipped |
+| 17 | Model-checking the recovery and isolation invariants; WAL-logging the catalog metadata to unlock log-streaming point-in-time recovery | Planned |
 
 ## What shipped, by sprint
 

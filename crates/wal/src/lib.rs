@@ -18,6 +18,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod archive;
 pub mod error;
 pub mod hook;
 pub mod lsn;

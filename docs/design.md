@@ -990,6 +990,34 @@ heavy radiation-hardened, triple-redundant parts.
   dose versus scrub cadence), and `vecert` certifies both the block store and the
   live-heap heal.
 
+## Backup, replication, and the point-in-time-recovery boundary
+
+`Database::backup` takes a consistent physical snapshot: it flushes the buffer
+pool and the WAL, then copies the heap, the WAL, and every sidecar to a
+destination base path. Because the engine is single-threaded, between statements
+is a consistent point, so the copy is a valid database and `open(dest)` restores
+it. The `pjbackup` binary runs this from cron (healing from parity first), which
+is how committed data leaves a node that could be lost: ship snapshots to a ground
+station or a peer. Restore is just opening the snapshot, and a standby is a peer
+kept warm by periodic snapshots. This is snapshot-granularity durability across
+whole-node loss, with the recovery-point objective set by the backup cadence.
+
+What is deliberately *not* claimed is log-streaming, LSN-precise point-in-time
+recovery, and this is an honest architectural boundary rather than missing polish.
+The WAL is an ARIES log of *heap page* changes, but the catalog metadata (table
+anchors, `next_rowid`, sequences, policies) lives in separate sidecar files that
+are written directly, not logged. A probe confirms the consequence: take a base
+backup at 100 rows, append 100 more to the primary, replace the base's WAL with
+the primary's longer one, and reopen. The result is 100 rows, not 200: recovery
+replays the heap pages, but the base's `meta` sidecar still anchors the table at
+its 100-row state, so the later rows are unreachable. Replaying the WAL forward
+over a base image therefore cannot land on an arbitrary log position. True PITR
+and physical streaming replication require WAL-logging the catalog metadata too,
+so a follower can be driven entirely by the log. The WAL-truncation primitives
+that such a restore would build on (`picklejar_wal::archive::truncate_to_lsn` and
+`max_lsn`) exist and are tested; the metadata logging is the identified next step,
+and naming the reason is more useful than shipping a subtly wrong restore.
+
 ## Testing strategy
 
 - **Unit tests** in each module. Fast (`cargo test --lib` runs in <50ms today).
