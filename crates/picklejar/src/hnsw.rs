@@ -368,7 +368,7 @@ impl Hnsw {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(b"PJHN");
-        out.extend_from_slice(&3u32.to_le_bytes());
+        out.extend_from_slice(&4u32.to_le_bytes());
         out.push(self.metric.tag());
         for field in [
             self.dim as u64,
@@ -399,15 +399,29 @@ impl Hnsw {
         for &t in &self.tombstones {
             out.push(u8::from(t));
         }
+        // A trailing CRC32 over the whole image. A bit flip anywhere (radiation,
+        // silent corruption) changes the checksum, so a corrupted index is
+        // detected on load and never silently trusted.
+        let checksum = picklejar_storage::crc32::crc32(&out);
+        out.extend_from_slice(&checksum.to_le_bytes());
         out
     }
 
     /// Restore an index from [`to_bytes`](Self::to_bytes) output. Returns `None`
-    /// if the bytes are not a version-3 index image or are truncated, so a
-    /// corrupt sidecar is rejected rather than trusted.
+    /// if the bytes are not a version-4 index image, are truncated, or fail their
+    /// CRC32 check, so a corrupt sidecar is detected and rejected rather than
+    /// trusted.
     #[must_use]
     #[allow(clippy::similar_names)] // the read_u32 / read_u64 / read_f32 readers are deliberately parallel
-    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+    pub fn from_bytes(full: &[u8]) -> Option<Self> {
+        // Verify the trailing CRC32 before parsing anything: this is the line
+        // that makes "never load a silently corrupted index" true.
+        let split = full.len().checked_sub(4)?;
+        let stored = u32::from_le_bytes(full.get(split..)?.try_into().ok()?);
+        if picklejar_storage::crc32::crc32(&full[..split]) != stored {
+            return None;
+        }
+        let bytes = &full[..split];
         if bytes.get(0..4)? != b"PJHN" {
             return None;
         }
@@ -427,7 +441,7 @@ impl Hnsw {
             *p += 4;
             Some(f32::from_le_bytes(b.try_into().ok()?))
         };
-        if read_u32(&mut p)? != 3 {
+        if read_u32(&mut p)? != 4 {
             return None;
         }
         let metric = Metric::from_tag(*bytes.get(p)?)?;
@@ -797,6 +811,30 @@ mod tests {
     // those relations is the accepted research answer to the oracle problem for
     // systems whose exact output you cannot predict. These are those relations
     // for nearest-neighbor search.
+
+    #[test]
+    fn corruption_in_the_serialized_index_is_detected() {
+        // The headline 2B invariant for the durable index: a single flipped bit
+        // anywhere in the image is detected on load, so a corrupted graph is
+        // never silently trusted.
+        let dim = 8;
+        let data = gen_vectors(200, dim, 55);
+        let mut index = Hnsw::new(dim, 16, 100, 9);
+        for v in &data {
+            index.insert(v.clone());
+        }
+        let good = index.to_bytes();
+        assert!(Hnsw::from_bytes(&good).is_some(), "a clean image must load");
+        // Flip one bit at a sampling of positions; every one must be caught.
+        for pos in (0..good.len()).step_by(7) {
+            let mut bad = good.clone();
+            bad[pos] ^= 0x01;
+            assert!(
+                Hnsw::from_bytes(&bad).is_none(),
+                "a flipped bit at byte {pos} must be detected"
+            );
+        }
+    }
 
     #[test]
     fn metamorphic_self_retrieval() {
