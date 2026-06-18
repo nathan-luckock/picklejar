@@ -208,7 +208,48 @@ fn eval_scalar_func(
                 .collect::<Result<Vec<_>>>()?;
             Ok(Some(apply_scalar(name, &vals)?))
         }
+        // Vector / embedding functions (the function forms of the distance
+        // operators, plus dimension and magnitude). NULL in any argument yields
+        // NULL, as with the other value functions.
+        "VECTOR_DIMS" | "L2_NORM" | "L2_DISTANCE" | "COSINE_DISTANCE" | "INNER_PRODUCT" => {
+            let vals = args
+                .iter()
+                .map(|a| eval_with(a, row, columns, runner))
+                .collect::<Result<Vec<_>>>()?;
+            if vals.iter().any(|v| matches!(v, Value::Null)) {
+                return Ok(Some(Value::Null));
+            }
+            Ok(Some(apply_vector_func(name, &vals)?))
+        }
         _ => Ok(None),
+    }
+}
+
+/// Apply a vector / embedding scalar function to already-evaluated arguments.
+/// `VECTOR_DIMS` returns the component count, `L2_NORM` the Euclidean magnitude,
+/// and `L2_DISTANCE` / `COSINE_DISTANCE` / `INNER_PRODUCT` are the function forms
+/// of the `<->` / `<=>` / `<#>` operators (pgvector exposes both spellings).
+fn apply_vector_func(name: &str, vals: &[Value]) -> Result<Value> {
+    let bad = || ExecError::Type(format!("{name} applied to wrong argument types"));
+    match (name, vals) {
+        ("VECTOR_DIMS", [v]) => {
+            let a = as_vector(v)?;
+            Ok(Value::Int(i64::try_from(a.len()).unwrap_or(i64::MAX)))
+        }
+        ("L2_NORM", [v]) => {
+            let a = as_vector(v)?;
+            let sum: f64 = a.iter().map(|x| f64::from(*x) * f64::from(*x)).sum();
+            Ok(Value::Float(sum.sqrt()))
+        }
+        ("L2_DISTANCE", [a, b]) => vector_distance(BinOp::VecL2, a, b),
+        ("COSINE_DISTANCE", [a, b]) => vector_distance(BinOp::VecCosine, a, b),
+        // pgvector's inner_product is the positive dot product; `<#>` is its
+        // negation, so flip the operator's sign back.
+        ("INNER_PRODUCT", [a, b]) => match vector_distance(BinOp::VecInner, a, b)? {
+            Value::Float(neg) => Ok(Value::Float(-neg)),
+            other => Ok(other),
+        },
+        _ => Err(bad()),
     }
 }
 
