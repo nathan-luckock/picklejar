@@ -107,7 +107,8 @@ pub struct IrradiatedOutcome {
     pub orbit: Orbit,
     /// The simulated dwell time in orbit, in days.
     pub orbit_days: f64,
-    /// The size of the irradiated artifact (the on-disk database file).
+    /// The size of the irradiated artifact (every persistent file: the heap, the
+    /// WAL, and the metadata sidecars).
     pub bytes: usize,
     /// The number of bit flips actually injected (a seeded draw whose expected
     /// value is the orbit dose over `orbit_days`).
@@ -128,10 +129,12 @@ pub struct IrradiatedOutcome {
 /// a tenant a silently wrong embedding and never leaks another tenant's row.
 ///
 /// The dose is drawn from the orbit model with expected value
-/// `expected_upsets_per_day(bytes, orbit) * orbit_days`, so a run injects the
-/// radiation the artifact would actually accumulate, not an arbitrary fault count.
-/// Only the heap file is irradiated (the durable served surface); WAL-stream
-/// corruption is a separate model. Every run replays exactly from `seed`.
+/// `expected_upsets_per_day(bytes, orbit) * orbit_days`, where `bytes` is the
+/// total size of every persistent file, so a run injects the radiation the
+/// artifact would actually accumulate, not an arbitrary fault count. Every
+/// persistent file is irradiated: the heap, the WAL, and the metadata sidecars,
+/// each of which carries its own integrity check. Every run replays exactly from
+/// `seed`.
 ///
 /// # Errors
 ///
@@ -171,19 +174,19 @@ fn simulate_irradiated(
     let workload = build_workload(seed, dir)?;
     let live: usize = workload.live.iter().map(BTreeMap::len).sum();
 
-    let bytes = usize::try_from(
-        std::fs::metadata(&workload.path)
-            .map_err(|e| format!("metadata: {e}"))?
-            .len(),
-    )
-    .unwrap_or(usize::MAX);
+    // Every persistent file is subject to radiation, not just the heap: the WAL
+    // and the metadata sidecars (catalog, policies, grants) carry data too, and
+    // each now has its own integrity check (page CRC for the heap, record CRC for
+    // the WAL, header CRC for the sidecars). The dose is set by the total size.
+    let files = persistent_files(dir).map_err(|e| format!("scan: {e}"))?;
+    let bytes: usize = files.iter().map(|(_, len)| *len).sum();
 
     // Draw the number of upsets with expected value equal to the orbit dose. A
     // dedicated RNG keeps the draw independent of the workload's own RNG stream.
     let dose = expected_upsets_per_day(bytes, orbit) * orbit_days;
     let mut rng = Rng::new(seed ^ 0x52AD_1A71_0000_0001);
     let flips = draw_dose(dose, &mut rng);
-    inject_flips(&workload.path, flips, &mut rng).map_err(|e| format!("inject: {e}"))?;
+    inject_flips(&files, &workload.path, flips, &mut rng).map_err(|e| format!("inject: {e}"))?;
 
     let detected = verify_irradiated(seed, &workload)?;
     Ok(IrradiatedOutcome {
@@ -214,29 +217,69 @@ fn draw_dose(dose: f64, rng: &mut Rng) -> usize {
     flips
 }
 
-/// Flip `flips` individual bits, each in the checksum-covered region of a random
-/// page of the file, so every flip is a detectable heap corruption.
-fn inject_flips(path: &Path, flips: usize, rng: &mut Rng) -> std::io::Result<()> {
+/// Every regular file in the database directory, with its size, as the artifact
+/// the radiation acts on: the heap, the WAL, and the metadata sidecars.
+fn persistent_files(dir: &Path) -> std::io::Result<Vec<(PathBuf, usize)>> {
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let meta = entry.metadata()?;
+        if meta.is_file() {
+            if let Ok(len) = usize::try_from(meta.len()) {
+                if len > 0 {
+                    files.push((entry.path(), len));
+                }
+            }
+        }
+    }
+    // A stable order so the seeded flip positions are reproducible across runs.
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(files)
+}
+
+/// Flip `flips` individual bits across the database's files, each file weighted by
+/// its size. A flip in the heap lands in the checksum-covered region of a page; a
+/// flip in any other file lands anywhere, since the WAL and the sidecars checksum
+/// their whole contents. Every flip is therefore detectable corruption.
+fn inject_flips(
+    files: &[(PathBuf, usize)],
+    heap: &Path,
+    flips: usize,
+    rng: &mut Rng,
+) -> std::io::Result<()> {
     use std::io::{Read, Seek, SeekFrom, Write};
-    if flips == 0 {
+    let total: u64 = files.iter().map(|(_, len)| *len as u64).sum();
+    if flips == 0 || total == 0 {
         return Ok(());
     }
-    let mut file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)?;
-    let len = file.metadata()?.len();
-    if len <= PAGE {
-        return Ok(());
-    }
-    let pages = len / PAGE;
     for _ in 0..flips {
-        let page = rng.below(pages);
-        let off = HEADER + rng.below(PAGE - HEADER);
-        let pos = page * PAGE + off;
+        // Choose a file in proportion to its size, then a byte within it.
+        let mut pick = rng.below(total);
+        let mut chosen = &files[0];
+        for f in files {
+            let len = f.1 as u64;
+            if pick < len {
+                chosen = f;
+                break;
+            }
+            pick -= len;
+        }
+        let (path, len) = (&chosen.0, chosen.1 as u64);
+        let pos = if path == heap && len > PAGE {
+            // Heap pages are checksummed past their header; stay in that region so
+            // the flip is always caught by the page CRC.
+            let page = rng.below(len / PAGE);
+            page * PAGE + HEADER + rng.below(PAGE - HEADER)
+        } else {
+            rng.below(len)
+        };
         if pos >= len {
             continue;
         }
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)?;
         file.seek(SeekFrom::Start(pos))?;
         let mut b = [0u8; 1];
         file.read_exact(&mut b)?;
@@ -244,8 +287,9 @@ fn inject_flips(path: &Path, flips: usize, rng: &mut Rng) -> std::io::Result<()>
         b[0] ^= 1u8 << bit;
         file.seek(SeekFrom::Start(pos))?;
         file.write_all(&b)?;
+        file.flush()?;
     }
-    file.flush()
+    Ok(())
 }
 
 /// Reopen the irradiated store and check the silent-corruption invariant: every
