@@ -213,6 +213,11 @@ impl Certificate {
         // shards, the mass-efficient redundancy that replaces heavy hardware copies.
         checks.push(erasure_self_heal());
 
+        // The live engine heals itself: a protected database, with corrupt heap
+        // pages, reconstructs them from parity on `open_resilient` and serves the
+        // committed data exactly.
+        checks.push(live_heap_self_heal());
+
         Self { checks }
     }
 
@@ -249,8 +254,9 @@ impl Certificate {
         s.push_str("PICKLEJAR AI MEMORY LAYER RELIABILITY CERTIFICATE\n");
         s.push_str("fault model: single-event upsets injected into the serialized index, into\n");
         s.push_str("      whole-store pages through SQL, into an irradiated multi-tenant\n");
-        s.push_str("      workload at an orbit's upset rate, and into erasure-coded shards that\n");
-        s.push_str("      self-heal from parity\n");
+        s.push_str("      workload at an orbit's upset rate, into erasure-coded shards that\n");
+        s.push_str("      self-heal from parity, and into a live heap that reconstructs its\n");
+        s.push_str("      corrupt pages from parity on open\n");
         s.push_str("method: deterministic, every check reproducible from a fixed seed\n");
         s.push_str("note: crash durability (100k sims) and tenant isolation are certified\n");
         s.push_str("      separately and at larger scale by the `dst` and `vecsim` binaries\n");
@@ -588,6 +594,109 @@ fn erasure_self_heal() -> Check {
              {wrong} served wrong; survives 4 failures at +40% storage vs +400% for copies"
         ),
         passed: wrong == 0,
+    }
+}
+
+/// The live database heals itself, certified end to end: build a small vector
+/// store, write a parity snapshot with [`Database::protect`], corrupt one heap
+/// page in every stripe, reopen with [`Database::open_resilient`], and require
+/// every committed row and embedding to come back exactly. This certifies the
+/// engine-level payoff, not just the standalone block store.
+fn live_heap_self_heal() -> Check {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    const PAGE: u64 = 8192;
+    let name = "live heap self-heal".to_string();
+    let base = std::env::temp_dir().join(format!("pj-cert-heal-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let _ = std::fs::create_dir_all(&base);
+    let path = base.join("m.db");
+    let rows_n = 800i64;
+    let embed = |i: i64| -> Value {
+        let f = |x: i64| f32::from(i16::try_from(x).unwrap_or(0));
+        Value::Vector(vec![f(i), f(i * 2), f(i * 3)])
+    };
+
+    let fail = |detail: String| Check {
+        name: name.clone(),
+        detail,
+        passed: false,
+    };
+
+    // Build and protect.
+    let protected = {
+        let mut db = match Database::open(&path) {
+            Ok(db) => db,
+            Err(e) => return fail(format!("open: {e}")),
+        };
+        if let Err(e) = db.execute("CREATE TABLE m (id INT, e VECTOR(3))") {
+            return fail(format!("create: {e}"));
+        }
+        for i in 1..=rows_n {
+            if let Err(e) = db.execute(&format!(
+                "INSERT INTO m VALUES ({i}, '[{i}, {}, {}]')",
+                i * 2,
+                i * 3
+            )) {
+                return fail(format!("insert: {e}"));
+            }
+        }
+        match db.protect(6, 3) {
+            Ok(report) => report.protected_pages,
+            Err(e) => return fail(format!("protect: {e}")),
+        }
+    };
+
+    // Corrupt one page in each six-page stripe, at a fixed in-range offset.
+    let pages = std::fs::metadata(&path).map_or(0, |meta| meta.len() / PAGE);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+    {
+        let mut s = 0u64;
+        while s * 6 + 1 < pages {
+            let pos = (s * 6 + 1) * PAGE + 100;
+            if f.seek(SeekFrom::Start(pos)).is_ok() {
+                let mut b = [0u8; 1];
+                if f.read_exact(&mut b).is_ok() {
+                    b[0] ^= 0xFF;
+                    let _ = f.seek(SeekFrom::Start(pos));
+                    let _ = f.write_all(&b);
+                }
+            }
+            s += 1;
+        }
+    }
+
+    // Heal on open and verify every row.
+    let healed = {
+        let mut db = match Database::open_resilient(&path) {
+            Ok(db) => db,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&base);
+                return fail(format!("open_resilient: {e}"));
+            }
+        };
+        match db.execute("SELECT id, e FROM m ORDER BY id") {
+            Ok(QueryOutcome::Rows { rows, .. }) => {
+                rows.len() == usize::try_from(rows_n).unwrap_or(0)
+                    && rows.iter().enumerate().all(|(idx, row)| {
+                        let i = i64::try_from(idx).unwrap_or(0) + 1;
+                        row.first() == Some(&Value::Int(i)) && row.get(1) == Some(&embed(i))
+                    })
+            }
+            _ => false,
+        }
+    };
+    let _ = std::fs::remove_dir_all(&base);
+
+    Check {
+        name,
+        detail: format!(
+            "{protected} heap pages protected (k=6, m=3); one page corrupted per stripe, \
+             all reconstructed on open and {rows_n} rows served exactly"
+        ),
+        passed: healed,
     }
 }
 
