@@ -56,6 +56,12 @@ use crate::security::{self, RoleAttrs, SecurityCatalog};
 /// Buffer pool size in pages. Generous for the capstone's working set.
 const POOL_PAGES: usize = 256;
 
+/// Default data shards per stripe for `PROTECT` (a stripe of 8 heap pages).
+const DEFAULT_PROTECT_K: usize = 8;
+/// Default parity shards per stripe for `PROTECT` (survives 2 bad pages per
+/// stripe at a 25% overhead).
+const DEFAULT_PROTECT_M: usize = 2;
+
 /// Per-table storage descriptor. The catalog holds the logical schema (the
 /// column types are derived from it on demand); this holds the physical
 /// anchors the engine needs to reopen the table.
@@ -494,6 +500,28 @@ impl Database {
             data_shards: k,
             parity_shards: m,
             parity_bytes,
+        })
+    }
+
+    /// Handle the `PROTECT` statement: refresh the parity snapshot with the given
+    /// (or default) shard counts and return a one-row report.
+    fn run_protect(&mut self, k: Option<u32>, m: Option<u32>) -> Result<QueryOutcome> {
+        let k = k.map_or(DEFAULT_PROTECT_K, |v| v as usize);
+        let m = m.map_or(DEFAULT_PROTECT_M, |v| v as usize);
+        let report = self.protect(k, m)?;
+        Ok(QueryOutcome::Rows {
+            columns: vec![
+                "protected_pages".to_string(),
+                "data_shards".to_string(),
+                "parity_shards".to_string(),
+                "parity_bytes".to_string(),
+            ],
+            rows: vec![vec![
+                Value::Int(i64::try_from(report.protected_pages).unwrap_or(-1)),
+                Value::Int(i64::try_from(report.data_shards).unwrap_or(-1)),
+                Value::Int(i64::try_from(report.parity_shards).unwrap_or(-1)),
+                Value::Int(i64::try_from(report.parity_bytes).unwrap_or(-1)),
+            ]],
         })
     }
 
@@ -962,6 +990,7 @@ impl Database {
             Statement::Truncate { ref table } => self.truncate_table(table),
             Statement::Analyze { ref table } => self.run_analyze(table.as_deref()),
             Statement::Vacuum { ref table } => self.run_vacuum(table.as_deref()),
+            Statement::Protect { k, m } => self.run_protect(k, m),
             Statement::AlterTable {
                 ref table,
                 ref action,
@@ -1440,6 +1469,14 @@ impl Database {
             {
                 return Err(DbError::PermissionDenied(
                     "permission denied to manage roles".into(),
+                ));
+            }
+            // PROTECT reads every heap page to compute parity, so it is a
+            // whole-database operation reserved for a superuser (one was already
+            // cleared above).
+            Statement::Protect { .. } => {
+                return Err(DbError::PermissionDenied(
+                    "PROTECT requires a superuser".into(),
                 ));
             }
             // CREATE TABLE / INDEX, DROP VIEW, bare ANALYZE/VACUUM, transaction

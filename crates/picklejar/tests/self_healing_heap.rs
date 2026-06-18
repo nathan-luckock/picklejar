@@ -106,6 +106,74 @@ fn the_heap_heals_corrupt_pages_from_parity_on_open() {
 }
 
 #[test]
+fn protect_statement_writes_parity_and_heals() {
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("p.db");
+    let n = 1500i64;
+    {
+        let mut db = Database::open(&path).expect("open");
+        db.execute("CREATE TABLE m (id INT, e VECTOR(3))").unwrap();
+        for i in 1..=n {
+            db.execute(&format!(
+                "INSERT INTO m VALUES ({i}, '[{i}, {}, {}]')",
+                i * 2,
+                i * 3
+            ))
+            .unwrap();
+        }
+        // PROTECT through SQL, with explicit shard counts, returns a report row.
+        let report = rows(&mut db, "PROTECT WITH (k = 6, m = 3)");
+        assert_eq!(report.len(), 1, "PROTECT returns one report row");
+        match report[0].first() {
+            Some(Value::Int(pages)) => assert!(*pages > 1, "should protect pages"),
+            other => panic!("expected protected_pages int, got {other:?}"),
+        }
+        assert!(
+            db.parity_path().exists(),
+            "PROTECT wrote the parity sidecar"
+        );
+    }
+
+    // Corrupt one page per stripe and confirm open_resilient heals it.
+    let pages = std::fs::metadata(&path).expect("meta").len() / PAGE;
+    let mut seed = 0xF00Du64;
+    let mut s = 0u64;
+    while s * 6 + 1 < pages {
+        corrupt_page(&path, s * 6 + 1, &mut seed);
+        s += 1;
+    }
+    let mut db = Database::open_resilient(&path).expect("resilient open");
+    let got = rows(&mut db, "SELECT id FROM m ORDER BY id LIMIT 3");
+    assert_eq!(
+        got,
+        vec![
+            vec![Value::Int(1)],
+            vec![Value::Int(2)],
+            vec![Value::Int(3)]
+        ]
+    );
+}
+
+#[test]
+fn protect_requires_a_superuser() {
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("perm.db");
+    let mut db = Database::open(&path).expect("open");
+    db.execute("CREATE TABLE t (id INT)").unwrap();
+    db.execute("INSERT INTO t VALUES (1)").unwrap();
+    db.execute("CREATE ROLE bob LOGIN").unwrap();
+
+    // The bootstrap superuser may protect.
+    assert!(db.execute("PROTECT").is_ok());
+    // An ordinary role may not: PROTECT reads the whole heap.
+    db.set_session_user("bob");
+    assert!(
+        db.execute("PROTECT").is_err(),
+        "a non-superuser must not be able to PROTECT"
+    );
+}
+
+#[test]
 fn open_resilient_without_a_parity_file_is_just_open() {
     // No protect, no parity sidecar: open_resilient behaves exactly like open.
     let dir = tempdir().expect("tempdir");
