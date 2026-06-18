@@ -6037,6 +6037,26 @@ mod tests {
     }
 
     #[test]
+    fn vector_scalar_functions_compute() {
+        let (_dir, mut db) = db();
+        db.execute("CREATE TABLE d (id INT, e VECTOR(3))").unwrap();
+        db.execute("INSERT INTO d VALUES (1, '[3, 4, 0]')").unwrap();
+        // vector_dims and l2_norm (|[3,4,0]| = 5).
+        let (_c, rows) = query(&mut db, "SELECT vector_dims(e), l2_norm(e) FROM d");
+        assert_eq!(rows[0][0], Value::Int(3));
+        match rows[0][1] {
+            Value::Float(x) => assert!((x - 5.0).abs() < 1e-9, "l2_norm was {x}"),
+            ref other => panic!("expected float, got {other:?}"),
+        }
+        // The function forms of the operators agree with the operators.
+        let l2 = scalar_float(&mut db, "SELECT l2_distance(e, '[0, 0, 0]') FROM d");
+        assert!((l2 - 5.0).abs() < 1e-9, "l2_distance was {l2}");
+        // inner_product is the positive dot product: [3,4,0].[1,1,1] = 7.
+        let ip = scalar_float(&mut db, "SELECT inner_product(e, '[1, 1, 1]') FROM d");
+        assert!((ip - 7.0).abs() < 1e-9, "inner_product was {ip}");
+    }
+
+    #[test]
     fn vector_distance_dimension_mismatch_errors() {
         let (_dir, mut db) = db();
         db.execute("CREATE TABLE d (id INT, e VECTOR(3))").unwrap();
