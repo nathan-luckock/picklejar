@@ -1002,6 +1002,57 @@ mod tests {
     }
 
     #[test]
+    fn vector_distance_operators_satisfy_metric_axioms() {
+        // Call the distance evaluator directly over thousands of random vector
+        // triples and assert the mathematical laws each metric must obey. Running
+        // at the eval layer (not through SQL) keeps it fast.
+        fn vd(op: BinOp, a: &[f32], b: &[f32]) -> f64 {
+            match vector_distance(op, &Value::Vector(a.to_vec()), &Value::Vector(b.to_vec())) {
+                Ok(Value::Float(x)) => x,
+                other => panic!("expected a float distance, got {other:?}"),
+            }
+        }
+        let mut state = 0xC0FF_EE12_3456_789Au64;
+        let mut next = || {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        };
+        let mut rv = || -> Vec<f32> {
+            (0..6)
+                .map(|_| f32::from(i16::try_from(next() % 41).unwrap()) - 20.0)
+                .collect()
+        };
+        for _ in 0..5000 {
+            let (a, b, c) = (rv(), rv(), rv());
+            // L2 and L1 are true metrics: non-negative, symmetric, zero only on
+            // self, and obeying the triangle inequality.
+            for op in [BinOp::VecL2, BinOp::VecL1] {
+                let dab = vd(op, &a, &b);
+                let dba = vd(op, &b, &a);
+                let daa = vd(op, &a, &a);
+                let dac = vd(op, &a, &c);
+                let dbc = vd(op, &b, &c);
+                assert!(dab >= 0.0, "{op:?} must be non-negative");
+                assert!((dab - dba).abs() < 1e-9, "{op:?} must be symmetric");
+                assert!(daa.abs() < 1e-9, "{op:?} of a vector with itself must be 0");
+                assert!(
+                    dac <= dab + dbc + 1e-4,
+                    "{op:?} must satisfy the triangle inequality"
+                );
+            }
+            // Cosine distance always lands in [0, 2].
+            let cos = vd(BinOp::VecCosine, &a, &b);
+            assert!(
+                (-1e-6..=2.0 + 1e-6).contains(&cos),
+                "cosine distance must be in [0, 2], was {cos}"
+            );
+        }
+    }
+
+    #[test]
     fn literals_and_columns() {
         assert_eq!(ev("42"), Value::Int(42));
         assert_eq!(ev("id"), Value::Int(5));
