@@ -92,9 +92,11 @@ the executor, and the PostgreSQL wire protocol. The SQL surface is deep
 (joins, window functions, set operations, CTEs, subqueries, a full everyday
 type system, roles and row-level security) and still growing. Durability is
 proven by 100,000 deterministic crash-and-recover simulations. The AI memory
-layer has begun: a native `VECTOR(n)` embedding type ships, with distance
-operators and isolated similarity search next. [sprints.md](sprints.md) tracks
-what shipped in what order.
+layer is built on this foundation: a native `VECTOR(n)` type, four distance
+metrics with brute-force KNN, row-level-security-filtered similarity search, an
+HNSW index, and a fault simulator that proves durability and isolation together.
+The remaining step is wiring the HNSW index into the planner.
+[sprints.md](sprints.md) tracks what shipped in what order.
 
 ## Architecture
 
@@ -778,8 +780,10 @@ table, `EXPLAIN <select>` prints the plan, and backslash meta-commands
 
 ### HTTP API server
 
-`picklejar-server` exposes the engine over HTTP/JSON so a browser studio can use
-it. Because the engine is `!Send` (the buffer pool holds `Rc`), the server is
+`picklejar-server` exposes the engine over HTTP/JSON, an alternative to the wire
+protocol for clients that prefer a simple request/response API (a browser, a
+service, a notebook). Because the engine is `!Send` (the buffer pool holds
+`Rc`), the server is
 single-threaded: one accept loop owns one `Database` and processes requests in
 order. The HTTP layer and the JSON writer are hand-written, so the database and
 its API have no external dependencies beyond CLI and logging plumbing.
@@ -792,8 +796,8 @@ its API have no external dependencies beyond CLI and logging plumbing.
 - Responses carry permissive CORS headers so a frontend on a different origin
   (a Vite dev server) can call the API.
 
-This is the boundary the studio UI is built on: a SQL editor posts to
-`/api/query` and renders the tagged result.
+Any client can drive the engine this way: post SQL to `/api/query` and render
+the tagged result.
 
 ### PostgreSQL wire protocol
 

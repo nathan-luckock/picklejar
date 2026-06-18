@@ -30,8 +30,9 @@ every task to a pull request that is squash-merged once the checks
 | 9 | Executor and CLI: row codec, Volcano operators, joins, aggregates, persistence | Shipped |
 | 10 | Deepen the engine: full DML, constraints, the everyday type system, sequences, views, subqueries, window functions, set operations, CTEs | Shipped |
 | 11 | Make it real: PostgreSQL wire protocol, deterministic and differential testing, multi-connection concurrency, VACUUM | Shipped |
-| 12 | Studio: HTTP API and web UI | Planned |
-| 13 | Demo, write-up, presentation | Planned |
+| 12 | Security: roles, GRANT/REVOKE, ownership, SCRAM auth, row-level security | Shipped |
+| 13 | AI memory layer: VECTOR type, distance operators + KNN, RLS-filtered similarity, the vecsim simulator, HNSW index | Shipped |
+| 14 | Wire the HNSW index into the planner; the orbital and edge direction | Planned |
 
 ## What shipped, by sprint
 
@@ -120,18 +121,43 @@ and differential testing against SQLite, multi-connection concurrency via an
 engine actor with transaction exclusivity, and `VACUUM` for MVCC space
 reclamation.
 
+### Sprint 12 - Security
+
+Roles and privileges (`CREATE ROLE` / `CREATE USER` with attributes, `GRANT` /
+`REVOKE`, ownership, role membership, `SET ROLE`), SCRAM-SHA-256 authentication
+on the wire (the SHA-256, HMAC, and PBKDF2 primitives in-tree), and row-level
+security (`CREATE POLICY` with `USING` and `WITH CHECK`, enforced in the engine).
+All of it persists across a restart.
+
+### Sprint 13 - AI memory layer
+
+The pivot, in code (see [Mission and direction](design.md#mission-and-direction)
+and [The vector memory layer](design.md#the-vector-memory-layer)): a native
+`VECTOR(n)` type, the four distance operators (`<->`, `<=>`, `<#>`, `<+>`) and
+their function forms, brute-force nearest-neighbor search, row-level-security-
+filtered similarity (a tenant's KNN can only ever rank its own vectors), an HNSW
+index (four metrics, insert/search/delete, durable), and the `vecsim` simulator
+that proves durability and isolation of the memory layer together under crash.
+Durability is verified at 100,000 deterministic crash simulations.
+
 ## Direction
 
-A from-scratch engine that behaves like PostgreSQL, with a studio on top:
+A from-scratch engine that speaks PostgreSQL over the wire, turned toward a
+specific mission: the durable, isolated memory layer for AI in environments that
+cannot be physically serviced (orbital and edge data centers).
 
-1. The engine is deep and speaks Postgres over the wire (sprints 10-11).
-2. Next: a studio, an HTTP API over the engine and a web UI with a SQL editor,
-   a results grid, a schema browser, a live cost-based plan visualizer, and a
-   crash-recovery panel.
+1. The relational engine is deep, crash-proven, and speaks Postgres (sprints
+   0-11).
+2. The memory layer is built on it: vectors, similarity search, engine-enforced
+   isolation, and a fault simulator (sprints 12-13).
+3. Next: wire the HNSW index into the planner so nearest-neighbor queries are
+   fast at scale while the row-level-security filter is applied before the
+   top-k, preserving isolation; then the deployment story for unreachable
+   infrastructure.
 
 ## Out of scope
 
-- Distributed replication and point-in-time recovery (candidate future work).
-- Right and full outer joins (inner and left are supported).
-- Authentication and TLS on the wire (candidate future work before exposing
-  the server publicly).
+- Distributed replication and point-in-time recovery (candidate future work,
+  built on the existing WAL).
+- TLS on the wire (SCRAM authentication is in; transport encryption is the next
+  hardening step before exposing the server publicly).

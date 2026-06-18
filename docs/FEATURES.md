@@ -11,16 +11,17 @@ The complete SQL and engine surface.
 ---
 
 For the reasoning behind each decision, see [design.md](design.md); for a quick
-tour, see the [README](../README.md). For where the project is headed - the
-durable, isolated memory layer for AI in unreachable environments - see
+tour, see the [README](../README.md). For where the project is headed, the
+durable, isolated memory layer for AI in unreachable environments, see
 [Mission and direction](design.md#mission-and-direction).
 
-This page is the *shipped* surface. The AI memory layer is now landing on it: a
-native `VECTOR(n)` type ships today (durable embedding storage). The roadmap on
-top of that is distance operators and nearest-neighbor search (KNN), then
-row-level-security-filtered similarity (isolation enforced by the engine, not app
-code), then a fault simulator that proves zero data lost and zero data leaked
-under simulated data-center chaos.
+This page is the *shipped* surface. The AI memory layer is built on it: a native
+`VECTOR(n)` type, the four distance operators and their function forms,
+brute-force nearest-neighbor search, row-level-security-filtered similarity
+(isolation enforced by the engine, not application code), an HNSW index, and a
+fault simulator (`vecsim`) that proves durability and isolation together under
+simulated crash. The one remaining step is wiring the HNSW index into the planner
+so nearest-neighbor queries use it automatically.
 
 ## SQL
 
