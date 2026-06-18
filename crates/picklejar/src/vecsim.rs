@@ -24,9 +24,11 @@
 //! the stricter fault-disk model behind the storage-level `dst` simulator.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::hnsw::Metric;
+use crate::radiation::{expected_upsets_per_day, Orbit};
 use crate::{ast, Database, QueryOutcome, Value};
 
 /// `SplitMix64`: a small, fast, fully deterministic PRNG, seeded once per run.
@@ -98,8 +100,236 @@ pub fn run_seed(seed: u64) -> Result<Outcome, String> {
     result
 }
 
+/// What one irradiated run injected and observed.
+#[derive(Debug, Clone, Copy)]
+pub struct IrradiatedOutcome {
+    /// The orbit whose single-event-upset rate set the dose.
+    pub orbit: Orbit,
+    /// The simulated dwell time in orbit, in days.
+    pub orbit_days: f64,
+    /// The size of the irradiated artifact (the on-disk database file).
+    pub bytes: usize,
+    /// The number of bit flips actually injected (a seeded draw whose expected
+    /// value is the orbit dose over `orbit_days`).
+    pub flips: usize,
+    /// Whether the engine detected the corruption (an error surfaced on reopen or
+    /// on a query) rather than the flips landing where they changed no answer.
+    pub detected: bool,
+    /// Live embeddings the run was built around.
+    pub live: usize,
+}
+
+/// Run one seeded workload, then irradiate its on-disk bytes and reopen.
+///
+/// The bytes are corrupted at the single-event upset rate of `orbit` for
+/// `orbit_days` of dwell time, then the store is reopened and checked against the
+/// one invariant that matters in an unreachable environment: the engine either
+/// detects the corruption or it changed no committed answer, but it never serves
+/// a tenant a silently wrong embedding and never leaks another tenant's row.
+///
+/// The dose is drawn from the orbit model with expected value
+/// `expected_upsets_per_day(bytes, orbit) * orbit_days`, so a run injects the
+/// radiation the artifact would actually accumulate, not an arbitrary fault count.
+/// Only the heap file is irradiated (the durable served surface); WAL-stream
+/// corruption is a separate model. Every run replays exactly from `seed`.
+///
+/// # Errors
+///
+/// Returns `Err` if the working directory cannot be created, if a setup statement
+/// fails, or if the irradiated engine served data that differs from what was
+/// committed without raising an error (a silent-corruption invariant violation).
+pub fn run_seed_irradiated(
+    seed: u64,
+    orbit: Orbit,
+    orbit_days: f64,
+) -> Result<IrradiatedOutcome, String> {
+    // A process-unique suffix so concurrent runs of the same seed never share a
+    // directory. The location does not affect the simulated logic, only where the
+    // bytes live, so this keeps each run reproducible while making it isolated.
+    static RUN_SEQ: AtomicU64 = AtomicU64::new(0);
+    let uniq = RUN_SEQ.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("pj-vecrad-{}-{seed}-{uniq}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("create_dir_all: {e}"))?;
+    let result = simulate_irradiated(seed, &dir, orbit, orbit_days);
+    let _ = std::fs::remove_dir_all(&dir);
+    result
+}
+
+/// The slotted-page size; flips land strictly inside the checksum-covered region
+/// of a page (past the header) so a corrupted heap byte is always detectable.
+const PAGE: u64 = 8192;
+/// Bytes at the start of each page that the page checksum does not cover.
+const HEADER: u64 = 12;
+
+fn simulate_irradiated(
+    seed: u64,
+    dir: &Path,
+    orbit: Orbit,
+    orbit_days: f64,
+) -> Result<IrradiatedOutcome, String> {
+    let workload = build_workload(seed, dir)?;
+    let live: usize = workload.live.iter().map(BTreeMap::len).sum();
+
+    let bytes = usize::try_from(
+        std::fs::metadata(&workload.path)
+            .map_err(|e| format!("metadata: {e}"))?
+            .len(),
+    )
+    .unwrap_or(usize::MAX);
+
+    // Draw the number of upsets with expected value equal to the orbit dose. A
+    // dedicated RNG keeps the draw independent of the workload's own RNG stream.
+    let dose = expected_upsets_per_day(bytes, orbit) * orbit_days;
+    let mut rng = Rng::new(seed ^ 0x52AD_1A71_0000_0001);
+    let flips = draw_dose(dose, &mut rng);
+    inject_flips(&workload.path, flips, &mut rng).map_err(|e| format!("inject: {e}"))?;
+
+    let detected = verify_irradiated(seed, &workload)?;
+    Ok(IrradiatedOutcome {
+        orbit,
+        orbit_days,
+        bytes,
+        flips,
+        detected,
+        live,
+    })
+}
+
+/// A seeded draw with expected value `dose`: the integer part, plus one more with
+/// probability equal to the fractional part. Over a sweep this lands the true
+/// expected dose without ever injecting a non-integer number of flips.
+fn draw_dose(dose: f64, rng: &mut Rng) -> usize {
+    let whole = dose.floor();
+    let frac = dose - whole;
+    #[allow(clippy::cast_precision_loss, clippy::cast_sign_loss)]
+    #[allow(clippy::cast_possible_truncation)]
+    let mut flips = whole.max(0.0) as usize;
+    // u64 -> [0,1) without bias that matters at this resolution.
+    #[allow(clippy::cast_precision_loss)]
+    let roll = rng.next_u64() as f64 / u64::MAX as f64;
+    if roll < frac {
+        flips += 1;
+    }
+    flips
+}
+
+/// Flip `flips` individual bits, each in the checksum-covered region of a random
+/// page of the file, so every flip is a detectable heap corruption.
+fn inject_flips(path: &Path, flips: usize, rng: &mut Rng) -> std::io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    if flips == 0 {
+        return Ok(());
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)?;
+    let len = file.metadata()?.len();
+    if len <= PAGE {
+        return Ok(());
+    }
+    let pages = len / PAGE;
+    for _ in 0..flips {
+        let page = rng.below(pages);
+        let off = HEADER + rng.below(PAGE - HEADER);
+        let pos = page * PAGE + off;
+        if pos >= len {
+            continue;
+        }
+        file.seek(SeekFrom::Start(pos))?;
+        let mut b = [0u8; 1];
+        file.read_exact(&mut b)?;
+        let bit = u32::try_from(rng.below(8)).expect("0..8 fits u32");
+        b[0] ^= 1u8 << bit;
+        file.seek(SeekFrom::Start(pos))?;
+        file.write_all(&b)?;
+    }
+    file.flush()
+}
+
+/// Reopen the irradiated store and check the silent-corruption invariant: every
+/// query either errors (the corruption was detected) or returns exactly the
+/// committed, correctly-isolated data. Returns whether any detection occurred, or
+/// an error naming the first silently-wrong answer.
+fn verify_irradiated(seed: u64, w: &Workload) -> Result<bool, String> {
+    // Recovery refusing to open the corrupted store counts as detection, not a
+    // silent failure.
+    let Ok(mut db) = Database::open(&w.path) else {
+        return Ok(true);
+    };
+
+    let live_total: usize = w.live.iter().map(BTreeMap::len).sum();
+    match db.execute("SELECT id FROM memories") {
+        Err(_) => return Ok(true),
+        Ok(QueryOutcome::Rows { rows, .. }) => {
+            if rows.len() != live_total {
+                return Err(format!(
+                    "seed {seed}: irradiated: silent row-count change, expected {live_total}, found {}",
+                    rows.len()
+                ));
+            }
+        }
+        Ok(_) => {}
+    }
+
+    let probe = ast::format_vector(&vec![0.0f32; w.dim]);
+    let mut detected = false;
+    for (t, want) in w.live.iter().enumerate() {
+        db.set_session_user(&format!("t{t}"));
+        match db.execute("SELECT id, e FROM memories ORDER BY id") {
+            Err(_) => {
+                detected = true;
+                continue;
+            }
+            Ok(QueryOutcome::Rows { rows, .. }) => {
+                let expected: Vec<Vec<Value>> = want
+                    .iter()
+                    .map(|(id, v)| vec![Value::Int(*id), Value::Vector(v.clone())])
+                    .collect();
+                if rows != expected {
+                    return Err(format!(
+                        "seed {seed}: tenant t{t}: irradiated silent corruption, served data differs from committed without an error"
+                    ));
+                }
+            }
+            Ok(_) => {}
+        }
+        match db.execute(&format!(
+            "SELECT tenant FROM memories ORDER BY e <-> '{probe}' LIMIT 1000"
+        )) {
+            Err(_) => detected = true,
+            Ok(QueryOutcome::Rows { rows, .. }) => {
+                let mine = Value::Text(format!("t{t}"));
+                if rows.iter().any(|row| row.first() != Some(&mine)) {
+                    return Err(format!(
+                        "seed {seed}: tenant t{t}: irradiated KNN leaked another tenant's row"
+                    ));
+                }
+            }
+            Ok(_) => {}
+        }
+    }
+    Ok(detected)
+}
+
+/// The committed state of one finished workload, with the engine closed and its
+/// bytes resting on disk. Both the clean reopen check and the irradiated check
+/// start from here, so the two share an identical workload for a given seed.
+struct Workload {
+    path: PathBuf,
+    live: Oracle,
+    dim: usize,
+    tenants: usize,
+    committed: usize,
+    rolled_back: usize,
+}
+
+/// Build and commit one seeded multi-tenant workload through the real engine,
+/// then close it (the crash). Returns the oracle of what a correct database must
+/// hold, alongside the on-disk path the bytes now live at.
 #[allow(clippy::too_many_lines)]
-fn simulate(seed: u64, dir: &Path) -> Result<Outcome, String> {
+fn build_workload(seed: u64, dir: &Path) -> Result<Workload, String> {
     let mut rng = Rng::new(seed);
     let dim = usize::try_from(2 + rng.below(6)).expect("small");
     let tenants = usize::try_from(2 + rng.below(3)).expect("small");
@@ -161,8 +391,29 @@ fn simulate(seed: u64, dir: &Path) -> Result<Outcome, String> {
         }
     }
 
-    // The crash: drop the engine and reopen, which runs WAL recovery.
+    // The crash: drop the engine, leaving the committed bytes on disk.
     drop(db);
+    Ok(Workload {
+        path,
+        live,
+        dim,
+        tenants,
+        committed,
+        rolled_back,
+    })
+}
+
+/// Run one seeded crash-and-recover simulation: build the workload, reopen
+/// (running WAL recovery), and verify durability and isolation.
+fn simulate(seed: u64, dir: &Path) -> Result<Outcome, String> {
+    let Workload {
+        path,
+        live,
+        dim,
+        tenants,
+        committed,
+        rolled_back,
+    } = build_workload(seed, dir)?;
     let mut db = Database::open(&path).map_err(|e| format!("reopen: {e}"))?;
 
     // Durability, from the superuser's unfenced view: exactly the live rows
@@ -312,7 +563,54 @@ fn rows(db: &mut Database, sql: &str) -> Result<Vec<Vec<Value>>, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::run_seed;
+    use super::{run_seed, run_seed_irradiated, Orbit};
+
+    #[test]
+    fn irradiated_runs_never_serve_silent_corruption() {
+        // A heavy dose so the flips reliably land on live heap pages across the
+        // sweep. Every run must uphold the invariant (an Ok return), and at least
+        // one must have actually detected corruption, proving the fault path is
+        // exercised rather than always missing the data.
+        let mut detected = 0usize;
+        let mut flips_total = 0usize;
+        for seed in 0..16 {
+            let outcome = run_seed_irradiated(seed, Orbit::Geo, 500.0).unwrap_or_else(|e| {
+                panic!("seed {seed}: silent-corruption invariant violated: {e}")
+            });
+            if outcome.detected {
+                detected += 1;
+            }
+            flips_total += outcome.flips;
+        }
+        assert!(
+            flips_total > 0,
+            "the dose never produced a single upset; the test exercised nothing"
+        );
+        assert!(
+            detected > 0,
+            "no irradiated run detected corruption; the dose never landed on data"
+        );
+    }
+
+    #[test]
+    fn a_light_dose_mostly_passes_cleanly() {
+        // A realistic low-Earth-orbit dose over a short dwell: the invariant must
+        // still hold for every seed, whether or not any flip happened to land.
+        for seed in 0..16 {
+            run_seed_irradiated(seed, Orbit::Leo, 1.0)
+                .unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+        }
+    }
+
+    #[test]
+    fn the_same_irradiated_seed_is_reproducible() {
+        let a = run_seed_irradiated(7, Orbit::Geo, 250.0).expect("seed 7");
+        let b = run_seed_irradiated(7, Orbit::Geo, 250.0).expect("seed 7 again");
+        assert_eq!(a.bytes, b.bytes);
+        assert_eq!(a.flips, b.flips);
+        assert_eq!(a.detected, b.detected);
+        assert_eq!(a.live, b.live);
+    }
 
     #[test]
     fn a_sweep_of_seeds_holds_durability_and_isolation() {
