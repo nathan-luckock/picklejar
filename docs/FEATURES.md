@@ -159,9 +159,13 @@ so nearest-neighbor queries use it automatically.
   searched by distance, so it gets an approximate-nearest-neighbor index of its
   own instead: an in-memory, seeded HNSW graph (`crates/picklejar/src/hnsw.rs`)
   with build and top-k search, recall measured against the brute-force baseline.
-  The structure is in place; wiring it into the planner so `ORDER BY col <-> q
-  LIMIT k` uses it, with the row-level-security filter applied before the top-k,
-  is the next step.)
+  This index is wired into SQL through an opt-in path: with it enabled, an
+  `ORDER BY col <-> :q LIMIT k` is served from a cached HNSW index instead of an
+  exact scan, keyed by `(role, table, column, metric)` and cleared on any write.
+  It engages only when row-level security does not apply (an RLS-fenced query
+  carries a folded WHERE and falls back to the exact, fenced path), so the
+  acceleration can never widen what a tenant can see. `vecsqlbench` measures the
+  warm speedup, roughly 150x over the exact scan on a representative table.)
 - **Concurrency control** - MVCC with snapshot isolation and version chains.
 - **Interfaces** - an embeddable library, a `psql`-style CLI, and a
   PostgreSQL-wire-protocol server (simple + extended, with `$N` parameters).

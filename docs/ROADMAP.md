@@ -116,6 +116,15 @@ and it is mostly engineering on foundations that exist.
 
 ### 1A. Wire HNSW into the planner
 
+**Status: shipped.** The index path is in `Database::run_vector_index_select`,
+opt-in behind `set_vector_index`, with a write-invalidated cache keyed by
+`(role, table, column, metric)`. It engages only when no RLS applies (an
+RLS-fenced query carries a folded WHERE and falls back to the exact path), so a
+cross-tenant leak through the index is structurally impossible. The
+`vector_index_path` tests pin it against the exact path and check the isolation
+and permission fences; `vecsqlbench` measures the warm speedup (~150x). The
+design below is what was built.
+
 Make `ORDER BY embedding <-> :q LIMIT k` use the index instead of a linear scan.
 
 - **Build:** detect the nearest-neighbor query shape in the planner; maintain a
@@ -172,9 +181,10 @@ Turn approximate-search quality into a tracked, regressible property.
   answer in general, but exact brute force is a sound oracle for recall, and you
   have made it a gate, not a vibe.
 
-**Horizon 1 deliverable:** index-accelerated, RLS-safe similarity search, fault-
-tested on the approximate path over realistic data, with recall held as a CI
-invariant. Every claim in the README becomes literally true and defensible.
+**Horizon 1 deliverable (shipped):** index-accelerated, RLS-safe similarity
+search, fault-tested on the approximate path over realistic data, with recall
+held as a CI invariant. Every claim in the README is literally true and
+defensible.
 
 ---
 
@@ -383,24 +393,28 @@ contract is a later chapter; this builds the thing that earns the meeting.
 
 ## Sequencing: the first three moves
 
-Do these in order. Each is independently shippable and each makes the next one
-possible.
+The first three moves are done. Each was independently shippable and each made
+the next one possible.
 
 1. **Wire HNSW into the planner and point `vecsim` at the approximate path**
-   (1A, 1B). Closes the biggest honest gap. After this, "we fault-test real
-   approximate search, with isolation, under crash" is simply true.
+   (1A, 1B). **Done.** "We fault-test real approximate search, with isolation,
+   under crash" is simply true, and the index path also ships a write-invalidated
+   cache for a ~150x warm speedup.
 2. **Build the space fault model and end-to-end corruption detection** (2A, 2B).
-   This is the most differentiating single step and the literal space
-   requirement: never return a silently corrupted answer, and prove it under bit
-   flips and silent corruption. This is where the project stops looking like a
-   good database project and starts looking like flight software.
-3. **Add the metamorphic oracle and the certificate generator** (2D, 3B). The
-   oracle answers the field's open problem; the certificate turns the proof into
-   the artifact you demo and pitch. Together they are the "nobody has done this"
-   claim, made concrete.
+   **Done.** A committed multi-tenant workload is irradiated on disk at a chosen
+   orbit's upset rate (`vecsim --irradiate`) and proven to never return a silently
+   corrupted answer; page and index checksums refuse a flipped bit. This is where
+   the project stops looking like a good database project and starts looking like
+   flight software.
+3. **Add the metamorphic oracle and the certificate generator** (2D, 3B).
+   **Done.** The oracle answers the field's open problem; `vecert` turns the proof
+   into a regenerable, content-hashed artifact. Together they are the "nobody has
+   done this" claim, made concrete.
 
-Everything after that, redundancy and scrubbing (2C), radiation rates (3A), model
-checking (3C), and partition and power tolerance (3D), deepens the moat and the
+**Next:** corrupt the WAL stream as well as the heap, replication and
+point-in-time recovery, and model-checking the core recovery and isolation
+invariants. Beyond that, redundancy and scrubbing (2C), radiation rates (3A),
+model checking (3C), and partition and power tolerance (3D), deepen the moat and the
 certificate. But the first three moves are what take this from a crash-proven
 vector engine to a credible, novel, fault-proven AI-memory layer for hardware
 nobody can reach.

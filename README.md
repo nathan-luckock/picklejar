@@ -39,11 +39,13 @@ Honest scoping of what is and is not new:
 | Distance operators and brute-force KNN (`<->`, `<=>`, `<#>`, `<+>`, plus function forms) | **done** |
 | RLS-filtered similarity search (isolation enforced by the engine, not application code) | **done** |
 | Fault simulator for the memory layer (`vecsim`: durability and isolation under simulated crash) | **done** |
-| HNSW index (4 metrics, insert/search/delete, durable, recall > 0.98 on hard data) | **index done**, planner wiring next |
+| HNSW index (4 metrics, insert/search/delete, durable, recall > 0.98 on hard data) | **done** |
+| HNSW wired into SQL: `ORDER BY col <-> :q LIMIT k` served from a write-invalidated, RLS-safe cached index (~150x warm) | **done** |
+| Orbital radiation fault model injected into the live simulator (`vecsim --irradiate`, dose set by orbit) | **done** |
 | Corruption detection and self-healing (page and index CRC32 enforced, redundant self-healing index, metamorphic oracle) | **done** |
 | Regenerable reliability certificate (`vecert`, framed in orbital upset rates) | **done** |
 
-**Where it is headed.** The corruption story is built: page and index checksums are enforced so a flipped bit is detected, not served; the index self-heals from a redundant copy; a metamorphic oracle tests approximate search without a ground-truth answer; and `vecert` emits a regenerable, content-hashed reliability certificate framed in an orbit's own upset rates. The remaining major step is wiring the HNSW index into the planner so KNN is accelerated at scale while still applying the row-level-security filter before the top-k. From there, deeper fault models (bit flips injected into the live crash simulator) and the orbital deployment story. The full plan and its honest scoping are in [docs/ROADMAP.md](docs/ROADMAP.md).
+**Where it is headed.** The core is in place: the HNSW index is reachable from SQL through a cached, opt-in, row-level-security-safe path that turns a repeated nearest-neighbor query into roughly a 150x speedup over the exact scan while still fencing each tenant to its own rows; the corruption story is enforced end to end (page and index checksums refuse a flipped bit, the index self-heals from a redundant copy, a metamorphic oracle tests approximate search without a ground-truth answer); and the orbital radiation fault model is injected into the live simulator, so a multi-tenant workload can be irradiated at a chosen orbit's upset rate for a chosen dwell time and proven to never serve a silently corrupted answer. From here: corrupting the WAL stream as well as the heap, replication and point-in-time recovery, and model-checking the core recovery and isolation invariants. The full plan and its honest scoping are in [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## Quickstart
 
@@ -76,6 +78,8 @@ SELECT id FROM memories ORDER BY embedding <-> '[0.1, 0.2, 0.8]' LIMIT 5;
 
 A `VECTOR(n)` column stores an embedding as native `f32`, validates its width on write, and survives a crash and reopen like any other value. Similarity search runs through the same row-level-security fence as every other read, so a tenant's nearest-neighbor query can only ever rank that tenant's own vectors, enforced by the engine.
 
+That last query can be served two ways. By default it is an exact scan. Turn on the index path and the same SQL is answered from a cached HNSW index instead, roughly 150x faster on a warm query, and only when row-level security does not apply to the query, so the acceleration can never widen what a tenant can see. An RLS-fenced query always falls back to the exact, fenced path.
+
 ## It speaks Postgres
 
 No shim. The server implements the PostgreSQL v3 wire protocol, so the real `psql` binary connects straight to the engine:
@@ -107,7 +111,7 @@ A toy "build a database" project stops at a key-value store or wraps an existing
 | **Transactions** | MVCC snapshot isolation; `BEGIN` / `COMMIT` / `ROLLBACK`; a reader never blocks a writer |
 | **Query engine** | hand-written lexer and Pratt parser, a cost-based planner, and a Volcano executor |
 | **Security** | roles, `GRANT` / `REVOKE`, ownership, and row-level security enforced in the engine |
-| **Vector memory** | `VECTOR(n)` type, four distance metrics, KNN, and an HNSW index (build, search, delete, persist) |
+| **Vector memory** | `VECTOR(n)` type, four distance metrics, KNN, and an HNSW index (build, search, delete, persist) wired into SQL through a cached, RLS-safe path |
 | **Reliability under fault** | page and index checksums refuse corrupt data, a self-healing redundant index, a metamorphic oracle, and a regenerable certificate |
 | **Postgres wire** | real clients and drivers connect over TCP, no shim |
 | **Deep SQL** | joins, window functions, set operations, correlated subqueries, CTEs, upserts, `information_schema` |
@@ -123,13 +127,16 @@ Correctness is not asserted, it is tested several independent ways, all under `c
 - **Vector durability and isolation simulation (`vecsim`).** The same seeded, replayable model applied to the memory layer: a multi-tenant embedding workload writing through the RLS fence, a crash, then a check that every committed embedding survives intact and each tenant sees only its own after recovery, on reads and on nearest-neighbor ranking.
 - **A metamorphic oracle for approximate search.** Relations that must always hold (self-retrieval, monotonic insertion, deletion consistency, recall monotonicity) test correctness without a ground-truth answer, the accepted answer to the oracle problem for approximate search.
 - **Corruption detection and self-healing.** Every page and every serialized index carries a CRC32 that is verified on read, so a flipped bit is refused rather than served; the index keeps a redundant copy and reconstructs itself from it with no intervention.
+- **An orbital radiation fault model in the live simulator.** A committed multi-tenant workload is irradiated on disk at a chosen orbit's single-event-upset rate for a chosen dwell time, then reopened: the engine either detects the corruption or it changed no committed answer, but it never serves a tenant a silently wrong embedding and never leaks another tenant's row. The injected dose is the orbit model, not an arbitrary fault count.
 
 ```bash
-cargo run --release --bin dst -- 100000        # 100k reproducible crash scenarios
-cargo run --release --bin difftest -- 100000   # 100k queries checked against SQLite
-cargo run --release --bin vecsim -- 100000     # 100k durability + isolation sims
-cargo run --release --bin vecbench             # HNSW vs brute-force speedup and recall
-cargo run --release --bin vecert               # the regenerable reliability certificate
+cargo run --release --bin dst -- 100000              # 100k reproducible crash scenarios
+cargo run --release --bin difftest -- 100000         # 100k queries checked against SQLite
+cargo run --release --bin vecsim -- 100000           # 100k durability + isolation sims
+cargo run --release --bin vecsim -- --irradiate 10000 365 geo   # irradiate a year in GEO
+cargo run --release --bin vecbench                   # HNSW vs brute-force speedup and recall
+cargo run --release --bin vecsqlbench                # cached SQL index path vs exact scan
+cargo run --release --bin vecert                     # the regenerable reliability certificate
 ```
 
 A database for hardware you cannot service is only as good as its proof that it survives failure. `vecert` turns that proof into a single regenerable, content-hashed artifact:

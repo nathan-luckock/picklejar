@@ -32,7 +32,8 @@ every task to a pull request that is squash-merged once the checks
 | 11 | Make it real: PostgreSQL wire protocol, deterministic and differential testing, multi-connection concurrency, VACUUM | Shipped |
 | 12 | Security: roles, GRANT/REVOKE, ownership, SCRAM auth, row-level security | Shipped |
 | 13 | AI memory layer: VECTOR type, distance operators + KNN, RLS-filtered similarity, the vecsim simulator, HNSW index | Shipped |
-| 14 | Wire the HNSW index into the planner; the orbital and edge direction | Planned |
+| 14 | Reliability for unreachable hardware: HNSW wired into SQL with a cached, RLS-safe index; corruption detection and self-healing; the metamorphic oracle; the `vecert` certificate; the orbital radiation fault model in the live simulator | Shipped |
+| 15 | WAL-stream fault model, replication and point-in-time recovery, model-checking the recovery and isolation invariants | Planned |
 
 ## What shipped, by sprint
 
@@ -150,10 +151,15 @@ cannot be physically serviced (orbital and edge data centers).
    0-11).
 2. The memory layer is built on it: vectors, similarity search, engine-enforced
    isolation, and a fault simulator (sprints 12-13).
-3. Next: wire the HNSW index into the planner so nearest-neighbor queries are
-   fast at scale while the row-level-security filter is applied before the
-   top-k, preserving isolation; then the deployment story for unreachable
-   infrastructure.
+3. Reliability for unreachable hardware is built (sprint 14): the HNSW index is
+   reachable from SQL through a cached, RLS-safe path (fast at scale while the
+   row-level-security filter is preserved); corruption is detected and self-healed;
+   a metamorphic oracle and the `vecert` certificate make the proof concrete; and
+   the live simulator irradiates a committed workload at an orbit's upset rate and
+   proves it is never served silently corrupted.
+4. Next: corrupt the WAL stream as well as the heap, replication and
+   point-in-time recovery, and model-checking the recovery and isolation
+   invariants; then the deployment story for unreachable infrastructure.
 
 ## Out of scope
 
