@@ -140,6 +140,7 @@ cargo run --release --bin vecbench                   # HNSW vs brute-force speed
 cargo run --release --bin vecsqlbench                # cached SQL index path vs exact scan
 cargo run --release --bin resilientdemo              # erasure-coded self-healing corruption drill
 cargo run --release --bin resilientsim               # years of orbital radiation vs scrub cadence
+cargo run --release --bin pjscrub -- mem.db          # the cron scrubber: heal + refresh parity
 cargo run --release --bin vecert                     # the regenerable reliability certificate
 ```
 
