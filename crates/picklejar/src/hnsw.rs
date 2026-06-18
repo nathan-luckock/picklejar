@@ -97,6 +97,8 @@ pub struct Hnsw {
     ef_construction: usize,
     /// Level-generation scale, `1 / ln(m)`.
     ml: f64,
+    /// The similarity metric the graph navigates by.
+    metric: Metric,
     rng: Rng,
     nodes: Vec<Node>,
     entry: Option<usize>,
@@ -114,6 +116,39 @@ impl std::fmt::Debug for Hnsw {
     }
 }
 
+/// The similarity metric the graph navigates by, matching the SQL operators:
+/// `L2` is `<->`, `Cosine` is `<=>`, `InnerProduct` is `<#>`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Metric {
+    /// Euclidean distance.
+    L2,
+    /// Cosine distance, `1 - cosine similarity`.
+    Cosine,
+    /// Negative inner product (so smaller still means nearer).
+    InnerProduct,
+}
+
+impl Metric {
+    /// The serialized tag for this metric.
+    const fn tag(self) -> u8 {
+        match self {
+            Self::L2 => 0,
+            Self::Cosine => 1,
+            Self::InnerProduct => 2,
+        }
+    }
+
+    /// Inverse of [`tag`](Self::tag).
+    const fn from_tag(tag: u8) -> Option<Self> {
+        match tag {
+            0 => Some(Self::L2),
+            1 => Some(Self::Cosine),
+            2 => Some(Self::InnerProduct),
+            _ => None,
+        }
+    }
+}
+
 /// Squared Euclidean distance. Monotonic with L2, so it ranks identically while
 /// avoiding a square root in the inner loop.
 fn dist_sq(a: &[f32], b: &[f32]) -> f32 {
@@ -126,6 +161,48 @@ fn dist_sq(a: &[f32], b: &[f32]) -> f32 {
         .sum()
 }
 
+/// Inner (dot) product.
+fn dot(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b).map(|(x, y)| x * y).sum()
+}
+
+/// Cosine distance, `1 - cosine similarity`, with a zero vector defined as
+/// distance 0 from another zero and 1 from any real vector (so it never yields
+/// NaN).
+fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
+    let na = dot(a, a).sqrt();
+    let nb = dot(b, b).sqrt();
+    let denom = na * nb;
+    if denom == 0.0 {
+        if na == 0.0 && nb == 0.0 {
+            0.0
+        } else {
+            1.0
+        }
+    } else {
+        1.0 - dot(a, b) / denom
+    }
+}
+
+/// The graph-ranking score for `metric`: smaller always means nearer, whichever
+/// metric is in use, so the search machinery is metric-agnostic.
+fn rank(metric: Metric, a: &[f32], b: &[f32]) -> f32 {
+    match metric {
+        Metric::L2 => dist_sq(a, b),
+        Metric::Cosine => cosine_distance(a, b),
+        Metric::InnerProduct => -dot(a, b),
+    }
+}
+
+/// Convert a graph-ranking score back to the user-facing distance: the true L2
+/// distance for `L2` (the rank is squared), the score itself otherwise.
+fn present(metric: Metric, score: f32) -> f32 {
+    match metric {
+        Metric::L2 => score.max(0.0).sqrt(),
+        Metric::Cosine | Metric::InnerProduct => score,
+    }
+}
+
 impl Hnsw {
     /// Create an empty index over `dim`-dimensional vectors. `m` is the graph
     /// degree (16 is a good default); `ef_construction` is the build-time beam
@@ -133,6 +210,19 @@ impl Hnsw {
     /// level assignment reproducible.
     #[must_use]
     pub fn new(dim: usize, m: usize, ef_construction: usize, seed: u64) -> Self {
+        Self::new_with_metric(dim, m, ef_construction, seed, Metric::L2)
+    }
+
+    /// Like [`new`](Self::new) but choosing the similarity metric the graph
+    /// navigates by (L2, cosine, or inner product), matching the SQL operators.
+    #[must_use]
+    pub fn new_with_metric(
+        dim: usize,
+        m: usize,
+        ef_construction: usize,
+        seed: u64,
+        metric: Metric,
+    ) -> Self {
         let m = m.max(2);
         // `m` is a small graph degree; the precision of its f64 image is exact.
         #[allow(clippy::cast_precision_loss)]
@@ -143,6 +233,7 @@ impl Hnsw {
             m0: m * 2,
             ef_construction: ef_construction.max(m),
             ml,
+            metric,
             rng: Rng::new(seed),
             nodes: Vec::new(),
             entry: None,
@@ -218,9 +309,10 @@ impl Hnsw {
     }
 
     /// The `k` approximate nearest neighbors of `query`, nearest first, as
-    /// `(id, distance)` pairs where the distance is true L2 (not squared).
-    /// `ef_search` is the query-time beam width (at least `k`); larger trades
-    /// speed for recall.
+    /// `(id, distance)` pairs. The distance is in the index's metric: true L2 for
+    /// `L2`, cosine distance for `Cosine`, negative inner product for
+    /// `InnerProduct`. `ef_search` is the query-time beam width (at least `k`);
+    /// larger trades speed for recall.
     #[must_use]
     pub fn search(&self, query: &[f32], k: usize, ef_search: usize) -> Vec<(usize, f32)> {
         let Some(entry) = self.entry else {
@@ -235,7 +327,7 @@ impl Hnsw {
         found.truncate(k);
         found
             .into_iter()
-            .map(|s| (s.id, s.dist.max(0.0).sqrt()))
+            .map(|s| (s.id, present(self.metric, s.dist)))
             .collect()
     }
 
@@ -247,7 +339,8 @@ impl Hnsw {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(b"PJHN");
-        out.extend_from_slice(&1u32.to_le_bytes());
+        out.extend_from_slice(&2u32.to_le_bytes());
+        out.push(self.metric.tag());
         for field in [
             self.dim as u64,
             self.m as u64,
@@ -277,7 +370,7 @@ impl Hnsw {
     }
 
     /// Restore an index from [`to_bytes`](Self::to_bytes) output. Returns `None`
-    /// if the bytes are not a version-1 index image or are truncated, so a
+    /// if the bytes are not a version-2 index image or are truncated, so a
     /// corrupt sidecar is rejected rather than trusted.
     #[must_use]
     #[allow(clippy::similar_names)] // the read_u32 / read_u64 / read_f32 readers are deliberately parallel
@@ -301,9 +394,11 @@ impl Hnsw {
             *p += 4;
             Some(f32::from_le_bytes(b.try_into().ok()?))
         };
-        if read_u32(&mut p)? != 1 {
+        if read_u32(&mut p)? != 2 {
             return None;
         }
+        let metric = Metric::from_tag(*bytes.get(p)?)?;
+        p += 1;
         let dim = usize::try_from(read_u64(&mut p)?).ok()?;
         let m = usize::try_from(read_u64(&mut p)?).ok()?;
         let m0 = usize::try_from(read_u64(&mut p)?).ok()?;
@@ -345,6 +440,7 @@ impl Hnsw {
             m0,
             ef_construction,
             ml,
+            metric,
             rng,
             nodes,
             entry,
@@ -362,14 +458,14 @@ impl Hnsw {
         entry: usize,
     ) -> usize {
         let mut cur = entry;
-        let mut cur_d = dist_sq(query, &self.nodes[cur].vector);
+        let mut cur_d = rank(self.metric, query, &self.nodes[cur].vector);
         let mut layer = from_level;
         while layer > to_level {
             loop {
                 let mut improved = false;
                 if layer <= self.nodes[cur].level() {
                     for &nb in &self.nodes[cur].neighbors[layer] {
-                        let d = dist_sq(query, &self.nodes[nb].vector);
+                        let d = rank(self.metric, query, &self.nodes[nb].vector);
                         if d < cur_d {
                             cur_d = d;
                             cur = nb;
@@ -400,7 +496,7 @@ impl Hnsw {
         let mut frontier: BinaryHeap<Reverse<Scored>> = BinaryHeap::new();
         let mut best: BinaryHeap<Scored> = BinaryHeap::new();
         for &ep in entry_points {
-            let d = dist_sq(query, &self.nodes[ep].vector);
+            let d = rank(self.metric, query, &self.nodes[ep].vector);
             let s = Scored { dist: d, id: ep };
             visited.insert(ep);
             frontier.push(Reverse(s));
@@ -421,7 +517,7 @@ impl Hnsw {
                 if !visited.insert(nb) {
                     continue;
                 }
-                let d = dist_sq(query, &self.nodes[nb].vector);
+                let d = rank(self.metric, query, &self.nodes[nb].vector);
                 let worst = best.peek().map_or(f32::INFINITY, |s| s.dist);
                 if best.len() < ef || d < worst {
                     let s = Scored { dist: d, id: nb };
@@ -460,7 +556,7 @@ impl Hnsw {
         let mut scored: Vec<Scored> = self.nodes[id].neighbors[layer]
             .iter()
             .map(|&nb| Scored {
-                dist: dist_sq(&v, &self.nodes[nb].vector),
+                dist: rank(self.metric, &v, &self.nodes[nb].vector),
                 id: nb,
             })
             .collect();
@@ -579,6 +675,85 @@ mod tests {
         assert!(Hnsw::from_bytes(&bytes[..bytes.len() / 2]).is_none());
         assert!(Hnsw::from_bytes(b"nope").is_none());
         assert!(Hnsw::from_bytes(&[]).is_none());
+    }
+
+    /// Exact top-k by brute force under a given metric, ids nearest first.
+    fn brute_force_metric(
+        data: &[Vec<f32>],
+        query: &[f32],
+        k: usize,
+        metric: Metric,
+    ) -> Vec<usize> {
+        let mut scored: Vec<(f32, usize)> = data
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (rank(metric, query, v), i))
+            .collect();
+        scored.sort_by(|a, b| a.0.total_cmp(&b.0));
+        scored.into_iter().take(k).map(|(_, i)| i).collect()
+    }
+
+    #[test]
+    fn cosine_metric_recovers_the_nearest() {
+        let dim = 16;
+        let data = gen_vectors(600, dim, 71);
+        let mut index = Hnsw::new_with_metric(dim, 16, 200, 3, Metric::Cosine);
+        for v in &data {
+            index.insert(v.clone());
+        }
+        // Each query is in the set, so its own cosine distance (0) is the minimum
+        // and must come back as the exact nearest.
+        for q in 0..20 {
+            let query = &data[q * 13 % data.len()];
+            let got = index.search(query, 1, 80);
+            let exact = brute_force_metric(&data, query, 1, Metric::Cosine);
+            assert_eq!(got[0].0, exact[0], "cosine nearest should be exact");
+        }
+    }
+
+    #[test]
+    fn inner_product_metric_has_high_recall() {
+        let dim = 16;
+        let data = gen_vectors(800, dim, 202);
+        let mut index = Hnsw::new_with_metric(dim, 16, 200, 5, Metric::InnerProduct);
+        for v in &data {
+            index.insert(v.clone());
+        }
+        let mut hits = 0usize;
+        let mut total = 0usize;
+        let queries = gen_vectors(40, dim, 909);
+        for query in &queries {
+            let approx: HashSet<usize> = index
+                .search(query, 10, 120)
+                .into_iter()
+                .map(|(i, _)| i)
+                .collect();
+            for id in brute_force_metric(&data, query, 10, Metric::InnerProduct) {
+                total += 1;
+                if approx.contains(&id) {
+                    hits += 1;
+                }
+            }
+        }
+        let recall =
+            f64::from(u32::try_from(hits).unwrap()) / f64::from(u32::try_from(total).unwrap());
+        assert!(recall > 0.80, "inner-product recall@10 was {recall:.3}");
+    }
+
+    #[test]
+    fn serialized_metric_round_trips() {
+        let dim = 10;
+        let data = gen_vectors(150, dim, 44);
+        let mut index = Hnsw::new_with_metric(dim, 16, 100, 6, Metric::Cosine);
+        for v in &data {
+            index.insert(v.clone());
+        }
+        let restored = Hnsw::from_bytes(&index.to_bytes()).expect("restore");
+        // The metric is preserved, so queries rank identically after a reload.
+        for q in 0..10 {
+            let query = &data[q * 7 % data.len()];
+            assert_eq!(index.search(query, 5, 64), restored.search(query, 5, 64));
+        }
     }
 
     #[test]
