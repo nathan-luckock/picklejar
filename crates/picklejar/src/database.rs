@@ -233,6 +233,13 @@ pub struct Database {
     /// default, so the exact path stays the default and approximate results are an
     /// explicit opt-in.
     vector_index_on: bool,
+    /// Cached HNSW indexes for the index path, keyed by `(current_role, table,
+    /// column, metric)`. The whole map is cleared on any statement that is not a
+    /// pure read, so an entry can never outlive a change to the data, the schema,
+    /// or the grants it was built under. Keying by role means a role can only ever
+    /// reuse an index it was itself permitted to build, never one another role
+    /// built; keying by metric means an L2 index is never reused for a cosine query.
+    vector_index_cache: HashMap<(String, String, String, Metric), CachedVectorIndex>,
 }
 
 impl std::fmt::Debug for Database {
@@ -242,6 +249,33 @@ impl std::fmt::Debug for Database {
             .field("tables", &self.tables.keys().collect::<Vec<_>>())
             .finish_non_exhaustive()
     }
+}
+
+/// A built HNSW index over one vector column, with the row snapshot it was built
+/// from. Held in the engine's cache so repeated nearest-neighbor queries on an
+/// unchanged table skip the rebuild; invalidated wholesale on any write.
+struct CachedVectorIndex {
+    index: crate::hnsw::Hnsw,
+    rows: Vec<Vec<Value>>,
+    columns: Vec<String>,
+    /// Map from an index node id back to its row in `rows`.
+    node_to_row: Vec<usize>,
+    /// The width of the indexed vectors, to reject a wrong-width query literal.
+    dim: usize,
+}
+
+/// Whether a statement only reads and so cannot invalidate a cached index. Every
+/// other statement (writes, DDL, grants, transaction control, session changes)
+/// clears the cache, which keeps invalidation conservative and correct by
+/// construction rather than tracking exactly what each statement touched.
+const fn statement_is_read_only(stmt: &Statement) -> bool {
+    matches!(
+        stmt,
+        Statement::Select(_)
+            | Statement::Union { .. }
+            | Statement::With { .. }
+            | Statement::Explain { .. }
+    )
 }
 
 /// Match an `ORDER BY` item against the `col <vector-op> <vector-literal>` shape
@@ -367,6 +401,7 @@ impl Database {
             pol_path,
             midx_path,
             vector_index_on: false,
+            vector_index_cache: HashMap::new(),
         };
         db.load_catalog()?;
         db.load_views()?;
@@ -743,6 +778,13 @@ impl Database {
         // Inline any WITH common table expressions into the body before routing,
         // so the rest of the engine only sees plain queries and derived tables.
         let stmt = expand_ctes(stmt)?;
+        // Any statement that is not a pure read may change the data, schema, or
+        // grants a cached index was built under, so drop every cached index. This
+        // is the cache's whole invalidation rule: conservative, but it makes a
+        // stale or wrongly-scoped index impossible to serve.
+        if !self.vector_index_cache.is_empty() && !statement_is_read_only(&stmt) {
+            self.vector_index_cache.clear();
+        }
         // Publish the active role names so `current_user` / `session_user`
         // expressions (and, later, RLS policies) resolve to the right role.
         picklejar_executor::set_session_identity(&self.current_role, &self.session_user);
@@ -1009,54 +1051,79 @@ impl Database {
             return Ok(None);
         };
 
-        // Fetch the visible rows through the engine's own SELECT. Permissions are
-        // enforced there, and since no RLS applies (a folded WHERE would have
-        // disqualified this shape) it returns every row of the table.
-        let QueryOutcome::Rows { columns, rows } =
-            self.execute(&format!("SELECT * FROM {}", s.from.name))?
-        else {
-            return Ok(None);
-        };
-        let Some(col_idx) = columns.iter().position(|c| *c == col) else {
-            return Ok(None);
-        };
-        let Some(projection) = Projection::resolve(&s.projections, &columns) else {
-            return Ok(None);
-        };
-        let out_columns = projection.output_columns(&columns);
-
-        // Determine the vector width from the first row that carries one. With no
-        // vectors the answer is empty, exactly as the exact path would return.
-        let Some(dim) = rows.iter().find_map(|r| match r.get(col_idx) {
-            Some(Value::Vector(v)) => Some(v.len()),
-            _ => None,
-        }) else {
-            return Ok(Some(QueryOutcome::Rows {
-                columns: out_columns,
-                rows: Vec::new(),
-            }));
-        };
-        // A dimension mismatch is a query error; let the exact path raise it so
-        // the message and behavior match the non-indexed path exactly.
-        if query.len() != dim {
-            return Ok(None);
-        }
-
-        let mut index = Hnsw::new_with_metric(dim, 16, 200, 0x5EED_15A1, metric);
-        let mut node_to_row: Vec<usize> = Vec::new();
-        for (i, r) in rows.iter().enumerate() {
-            if let Some(Value::Vector(v)) = r.get(col_idx) {
-                if v.len() == dim {
-                    index.insert(v.clone());
-                    node_to_row.push(i);
+        // Reuse a cached index for this (role, table, column, metric), or build one
+        // now. Building goes through the engine's own SELECT, which enforces table
+        // permissions; a cached entry only exists because this same role built it
+        // and no intervening write cleared it, so a hit needs no recheck.
+        let key = (
+            self.current_role.clone(),
+            s.from.name.clone(),
+            col.clone(),
+            metric,
+        );
+        if !self.vector_index_cache.contains_key(&key) {
+            // Since no RLS applies (a folded WHERE would have disqualified this
+            // shape), this returns every row of the table.
+            let QueryOutcome::Rows { columns, rows } =
+                self.execute(&format!("SELECT * FROM {}", s.from.name))?
+            else {
+                return Ok(None);
+            };
+            let Some(col_idx) = columns.iter().position(|c| *c == col) else {
+                return Ok(None);
+            };
+            // With no vectors the answer is empty, exactly as the exact path would
+            // return; there is nothing to index, so do not cache.
+            let Some(dim) = rows.iter().find_map(|r| match r.get(col_idx) {
+                Some(Value::Vector(v)) => Some(v.len()),
+                _ => None,
+            }) else {
+                let Some(projection) = Projection::resolve(&s.projections, &columns) else {
+                    return Ok(None);
+                };
+                return Ok(Some(QueryOutcome::Rows {
+                    columns: projection.output_columns(&columns),
+                    rows: Vec::new(),
+                }));
+            };
+            let mut index = Hnsw::new_with_metric(dim, 16, 200, 0x5EED_15A1, metric);
+            let mut node_to_row: Vec<usize> = Vec::new();
+            for (i, r) in rows.iter().enumerate() {
+                if let Some(Value::Vector(v)) = r.get(col_idx) {
+                    if v.len() == dim {
+                        index.insert(v.clone());
+                        node_to_row.push(i);
+                    }
                 }
             }
+            self.vector_index_cache.insert(
+                key.clone(),
+                CachedVectorIndex {
+                    index,
+                    rows,
+                    columns,
+                    node_to_row,
+                    dim,
+                },
+            );
         }
+
+        let entry = &self.vector_index_cache[&key];
+        let Some(projection) = Projection::resolve(&s.projections, &entry.columns) else {
+            return Ok(None);
+        };
+        // A dimension mismatch is a query error; let the exact path raise it so the
+        // message and behavior match the non-indexed path exactly.
+        if query.len() != entry.dim {
+            return Ok(None);
+        }
+        let out_columns = projection.output_columns(&entry.columns);
         let ef = k.max(64).saturating_mul(2);
-        let out_rows = index
+        let out_rows = entry
+            .index
             .search(&query, k, ef)
             .into_iter()
-            .map(|(id, _)| projection.project(&rows[node_to_row[id]]))
+            .map(|(id, _)| projection.project(&entry.rows[entry.node_to_row[id]]))
             .collect();
         Ok(Some(QueryOutcome::Rows {
             columns: out_columns,

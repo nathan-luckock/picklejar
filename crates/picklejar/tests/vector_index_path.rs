@@ -132,6 +132,115 @@ fn index_path_preserves_row_level_security() {
 }
 
 #[test]
+fn a_write_invalidates_the_cached_index() {
+    let mut db = seeded_store();
+    db.set_vector_index(true);
+
+    // Warm the cache: the nearest row to [100, 0] is the largest x, id 59.
+    let before = rows(
+        &mut db,
+        "SELECT id FROM items ORDER BY e <-> '[100, 0]' LIMIT 1",
+    );
+    assert_eq!(before, vec![vec![Value::Int(59)]]);
+
+    // Insert a row that sits exactly on the query point. If the cache were stale,
+    // the old index would still rank id 59 first; invalidation must let id 999 win.
+    db.execute("INSERT INTO items VALUES (999, 't0', '[100, 0]')")
+        .unwrap();
+    let after = rows(
+        &mut db,
+        "SELECT id FROM items ORDER BY e <-> '[100, 0]' LIMIT 1",
+    );
+    assert_eq!(after, vec![vec![Value::Int(999)]]);
+}
+
+#[test]
+fn a_cached_index_is_not_reused_across_roles() {
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("roles.db");
+    let mut db = Database::open(&path).expect("open");
+
+    db.execute("CREATE TABLE items (id INT, e VECTOR(2))")
+        .unwrap();
+    db.execute("INSERT INTO items VALUES (1, '[1, 0]'), (2, '[0, 1]')")
+        .unwrap();
+    db.execute("CREATE ROLE alice LOGIN").unwrap();
+    db.execute("CREATE ROLE mallory LOGIN").unwrap();
+    db.execute("GRANT SELECT ON items TO alice").unwrap();
+    db.set_vector_index(true);
+
+    // alice has SELECT and warms an index for (alice, items, e, L2).
+    db.set_session_user("alice");
+    let a = rows(
+        &mut db,
+        "SELECT id FROM items ORDER BY e <-> '[1, 0]' LIMIT 1",
+    );
+    assert_eq!(a, vec![vec![Value::Int(1)]]);
+
+    // mallory has no grant. The cache is keyed by role, so mallory cannot reuse
+    // alice's index; the rebuild goes through a permission-checked SELECT and is
+    // denied. (set_session_user is an API call, so it does not itself clear the
+    // cache, which is exactly the case this guards.)
+    db.set_session_user("mallory");
+    let denied = db.execute("SELECT id FROM items ORDER BY e <-> '[1, 0]' LIMIT 1");
+    assert!(
+        denied.is_err(),
+        "a role without SELECT read through another role's cached index"
+    );
+}
+
+#[test]
+fn enabling_rls_after_caching_still_fences() {
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("rls-late.db");
+    let mut db = Database::open(&path).expect("open");
+
+    db.execute("CREATE TABLE memories (id INT, tenant TEXT, e VECTOR(2))")
+        .unwrap();
+    for i in 0..10i64 {
+        let tenant = if i % 2 == 0 { "orion" } else { "vega" };
+        let x = f32::from(i16::try_from(i).expect("small"));
+        db.execute(&format!(
+            "INSERT INTO memories VALUES ({i}, '{tenant}', '[{x}, 0]')"
+        ))
+        .unwrap();
+    }
+    db.execute("GRANT SELECT ON memories TO PUBLIC").unwrap();
+    db.execute("CREATE ROLE orion LOGIN").unwrap();
+    db.execute("CREATE ROLE vega LOGIN").unwrap();
+    db.set_vector_index(true);
+
+    // Warm the cache before any policy exists: the owner sees all ten rows.
+    let all = rows(
+        &mut db,
+        "SELECT id FROM memories ORDER BY e <-> '[5, 0]' LIMIT 100",
+    );
+    assert_eq!(all.len(), 10);
+
+    // Turning RLS on is DDL, which clears the cache. orion's later query carries a
+    // folded WHERE, so it falls through to the exact fenced path and sees only her
+    // own rows, never the stale all-rows index.
+    db.execute("CREATE POLICY tenant ON memories USING ((tenant = current_user()))")
+        .unwrap();
+    db.execute("ALTER TABLE memories ENABLE ROW LEVEL SECURITY")
+        .unwrap();
+    db.set_session_user("orion");
+    let hits = rows(
+        &mut db,
+        "SELECT id, tenant FROM memories ORDER BY e <-> '[5, 0]' LIMIT 100",
+    );
+    assert!(!hits.is_empty(), "orion should see her own memories");
+    for row in &hits {
+        assert_eq!(
+            row.get(1),
+            Some(&Value::Text("orion".to_string())),
+            "a stale all-rows index leaked another tenant's row after RLS was enabled"
+        );
+    }
+    assert_eq!(hits.len(), 5, "orion has exactly five memories");
+}
+
+#[test]
 fn index_path_respects_table_permissions() {
     let dir = tempdir().expect("tempdir");
     let path = dir.path().join("perm.db");

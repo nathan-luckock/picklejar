@@ -121,7 +121,7 @@ impl std::fmt::Debug for Hnsw {
 
 /// The similarity metric the graph navigates by, matching the SQL operators:
 /// `L2` is `<->`, `Cosine` is `<=>`, `InnerProduct` is `<#>`, `L1` is `<+>`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Metric {
     /// Euclidean distance.
     L2,
