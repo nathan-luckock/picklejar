@@ -218,6 +218,11 @@ impl Certificate {
         // committed data exactly.
         checks.push(live_heap_self_heal());
 
+        // Formal model checks: the core durability and isolation invariants proved
+        // over every reachable interleaving of a bounded model, not just sampled.
+        checks.push(wal_ordering_model());
+        checks.push(snapshot_isolation_model());
+
         Self { checks }
     }
 
@@ -259,7 +264,9 @@ impl Certificate {
         s.push_str("      corrupt pages from parity on open\n");
         s.push_str("method: deterministic, every check reproducible from a fixed seed\n");
         s.push_str("note: crash durability (100k sims) and tenant isolation are certified\n");
-        s.push_str("      separately and at larger scale by the `dst` and `vecsim` binaries\n");
+        s.push_str("      separately and at larger scale by the `dst` and `vecsim` binaries;\n");
+        s.push_str("      the WAL-ordering and snapshot-isolation invariants are also\n");
+        s.push_str("      model-checked exhaustively over a bounded model\n");
         s.push_str("--------------------------------------------------------------------\n");
         s.push_str(&self.body());
         s.push_str("--------------------------------------------------------------------\n");
@@ -697,6 +704,42 @@ fn live_heap_self_heal() -> Check {
              all reconstructed on open and {rows_n} rows served exactly"
         ),
         passed: healed,
+    }
+}
+
+/// The write-ahead-logging ordering invariant, model-checked: over every
+/// reachable interleaving of the bounded log-and-page model, no page change is
+/// durable ahead of its log record, and a deliberately buggy flush is caught.
+fn wal_ordering_model() -> Check {
+    let bound = 8u8;
+    let states = picklejar_wal::model::reachable_states(bound, true);
+    let held = picklejar_wal::model::check(bound, true).is_none();
+    let teeth = picklejar_wal::model::check(3, false).is_some();
+    Check {
+        name: "WAL ordering model-check".into(),
+        detail: format!(
+            "no page durable ahead of its log over all {states} reachable states (bound {bound}); \
+             a buggy early flush is caught"
+        ),
+        passed: held && teeth,
+    }
+}
+
+/// Snapshot isolation's read-stability invariant, model-checked: over every
+/// reachable interleaving, a reader sees the same value twice within its snapshot,
+/// and a snapshot-ignoring read is caught.
+fn snapshot_isolation_model() -> Check {
+    let bound = 8u8;
+    let states = picklejar_txn::model::reachable_states(bound, true);
+    let held = picklejar_txn::model::check(bound, true).is_none();
+    let teeth = picklejar_txn::model::check(3, false).is_some();
+    Check {
+        name: "snapshot isolation model-check".into(),
+        detail: format!(
+            "reads are stable within a snapshot over all {states} reachable states (bound {bound}); \
+             a snapshot-ignoring read is caught"
+        ),
+        passed: held && teeth,
     }
 }
 
