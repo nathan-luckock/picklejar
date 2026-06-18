@@ -41,7 +41,7 @@ Honest scoping of what is and is not new:
 | Fault simulator for the memory layer (`vecsim`: durability and isolation under simulated crash) | **done** |
 | HNSW index (4 metrics, insert/search/delete, durable, recall > 0.90) | **index done**, planner wiring next |
 
-**Where it is headed.** The index structure is complete and tested; the next step is wiring it into the planner so `ORDER BY embedding <-> :q LIMIT k` is accelerated at scale while still applying the row-level-security filter before the top-k, so the isolation guarantee holds. After that the roadmap pushes toward the orbital and edge deployment story the mission describes.
+**Where it is headed.** The index structure is complete and tested; the next step is wiring it into the planner so `ORDER BY embedding <-> :q LIMIT k` is accelerated at scale while still applying the row-level-security filter before the top-k, so the isolation guarantee holds. From there the path runs toward a space fault model (corruption, not just crash), self-healing, and a regenerable reliability certificate. The full plan is in [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## Quickstart
 
@@ -148,6 +148,7 @@ A database for hardware you cannot service is only as good as its proof that it 
 
 | | |
 |---|---|
+| [docs/ROADMAP.md](docs/ROADMAP.md) | where this is headed: from a crash-proven vector engine to flight-certifiable AI memory |
 | [docs/design.md](docs/design.md) | every design decision, with the alternatives considered and rejected |
 | [docs/FEATURES.md](docs/FEATURES.md) | the complete SQL surface and engine features |
 | [docs/sprints.md](docs/sprints.md) | how the build was sequenced |
