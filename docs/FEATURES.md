@@ -93,12 +93,12 @@ under simulated data-center chaos.
   the little-endian floats), so an embedding round-trips a crash and reopen like
   any other value. The optional dimension declares the embedding width and is
   enforced on every write; a bare `VECTOR` is width-agnostic. Distance operators
-  `<->` (L2), `<=>` (cosine), and `<#>` (negative inner product) evaluate to a
-  FLOAT, so `ORDER BY embedding <-> :query LIMIT k` is brute-force
-  nearest-neighbor search and `WHERE embedding <-> :query < r` is a radius
-  filter; the same distances are available as the functions `l2_distance`,
-  `cosine_distance`, and `inner_product`, alongside `vector_dims` and `l2_norm`.
-  This is the storage and query foundation of the AI memory layer.
+  `<->` (L2), `<=>` (cosine), `<#>` (negative inner product), and `<+>` (L1 /
+  Manhattan) evaluate to a FLOAT, so `ORDER BY embedding <-> :query LIMIT k` is
+  brute-force nearest-neighbor search and `WHERE embedding <-> :query < r` is a
+  radius filter; the same distances are available as the functions `l2_distance`,
+  `l1_distance`, `cosine_distance`, and `inner_product`, alongside `vector_dims`
+  and `l2_norm`. This is the storage and query foundation of the AI memory layer.
 - **Decimal** - a `DECIMAL` / `NUMERIC` column with exact base-10 arithmetic
   (`0.1 + 0.2` is `0.3`, not a binary-float approximation), `DECIMAL '12.34'`
   literals, and exact `SUM` / `AVG`. Stored as an `i128` mantissa plus a scale,

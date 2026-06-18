@@ -907,8 +907,8 @@ approximate-nearest-neighbor index (HNSW) of its own later, which is fast.
 1. **The `VECTOR(n)` type.** Shipped (above): durable `f32` embedding storage,
    width-enforced on write.
 2. **Distance operators and brute-force KNN.** Shipped. `<->` (L2), `<=>`
-   (cosine), `<#>` (negative inner product) evaluate to a scalar, so
-   `ORDER BY embedding <-> :q LIMIT k` is nearest-neighbor search over a
+   (cosine), `<#>` (negative inner product), and `<+>` (L1) evaluate to a scalar,
+   so `ORDER BY embedding <-> :q LIMIT k` is nearest-neighbor search over a
    sequential scan. Brute force first because it is the *correct* baseline every
    faster index must be checked against.
 3. **RLS-filtered similarity.** Shipped. Row-level security already folds a
