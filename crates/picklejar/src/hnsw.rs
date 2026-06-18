@@ -322,8 +322,8 @@ impl Hnsw {
         for layer in (0..=top).rev() {
             let found = self.search_layer(&query, &[cur], self.ef_construction, layer);
             let max = if layer == 0 { self.m0 } else { self.m };
-            for cand in found.iter().take(self.m) {
-                self.connect(id, cand.id, layer, max);
+            for nb in self.select_neighbors_heuristic(&found, self.m) {
+                self.connect(id, nb, layer, max);
             }
             if let Some(nearest) = found.first() {
                 cur = nearest.id;
@@ -594,7 +594,32 @@ impl Hnsw {
         self.prune(b, layer, max);
     }
 
-    /// Trim node `id`'s neighbor list at `layer` to its `max` closest neighbors.
+    /// HNSW heuristic neighbor selection (Malkov and Yashunin, Algorithm 4): from
+    /// `candidates` sorted nearest-first by their distance to the base node, keep
+    /// up to `m` that are *diverse*. A candidate is dropped if it is closer to an
+    /// already-kept neighbor than it is to the base node, which spreads a node's
+    /// edges out instead of pointing them all into one tight cluster. This is what
+    /// keeps the graph navigable through dense or near-duplicate data, where
+    /// "keep the m closest" collapses recall. Each candidate's `dist` already
+    /// holds its distance to the base node, so the base vector is not needed.
+    fn select_neighbors_heuristic(&self, candidates: &[Scored], m: usize) -> Vec<usize> {
+        let mut kept: Vec<usize> = Vec::new();
+        for c in candidates {
+            if kept.len() >= m {
+                break;
+            }
+            let diverse = kept.iter().all(|&r| {
+                c.dist < rank(self.metric, &self.nodes[c.id].vector, &self.nodes[r].vector)
+            });
+            if diverse {
+                kept.push(c.id);
+            }
+        }
+        kept
+    }
+
+    /// Trim node `id`'s neighbor list at `layer` back to `max`, using the
+    /// diversity heuristic rather than simply keeping the closest.
     fn prune(&mut self, id: usize, layer: usize, max: usize) {
         if self.nodes[id].neighbors[layer].len() <= max {
             return;
@@ -608,8 +633,7 @@ impl Hnsw {
             })
             .collect();
         scored.sort_unstable();
-        scored.truncate(max);
-        self.nodes[id].neighbors[layer] = scored.into_iter().map(|s| s.id).collect();
+        self.nodes[id].neighbors[layer] = self.select_neighbors_heuristic(&scored, max);
     }
 }
 
@@ -641,6 +665,129 @@ mod tests {
             .collect();
         scored.sort_by(|a, b| a.0.total_cmp(&b.0));
         scored.into_iter().take(k).map(|(_, i)| i).collect()
+    }
+
+    // --- realistic and adversarial distributions, the cases where ANN fails ---
+
+    /// A random integer-valued component in `[-1000, 1000]`.
+    fn comp(rng: &mut Rng) -> f32 {
+        f32::from(i16::try_from(rng.next_u64() % 2001).unwrap_or(0) - 1000)
+    }
+
+    /// `n` points drawn from `clusters` Gaussian-ish clusters: a random center per
+    /// cluster, each point the center plus small uniform jitter. Overlapping
+    /// clusters are where a graph index starts to miss neighbors.
+    fn clustered_vectors(n: usize, dim: usize, clusters: usize, seed: u64) -> Vec<Vec<f32>> {
+        let mut rng = Rng::new(seed);
+        let centers: Vec<Vec<f32>> = (0..clusters)
+            .map(|_| (0..dim).map(|_| comp(&mut rng)).collect())
+            .collect();
+        (0..n)
+            .map(|_| {
+                let c = usize::try_from(rng.next_u64() % clusters as u64).unwrap_or(0);
+                centers[c]
+                    .iter()
+                    .map(|&x| x + f32::from(i16::try_from(rng.next_u64() % 21).unwrap_or(0) - 10))
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// `n` points clustered tightly around a few base vectors: the near-duplicate
+    /// case, where the k-th neighbor distance is tiny and many candidates tie.
+    fn near_duplicate_vectors(n: usize, dim: usize, seed: u64) -> Vec<Vec<f32>> {
+        let mut rng = Rng::new(seed);
+        let bases: Vec<Vec<f32>> = (0..8)
+            .map(|_| (0..dim).map(|_| comp(&mut rng)).collect())
+            .collect();
+        (0..n)
+            .map(|_| {
+                let b = usize::try_from(rng.next_u64() % 8).unwrap_or(0);
+                bases[b]
+                    .iter()
+                    .map(|&x| x + f32::from(i16::try_from(rng.next_u64() % 5).unwrap_or(0) - 2))
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// `n` unit-norm vectors, the natural input for cosine similarity.
+    fn normalized_vectors(n: usize, dim: usize, seed: u64) -> Vec<Vec<f32>> {
+        let mut rng = Rng::new(seed);
+        (0..n)
+            .map(|_| {
+                let v: Vec<f32> = (0..dim).map(|_| comp(&mut rng)).collect();
+                let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+                if norm == 0.0 {
+                    v
+                } else {
+                    v.iter().map(|x| x / norm).collect()
+                }
+            })
+            .collect()
+    }
+
+    /// Build an index over `data` and measure recall@k against the exact
+    /// brute-force oracle over `queries`: the fraction of true neighbors the
+    /// index returns. Exact brute force is a sound oracle for an approximate
+    /// index's recall, which is how this answers the oracle problem.
+    fn measure_recall(
+        data: &[Vec<f32>],
+        queries: &[Vec<f32>],
+        k: usize,
+        ef: usize,
+        metric: Metric,
+        seed: u64,
+    ) -> f64 {
+        let dim = data[0].len();
+        let mut index = Hnsw::new_with_metric(dim, 16, 200, seed, metric);
+        for v in data {
+            index.insert(v.clone());
+        }
+        let mut hits = 0usize;
+        let mut total = 0usize;
+        for q in queries {
+            let approx: HashSet<usize> =
+                index.search(q, k, ef).into_iter().map(|(i, _)| i).collect();
+            for id in brute_force_metric(data, q, k, metric) {
+                total += 1;
+                if approx.contains(&id) {
+                    hits += 1;
+                }
+            }
+        }
+        f64::from(u32::try_from(hits).unwrap_or(u32::MAX))
+            / f64::from(u32::try_from(total.max(1)).unwrap_or(u32::MAX))
+    }
+
+    #[test]
+    fn recall_gate_clustered() {
+        let data = clustered_vectors(2000, 32, 20, 11);
+        let queries = clustered_vectors(80, 32, 20, 99);
+        let r = measure_recall(&data, &queries, 10, 150, Metric::L2, 7);
+        assert!(r > 0.98, "clustered recall@10 was {r:.3}, expected > 0.98");
+    }
+
+    #[test]
+    fn recall_gate_near_duplicates() {
+        let data = near_duplicate_vectors(2000, 32, 23);
+        let queries = near_duplicate_vectors(80, 32, 71);
+        let r = measure_recall(&data, &queries, 10, 200, Metric::L2, 5);
+        assert!(
+            r > 0.98,
+            "near-duplicate recall@10 was {r:.3}, expected > 0.98"
+        );
+    }
+
+    #[test]
+    fn recall_gate_normalized_cosine() {
+        let data = normalized_vectors(2000, 64, 31);
+        let queries = normalized_vectors(80, 64, 53);
+        let r = measure_recall(&data, &queries, 10, 150, Metric::Cosine, 3);
+        assert!(
+            r > 0.97,
+            "normalized cosine recall@10 was {r:.3}, expected > 0.97"
+        );
     }
 
     #[test]
