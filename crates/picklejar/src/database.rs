@@ -6249,6 +6249,66 @@ mod tests {
     }
 
     #[test]
+    fn rls_isolates_similarity_search_by_tenant() {
+        // The core isolation claim of the AI memory layer: a tenant's
+        // nearest-neighbor search can only ever rank that tenant's own vectors,
+        // enforced by the engine rather than by application code.
+        let (_d, mut db) = db();
+        db.execute("CREATE TABLE memories (id INT, tenant TEXT, e VECTOR(2))")
+            .unwrap();
+        // bob's vector [0,0] is globally nearest to the query [0,0], but alice
+        // must never see it: her search ranks only her own rows.
+        db.execute(
+            "INSERT INTO memories VALUES \
+             (1, 'alice', '[1, 0]'), (2, 'bob', '[0, 0]'), (3, 'alice', '[5, 5]')",
+        )
+        .unwrap();
+        db.execute("GRANT SELECT ON memories TO PUBLIC").unwrap();
+        db.execute("CREATE ROLE alice LOGIN").unwrap();
+        db.execute("CREATE ROLE bob LOGIN").unwrap();
+        db.execute("CREATE POLICY tenant ON memories USING ((tenant = current_user()))")
+            .unwrap();
+        db.execute("ALTER TABLE memories ENABLE ROW LEVEL SECURITY")
+            .unwrap();
+
+        // alice's nearest-neighbor search returns her own closest row (id 1),
+        // never bob's id 2 even though it is globally nearest to the query.
+        db.set_session_user("alice");
+        let (_c, rows) = query(
+            &mut db,
+            "SELECT id FROM memories ORDER BY e <-> '[0, 0]' LIMIT 1",
+        );
+        assert_eq!(
+            rows,
+            vec![vec![Value::Int(1)]],
+            "alice's KNN must not reach bob's globally-nearest vector"
+        );
+        // Her full ranking is exactly her two rows, nearest first.
+        let (_c, rows) = query(&mut db, "SELECT id FROM memories ORDER BY e <-> '[0, 0]'");
+        assert_eq!(rows, vec![vec![Value::Int(1)], vec![Value::Int(3)]]);
+
+        // bob's search sees only his own row, even asking for more than exist.
+        db.set_session_user("bob");
+        let (_c, rows) = query(
+            &mut db,
+            "SELECT id FROM memories ORDER BY e <-> '[0, 0]' LIMIT 5",
+        );
+        assert_eq!(rows, vec![vec![Value::Int(2)]]);
+
+        // A superuser bypasses RLS and ranks every tenant's vectors together.
+        db.set_session_user(SUPER);
+        let (_c, rows) = query(
+            &mut db,
+            "SELECT id FROM memories ORDER BY e <-> '[0, 0]' LIMIT 1",
+        );
+        assert_eq!(
+            rows,
+            vec![vec![Value::Int(2)]],
+            "the unfiltered nearest is bob's"
+        );
+    }
+
+    #[test]
     fn rls_restricts_update_and_delete_to_visible_rows() {
         let (_d, mut db) = db();
         rls_tenant_table(&mut db);
