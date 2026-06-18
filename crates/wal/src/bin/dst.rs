@@ -38,10 +38,20 @@ fn main() -> ExitCode {
         };
     }
 
+    // `dst <count> [start]` sweeps the half-open seed range `start..start+count`.
+    // The optional start makes it shardable: several processes can each cover a
+    // disjoint slice of one large run in parallel, then their union is the whole.
     let count: u64 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(1000);
-    println!("running {count} deterministic crash-recovery simulations...");
+    let start: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
+    let end = start.saturating_add(count);
+    if start == 0 {
+        println!("running {count} deterministic crash-recovery simulations...");
+    } else {
+        println!("running {count} simulations over seeds {start}..{end}...");
+    }
     let mut committed_total = 0u64;
-    for seed in 0..count {
+    let mut done = 0u64;
+    for seed in start..end {
         match run_seed(seed) {
             Ok(outcome) => committed_total += outcome.committed as u64,
             Err(e) => {
@@ -50,8 +60,9 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         }
-        if count >= 1000 && (seed + 1) % (count / 10).max(1) == 0 {
-            println!("  {}/{count} seeds passed", seed + 1);
+        done += 1;
+        if count >= 1000 && done % (count / 10).max(1) == 0 {
+            println!("  {done}/{count} seeds passed (through seed {seed})");
         }
     }
     println!("all {count} seeds recovered correctly ({committed_total} committed rows verified)");
