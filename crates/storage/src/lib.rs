@@ -30,6 +30,7 @@
 pub mod btree;
 pub mod buffer;
 pub mod crc32;
+pub mod erasure;
 pub mod error;
 pub mod file;
 pub mod header;
