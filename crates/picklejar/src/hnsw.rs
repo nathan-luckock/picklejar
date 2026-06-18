@@ -212,6 +212,18 @@ fn present(metric: Metric, score: f32) -> f32 {
     }
 }
 
+/// The result of scrubbing a redundant index image.
+#[derive(Debug)]
+pub enum ScrubOutcome {
+    /// Every copy was intact; nothing to do.
+    Clean,
+    /// A copy was corrupt but recoverable; the bytes are a freshly written clean
+    /// redundant image to persist in place of the old one.
+    Repaired(Vec<u8>),
+    /// No copy survived; the index cannot be recovered from this image.
+    Unrecoverable,
+}
+
 impl Hnsw {
     /// Create an empty index over `dim`-dimensional vectors. `m` is the graph
     /// degree (16 is a good default); `ef_construction` is the build-time beam
@@ -552,6 +564,21 @@ impl Hnsw {
             }
         }
         None
+    }
+
+    /// Scrub a redundant image: the operation a deployment runs periodically to
+    /// repair corruption *before* it accumulates past what redundancy can
+    /// recover. If a copy is corrupt but recoverable, returns a freshly written
+    /// clean image (both copies rebuilt from the good one) to persist back. If the
+    /// image is already clean it needs no rewrite, and if no copy survives it is
+    /// reported as unrecoverable.
+    #[must_use]
+    pub fn scrub(bytes: &[u8]) -> ScrubOutcome {
+        match Self::load_redundant(bytes) {
+            Some((index, true)) => ScrubOutcome::Repaired(index.to_bytes_redundant()),
+            Some((_, false)) => ScrubOutcome::Clean,
+            None => ScrubOutcome::Unrecoverable,
+        }
     }
 
     /// Greedily walk from `from_level` down to just above `to_level`, hopping to
@@ -905,6 +932,40 @@ mod tests {
             Hnsw::load_redundant(&dead).is_none(),
             "both copies corrupt is detected, not served as a wrong answer"
         );
+    }
+
+    #[test]
+    fn scrub_repairs_a_corrupt_copy_and_leaves_a_clean_image() {
+        let dim = 8;
+        let data = gen_vectors(150, dim, 19);
+        let mut index = Hnsw::new(dim, 16, 100, 6);
+        for v in &data {
+            index.insert(v.clone());
+        }
+        let img = index.to_bytes_redundant();
+        // A clean image scrubs to Clean.
+        assert!(matches!(Hnsw::scrub(&img), ScrubOutcome::Clean));
+        // Corrupt the first copy; scrub returns a repaired image.
+        let mut damaged = img.clone();
+        for b in damaged.iter_mut().skip(16).take(24) {
+            *b ^= 0xFF;
+        }
+        let ScrubOutcome::Repaired(fresh) = Hnsw::scrub(&damaged) else {
+            panic!("a recoverable corruption must scrub to Repaired");
+        };
+        // The repaired image is itself clean and answers identically.
+        assert!(matches!(Hnsw::scrub(&fresh), ScrubOutcome::Clean));
+        let (healed, _) = Hnsw::load_redundant(&fresh).expect("repaired image loads");
+        assert_eq!(
+            healed.search(&data[3], 5, 64),
+            index.search(&data[3], 5, 64)
+        );
+        // Corrupt both copies: unrecoverable, reported as such.
+        let mut dead = img;
+        let n = dead.len();
+        dead[20] ^= 0xFF;
+        dead[n - 6] ^= 0xFF;
+        assert!(matches!(Hnsw::scrub(&dead), ScrubOutcome::Unrecoverable));
     }
 
     #[test]
