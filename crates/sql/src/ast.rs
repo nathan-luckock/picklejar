@@ -181,6 +181,8 @@ pub enum BinOp {
     /// `<#>` vector negative inner product, returning a FLOAT (negated so that
     /// ascending order ranks the most similar first, matching pgvector).
     VecInner,
+    /// `<+>` vector L1 (Manhattan / taxicab) distance, returning a FLOAT.
+    VecL1,
 }
 
 impl fmt::Display for BinOp {
@@ -205,6 +207,7 @@ impl fmt::Display for BinOp {
             Self::VecL2 => "<->",
             Self::VecCosine => "<=>",
             Self::VecInner => "<#>",
+            Self::VecL1 => "<+>",
         };
         f.write_str(s)
     }

@@ -276,6 +276,8 @@ pub enum TokenKind {
     VecCosine,
     /// `<#>` (vector negative inner product)
     VecInner,
+    /// `<+>` (vector L1 / taxicab distance)
+    VecL1,
     /// End of input.
     Eof,
 }

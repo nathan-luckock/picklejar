@@ -144,7 +144,7 @@ impl<'a> Lexer<'a> {
 
     /// `<` is less-than; `<=` less-or-equal; `<>` not-equal. The vector distance
     /// operators share the `<` prefix: `<->` (L2), `<=>` (cosine), `<#>` (negative
-    /// inner product), each requiring the trailing `>`.
+    /// inner product), `<+>` (L1 / taxicab), each requiring the trailing `>`.
     fn less(&mut self) -> TokenKind {
         self.bump();
         match self.peek() {
@@ -171,6 +171,11 @@ impl<'a> Lexer<'a> {
                 self.bump();
                 self.bump();
                 TokenKind::VecInner
+            }
+            Some(b'+') if self.peek2() == Some(b'>') => {
+                self.bump();
+                self.bump();
+                TokenKind::VecL1
             }
             _ => TokenKind::Lt,
         }

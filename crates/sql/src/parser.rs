@@ -720,6 +720,7 @@ const fn infix_binding_power(kind: &TokenKind) -> Option<(BinOp, u8, u8)> {
         TokenKind::VecL2 => (BinOp::VecL2, 7),
         TokenKind::VecCosine => (BinOp::VecCosine, 7),
         TokenKind::VecInner => (BinOp::VecInner, 7),
+        TokenKind::VecL1 => (BinOp::VecL1, 7),
         _ => return None,
     };
     Some((op, l_bp, l_bp + 1))
@@ -769,10 +770,11 @@ mod tests {
 
     #[test]
     fn vector_distance_operators_parse_and_bind() {
-        // All three operators lex and render.
+        // All four operators lex and render.
         assert_eq!(shape("a <-> b"), "(a <-> b)");
         assert_eq!(shape("a <=> b"), "(a <=> b)");
         assert_eq!(shape("a <#> b"), "(a <#> b)");
+        assert_eq!(shape("a <+> b"), "(a <+> b)");
         // Distance binds tighter than comparison: `a <-> b < c` is `(a <-> b) < c`.
         assert_eq!(shape("a <-> b < c"), "((a <-> b) < c)");
         // `<=>` is the cosine operator, distinct from `<=` followed by `>`.

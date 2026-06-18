@@ -5992,6 +5992,12 @@ mod tests {
         // Negative inner product: -(1*4 + 2*6 + 3*3) = -25.
         let ip = scalar_float(&mut db, "SELECT e <#> '[4, 6, 3]' FROM d");
         assert!((ip + 25.0).abs() < 1e-9, "inner product was {ip}");
+        // L1 (Manhattan): |1-4| + |2-6| + |3-3| = 7.
+        let l1 = scalar_float(&mut db, "SELECT e <+> '[4, 6, 3]' FROM d");
+        assert!((l1 - 7.0).abs() < 1e-9, "l1 was {l1}");
+        // The function form agrees with the operator.
+        let l1f = scalar_float(&mut db, "SELECT l1_distance(e, '[4, 6, 3]') FROM d");
+        assert!((l1f - 7.0).abs() < 1e-9, "l1_distance was {l1f}");
         // Cosine distance against an identical direction is 0; against an
         // orthogonal vector it is 1.
         let same = scalar_float(&mut db, "SELECT e <=> '[2, 4, 6]' FROM d");

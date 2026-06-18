@@ -211,7 +211,8 @@ fn eval_scalar_func(
         // Vector / embedding functions (the function forms of the distance
         // operators, plus dimension and magnitude). NULL in any argument yields
         // NULL, as with the other value functions.
-        "VECTOR_DIMS" | "L2_NORM" | "L2_DISTANCE" | "COSINE_DISTANCE" | "INNER_PRODUCT" => {
+        "VECTOR_DIMS" | "L2_NORM" | "L2_DISTANCE" | "L1_DISTANCE" | "COSINE_DISTANCE"
+        | "INNER_PRODUCT" => {
             let vals = args
                 .iter()
                 .map(|a| eval_with(a, row, columns, runner))
@@ -242,6 +243,7 @@ fn apply_vector_func(name: &str, vals: &[Value]) -> Result<Value> {
             Ok(Value::Float(sum.sqrt()))
         }
         ("L2_DISTANCE", [a, b]) => vector_distance(BinOp::VecL2, a, b),
+        ("L1_DISTANCE", [a, b]) => vector_distance(BinOp::VecL1, a, b),
         ("COSINE_DISTANCE", [a, b]) => vector_distance(BinOp::VecCosine, a, b),
         // pgvector's inner_product is the positive dot product; `<#>` is its
         // negation, so flip the operator's sign back.
@@ -529,7 +531,9 @@ fn eval_binary(
         BinOp::Like => like(&l, &r),
         BinOp::Concat => Ok(Value::Text(value_text(&l) + &value_text(&r))),
         BinOp::JsonGet | BinOp::JsonGetText => json_get(&l, &r, op == BinOp::JsonGetText),
-        BinOp::VecL2 | BinOp::VecCosine | BinOp::VecInner => vector_distance(op, &l, &r),
+        BinOp::VecL2 | BinOp::VecCosine | BinOp::VecInner | BinOp::VecL1 => {
+            vector_distance(op, &l, &r)
+        }
         BinOp::And | BinOp::Or => unreachable!("handled above"),
     }
 }
@@ -604,6 +608,11 @@ fn vector_distance(op: BinOp, left: &Value, right: &Value) -> Result<Value> {
                 .sum();
             -dot
         }
+        BinOp::VecL1 => a
+            .iter()
+            .zip(&b)
+            .map(|(x, y)| (f64::from(*x) - f64::from(*y)).abs())
+            .sum(),
         _ => unreachable!("vector_distance only handles the vector operators"),
     };
     Ok(Value::Float(dist))

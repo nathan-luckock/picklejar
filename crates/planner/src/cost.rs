@@ -82,7 +82,8 @@ fn binary_selectivity(op: BinOp, left: &Expr, right: &Expr, table: &TableMeta) -
         // it carries no selectivity information.
         | BinOp::VecL2
         | BinOp::VecCosine
-        | BinOp::VecInner => UNKNOWN_SELECTIVITY,
+        | BinOp::VecInner
+        | BinOp::VecL1 => UNKNOWN_SELECTIVITY,
     }
 }
 
