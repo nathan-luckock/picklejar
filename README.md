@@ -112,7 +112,7 @@ A toy "build a database" project stops at a key-value store or wraps an existing
 | **Query engine** | hand-written lexer and Pratt parser, a cost-based planner, and a Volcano executor |
 | **Security** | roles, `GRANT` / `REVOKE`, ownership, and row-level security enforced in the engine |
 | **Vector memory** | `VECTOR(n)` type, four distance metrics, KNN, and an HNSW index (build, search, delete, persist) wired into SQL through a cached, RLS-safe path |
-| **Reliability under fault** | page, index, and metadata-sidecar checksums refuse corrupt data, a self-healing redundant index, a metamorphic oracle, and a regenerable certificate |
+| **Reliability under fault** | page, index, and metadata-sidecar checksums refuse corrupt data; a self-healing redundant index; Reed-Solomon erasure coding for mass-efficient self-healing storage; a metamorphic oracle; and a regenerable certificate |
 | **Postgres wire** | real clients and drivers connect over TCP, no shim |
 | **Deep SQL** | joins, window functions, set operations, correlated subqueries, CTEs, upserts, `information_schema` |
 
@@ -128,6 +128,7 @@ Correctness is not asserted, it is tested several independent ways, all under `c
 - **A metamorphic oracle for approximate search.** Relations that must always hold (self-retrieval, monotonic insertion, deletion consistency, recall monotonicity) test correctness without a ground-truth answer, the accepted answer to the oracle problem for approximate search.
 - **Corruption detection and self-healing.** Every page and every serialized index carries a CRC32 that is verified on read, so a flipped bit is refused rather than served; the index keeps a redundant copy and reconstructs itself from it with no intervention.
 - **An orbital radiation fault model in the live simulator.** A committed multi-tenant workload is irradiated across every persistent file (heap, WAL, and metadata sidecars) at a chosen orbit's single-event-upset rate for a chosen dwell time, then reopened: the engine either detects the corruption or it changed no committed answer, but it never serves a tenant a silently wrong embedding and never leaks another tenant's row. The injected dose is the orbit model, not an arbitrary fault count.
+- **Self-healing storage with mass-efficient redundancy.** A from-scratch Reed-Solomon erasure code (GF(2^8)) stores data as `k` shards plus `m` parity, so any `m` corrupt shards are reconstructed from the survivors. Surviving `m` failures this way costs `+m/k` storage (for example `+40%`) instead of the `+m*100%` (for example `+400%`) that redundant hardware copies cost, which is why you can launch light commodity storage instead of heavy triple-redundant drives. The store detects a bad shard by its checksum, logs the fault, repairs it from parity, and heals itself; `resilientdemo` runs the corruption drill.
 
 ```bash
 cargo run --release --bin dst -- 100000              # 100k reproducible crash scenarios
@@ -136,6 +137,7 @@ cargo run --release --bin vecsim -- 100000           # 100k durability + isolati
 cargo run --release --bin vecsim -- --irradiate 10000 365 geo   # irradiate a year in GEO
 cargo run --release --bin vecbench                   # HNSW vs brute-force speedup and recall
 cargo run --release --bin vecsqlbench                # cached SQL index path vs exact scan
+cargo run --release --bin resilientdemo              # erasure-coded self-healing corruption drill
 cargo run --release --bin vecert                     # the regenerable reliability certificate
 ```
 
