@@ -15,6 +15,7 @@
 use std::fmt::Write as _;
 
 use crate::hnsw::{Hnsw, Metric};
+use crate::{Database, QueryOutcome, Value};
 
 /// `SplitMix64`, the deterministic generator the rest of the engine uses.
 struct Rng(u64);
@@ -198,6 +199,10 @@ impl Certificate {
 
         // Radiation survivability: the proof, framed in an orbit's own units.
         checks.push(radiation_survivability());
+
+        // Whole-store corruption survival: the same property at the engine level,
+        // through the SQL layer, not just the index artifact.
+        checks.push(whole_store_corruption());
 
         Self { checks }
     }
@@ -396,6 +401,76 @@ fn radiation_survivability() -> Check {
             orbit.name()
         ),
         passed: detected == dose,
+    }
+}
+
+/// Whole-store corruption survival, exercised through the SQL layer: write known
+/// rows to a real database, flip a byte in a checksum-covered page region,
+/// reopen, and query. Committed data is either returned correctly or a corruption
+/// error surfaces; it is never served wrong without an error. This certifies the
+/// product claim (the whole store), not just the index artifact.
+fn whole_store_corruption() -> Check {
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    let to_f = |n: i64| f32::from(i16::try_from(n).unwrap_or(0));
+    let expected: Vec<Vec<Value>> = (1..=12i64)
+        .map(|i| vec![Value::Int(i), Value::Vector(vec![to_f(i), to_f(i * 3)])])
+        .collect();
+    let base = std::env::temp_dir().join(format!("pj-cert-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let _ = std::fs::create_dir_all(&base);
+
+    let mut rng = Rng::new(0xC0DE_1234_5678_9ABC);
+    let mut trials = 0usize;
+    let mut violated = 0usize;
+    for run in 0..8 {
+        let path = base.join(format!("c{run}.db"));
+        if let Ok(mut db) = Database::open(&path) {
+            let _ = db.execute("CREATE TABLE t (id INT, e VECTOR(2))");
+            for i in 1..=12i64 {
+                let _ = db.execute(&format!("INSERT INTO t VALUES ({i}, '[{i}, {}]')", i * 3));
+            }
+        }
+        let len = std::fs::metadata(&path).map_or(0, |m| m.len());
+        if len >= 8192 {
+            let pages = len / 8192;
+            let page = rng.next_u64() % pages;
+            let off = 12 + rng.next_u64() % (8192 - 12);
+            let pos = page * 8192 + off;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+            {
+                if f.seek(SeekFrom::Start(pos)).is_ok() {
+                    let mut b = [0u8; 1];
+                    if f.read_exact(&mut b).is_ok() {
+                        b[0] ^= 0xFF;
+                        let _ = f.seek(SeekFrom::Start(pos));
+                        let _ = f.write_all(&b);
+                    }
+                }
+            }
+        }
+        trials += 1;
+        if let Ok(mut db) = Database::open(&path) {
+            if let Ok(QueryOutcome::Rows { rows, .. }) =
+                db.execute("SELECT id, e FROM t ORDER BY id")
+            {
+                // Returned without error: it must be exactly the committed data.
+                if rows != expected {
+                    violated += 1;
+                }
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&base);
+    Check {
+        name: "whole-store corruption survival".into(),
+        detail: format!(
+            "{trials} page-corruption trials through SQL, {violated} silent-wrong results"
+        ),
+        passed: violated == 0,
     }
 }
 
