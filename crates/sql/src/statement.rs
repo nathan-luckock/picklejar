@@ -601,6 +601,15 @@ pub enum Statement {
         /// Target table, or `None` for all tables.
         table: Option<String>,
     },
+    /// `PROTECT [WITH (k = N, m = N)]`: write a Reed-Solomon parity snapshot of
+    /// the heap so corrupt pages can self-heal on the next `open_resilient`.
+    /// `None` shards fall back to the engine default.
+    Protect {
+        /// Data shards per stripe, or `None` for the default.
+        k: Option<u32>,
+        /// Parity shards per stripe, or `None` for the default.
+        m: Option<u32>,
+    },
     /// `COPY table {FROM | TO} 'path' [HEADER]`: bulk-load a table from a CSV
     /// file, or write its rows out to one.
     Copy {
@@ -1104,6 +1113,10 @@ impl fmt::Display for Statement {
                 Some(t) => write!(f, "VACUUM {t}"),
                 None => f.write_str("VACUUM"),
             },
+            Self::Protect { k, m } => match (k, m) {
+                (Some(k), Some(m)) => write!(f, "PROTECT WITH (k = {k}, m = {m})"),
+                _ => f.write_str("PROTECT"),
+            },
             Self::Copy {
                 table,
                 to,
@@ -1320,6 +1333,10 @@ impl Parser {
                     None
                 };
                 Statement::Vacuum { table }
+            }
+            TokenKind::Keyword(Keyword::Protect) => {
+                self.advance();
+                self.parse_protect_tail()?
             }
             TokenKind::Keyword(Keyword::Copy) => {
                 self.advance();
@@ -2313,6 +2330,49 @@ impl Parser {
             ));
         };
         Ok(Statement::SetVectorIndex { on })
+    }
+
+    /// `PROTECT [WITH (k = N, m = N)]` (the `PROTECT` is already consumed).
+    fn parse_protect_tail(&mut self) -> Result<Statement> {
+        if !self.eat_keyword(Keyword::With) {
+            return Ok(Statement::Protect { k: None, m: None });
+        }
+        self.expect(&TokenKind::LParen)?;
+        let mut k = None;
+        let mut m = None;
+        loop {
+            let name = self.parse_ident()?;
+            self.expect(&TokenKind::Eq)?;
+            let value = match self.peek().clone() {
+                TokenKind::Int(n) if n >= 0 => {
+                    self.advance();
+                    u32::try_from(n).map_err(|_| {
+                        SqlError::parse("PROTECT shard count too large", self.span())
+                    })?
+                }
+                other => {
+                    return Err(SqlError::parse(
+                        format!("expected a non-negative integer in PROTECT, found {other:?}"),
+                        self.span(),
+                    ))
+                }
+            };
+            match name.as_str() {
+                "k" => k = Some(value),
+                "m" => m = Some(value),
+                other => {
+                    return Err(SqlError::parse(
+                        format!("unknown PROTECT option `{other}` (expected k or m)"),
+                        self.span(),
+                    ))
+                }
+            }
+            if !self.eat(&TokenKind::Comma) {
+                break;
+            }
+        }
+        self.expect(&TokenKind::RParen)?;
+        Ok(Statement::Protect { k, m })
     }
 
     /// `GRANT <privileges> ON [TABLE] table TO grantees [WITH GRANT OPTION]`, or
