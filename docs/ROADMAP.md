@@ -231,8 +231,16 @@ Make silent corruption impossible to return.
 
 ### 2C. Redundancy and self-healing (no one is coming)
 
-Detection is not enough when nobody can replace the bad hardware. The store must
-reconstruct lost or corrupted data on its own.
+**Status: shipped.** Detection is not enough when nobody can replace the bad
+hardware, so the store reconstructs corrupted data on its own. A from-scratch
+Reed-Solomon erasure code (GF(2^8), `crates/storage/src/erasure.rs`) backs a
+self-healing block store (`resilient.rs`) and a page-heap parity layer
+(`resilience.rs`): `Database::protect(k, m)` writes a parity snapshot, and
+`Database::open_resilient` reconstructs any heap page whose checksum fails before
+the engine reads it, at `m/k` overhead instead of the `+m*100%` of redundant
+copies. `resilientdemo`, `resilientsim` (years of orbital dose versus scrub
+cadence), and a `vecert` check exercise it; the live-heap heal is tested end to
+end and the design below is what was built.
 
 - **Build:** erasure coding (Reed-Solomon parity) over page groups, or, as a
   simpler first cut, a replicated and checksummed WAL plus periodic full-page
@@ -411,11 +419,12 @@ the next one possible.
    into a regenerable, content-hashed artifact. Together they are the "nobody has
    done this" claim, made concrete.
 
-**Next:** the radiation model now corrupts every persistent file (heap, WAL, and
-the checksummed metadata sidecars), so what remains is replication and
-point-in-time recovery, and model-checking the core recovery and isolation
-invariants. Beyond that, redundancy and scrubbing (2C), radiation rates (3A),
-model checking (3C), and partition and power tolerance (3D), deepen the moat and the
+**Next:** the radiation model corrupts every persistent file (heap, WAL, and the
+checksummed metadata sidecars), and redundancy and self-healing (2C) now ship,
+the live heap reconstructing its corrupt pages from Reed-Solomon parity on open.
+What remains is replication and point-in-time recovery, and model-checking the
+core recovery and isolation invariants. Beyond that, radiation rates (3A), model
+checking (3C), and partition and power tolerance (3D), deepen the moat and the
 certificate. But the first three moves are what take this from a crash-proven
 vector engine to a credible, novel, fault-proven AI-memory layer for hardware
 nobody can reach.

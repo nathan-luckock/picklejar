@@ -33,7 +33,8 @@ every task to a pull request that is squash-merged once the checks
 | 12 | Security: roles, GRANT/REVOKE, ownership, SCRAM auth, row-level security | Shipped |
 | 13 | AI memory layer: VECTOR type, distance operators + KNN, RLS-filtered similarity, the vecsim simulator, HNSW index | Shipped |
 | 14 | Reliability for unreachable hardware: HNSW wired into SQL with a cached, RLS-safe index; corruption detection and self-healing; the metamorphic oracle; the `vecert` certificate; the orbital radiation fault model in the live simulator | Shipped |
-| 15 | Whole-footprint radiation (heap, WAL, and checksummed metadata sidecars); replication and point-in-time recovery, model-checking the recovery and isolation invariants | In progress |
+| 15 | Mass-efficient self-healing: from-scratch Reed-Solomon erasure coding; a self-healing block store; whole-footprint radiation (heap, WAL, sidecars); the live heap reconstructing corrupt pages from parity on `open_resilient` | Shipped |
+| 16 | Replication and point-in-time recovery; model-checking the recovery and isolation invariants | Planned |
 
 ## What shipped, by sprint
 

@@ -267,7 +267,12 @@ every serialized HNSW index carries a CRC32 that is verified on read, so a flipp
 bit (a radiation upset, silent data corruption) is refused with a checksum error
 rather than served as if it were intact. The index also keeps a redundant copy and
 reconstructs itself from it when one is corrupted past its checksum, with no
-intervention. A metamorphic oracle tests the correctness of approximate search
+intervention. The page heap goes further than detection: a from-scratch
+Reed-Solomon erasure code (GF(2^8)) lets `Database::protect(k, m)` write a parity
+snapshot, and `Database::open_resilient` reconstructs any heap page whose checksum
+fails from that parity before the engine reads it, so a node corrupted by
+radiation repairs its own storage on open at `m / k` overhead rather than the
+`+m*100%` of redundant copies. A metamorphic oracle tests the correctness of approximate search
 through relations that must always hold (self-retrieval, monotonic insertion,
 deletion consistency, recall monotonicity), the standard answer to the oracle
 problem when the exact result cannot be known. The `vecert` binary runs these
@@ -275,6 +280,8 @@ reliability invariants and emits a reproducible, content-hashed certificate,
 framed in a named orbit's expected upset rate.
 
 ```bash
+cargo run --release --bin resilientdemo        # erasure-coded self-healing corruption drill
+cargo run --release --bin resilientsim         # years of orbital radiation versus scrub cadence
 cargo run --release --bin vecert               # the regenerable reliability certificate
 ```
 

@@ -951,6 +951,45 @@ approximate-nearest-neighbor index (HNSW) of its own later, which is fast.
    `vector_index_path` tests are the regression net for exactly that, and
    `vecsqlbench` measures the warm speedup end to end through the SQL engine.
 
+## Self-healing storage (mass-efficient redundancy)
+
+Detecting corruption is not enough where nobody can replace the hardware: the
+store has to reconstruct what radiation damaged. The redundancy is done in
+software so a deployment can launch light, dense commodity storage instead of
+heavy radiation-hardened, triple-redundant parts.
+
+- **The code.** `crates/storage/src/erasure.rs` is a from-scratch systematic
+  Reed-Solomon code over GF(2^8) with the standard `0x11D` polynomial: `k` data
+  shards plus `m` parity shards, reconstructing the data from any `k` of the
+  `k + m`. Surviving `m` failures costs `m / k` storage instead of the `+m*100%`
+  of `m` redundant copies; for `k = 10, m = 2` that is `+20%` versus `+200%`. The
+  field tables, Gauss-Jordan inversion, and matrix multiply are all in-tree, like
+  the rest of the storage layer.
+
+- **The block store.** `resilient.rs` frames each shard with its own CRC32; on
+  read it verifies every shard, treats a mismatch as an erasure, reconstructs from
+  the survivors when at most `m` are bad, logs the fault, and rewrites the repaired
+  shards so the next read is clean. `scrub()` is the periodic pass that heals
+  latent corruption before a second fault on the same blob makes it unrecoverable.
+
+- **The live heap.** `resilience.rs` plus `Database::protect` / `open_resilient`
+  bring this to the engine. `protect(k, m)` writes a parity sidecar over stripes of
+  `k` heap pages; `open_resilient` reconstructs any heap page whose checksum fails
+  from that parity *before the buffer pool is built*, so the heal never fights the
+  checksum-enforcing read path and the crash-proven hot path is untouched (the
+  2000-seed DST sweep still recovers every seed). The page CRC localizes the fault
+  to an erasure; the erasure code rebuilds it.
+
+- **Honest scope.** The parity is a point-in-time snapshot. A page changed after
+  the last `protect` is crash-covered by the WAL and gains parity at the next
+  `protect`; `open_resilient` heals to the snapshot and WAL recovery replays
+  anything committed since, which is exactly right for a write-once-read-many
+  memory store with a periodic protect. More than `m` bad pages in a stripe is
+  genuine data loss: it is reported and the pages stay detectably corrupt, never
+  served as a silently wrong answer. `resilientsim` explores the envelope (orbital
+  dose versus scrub cadence), and `vecert` certifies both the block store and the
+  live-heap heal.
+
 ## Testing strategy
 
 - **Unit tests** in each module. Fast (`cargo test --lib` runs in <50ms today).
