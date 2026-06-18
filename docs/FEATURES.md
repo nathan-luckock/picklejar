@@ -257,6 +257,23 @@ cargo run --release --bin vecsim -- 100000     # 100k durability+isolation sims
 cargo run --bin vecsim -- --seed 42             # replay one exactly
 ```
 
+Beyond crash durability, the memory layer is built to survive corruption, the
+fault that dominates when hardware cannot be serviced. Every storage page and
+every serialized HNSW index carries a CRC32 that is verified on read, so a flipped
+bit (a radiation upset, silent data corruption) is refused with a checksum error
+rather than served as if it were intact. The index also keeps a redundant copy and
+reconstructs itself from it when one is corrupted past its checksum, with no
+intervention. A metamorphic oracle tests the correctness of approximate search
+through relations that must always hold (self-retrieval, monotonic insertion,
+deletion consistency, recall monotonicity), the standard answer to the oracle
+problem when the exact result cannot be known. The `vecert` binary runs these
+reliability invariants and emits a reproducible, content-hashed certificate,
+framed in a named orbit's expected upset rate.
+
+```bash
+cargo run --release --bin vecert               # the regenerable reliability certificate
+```
+
 ## Crates
 
 | Crate | Responsibility |

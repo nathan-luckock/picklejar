@@ -39,9 +39,11 @@ Honest scoping of what is and is not new:
 | Distance operators and brute-force KNN (`<->`, `<=>`, `<#>`, `<+>`, plus function forms) | **done** |
 | RLS-filtered similarity search (isolation enforced by the engine, not application code) | **done** |
 | Fault simulator for the memory layer (`vecsim`: durability and isolation under simulated crash) | **done** |
-| HNSW index (4 metrics, insert/search/delete, durable, recall > 0.90) | **index done**, planner wiring next |
+| HNSW index (4 metrics, insert/search/delete, durable, recall > 0.98 on hard data) | **index done**, planner wiring next |
+| Corruption detection and self-healing (page and index CRC32 enforced, redundant self-healing index, metamorphic oracle) | **done** |
+| Regenerable reliability certificate (`vecert`, framed in orbital upset rates) | **done** |
 
-**Where it is headed.** The index structure is complete and tested; the next step is wiring it into the planner so `ORDER BY embedding <-> :q LIMIT k` is accelerated at scale while still applying the row-level-security filter before the top-k, so the isolation guarantee holds. From there the path runs toward a space fault model (corruption, not just crash), self-healing, and a regenerable reliability certificate. The full plan is in [docs/ROADMAP.md](docs/ROADMAP.md).
+**Where it is headed.** The corruption story is built: page and index checksums are enforced so a flipped bit is detected, not served; the index self-heals from a redundant copy; a metamorphic oracle tests approximate search without a ground-truth answer; and `vecert` emits a regenerable, content-hashed reliability certificate framed in an orbit's own upset rates. The remaining major step is wiring the HNSW index into the planner so KNN is accelerated at scale while still applying the row-level-security filter before the top-k. From there, deeper fault models (bit flips injected into the live crash simulator) and the orbital deployment story. The full plan and its honest scoping are in [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## Quickstart
 
@@ -100,12 +102,13 @@ A toy "build a database" project stops at a key-value store or wraps an existing
 
 | | |
 |---|---|
-| **Storage** | 8 KiB slotted pages, an LRU-K buffer pool, a B+ tree, CRC32 checksums, all behind a `Disk` trait |
+| **Storage** | 8 KiB slotted pages, an LRU-K buffer pool, a B+ tree, CRC32 checksums verified on every read, all behind a `Disk` trait |
 | **Crash safety** | a write-ahead log and full ARIES recovery (analysis, redo, undo with compensation records) |
 | **Transactions** | MVCC snapshot isolation; `BEGIN` / `COMMIT` / `ROLLBACK`; a reader never blocks a writer |
 | **Query engine** | hand-written lexer and Pratt parser, a cost-based planner, and a Volcano executor |
 | **Security** | roles, `GRANT` / `REVOKE`, ownership, and row-level security enforced in the engine |
 | **Vector memory** | `VECTOR(n)` type, four distance metrics, KNN, and an HNSW index (build, search, delete, persist) |
+| **Reliability under fault** | page and index checksums refuse corrupt data, a self-healing redundant index, a metamorphic oracle, and a regenerable certificate |
 | **Postgres wire** | real clients and drivers connect over TCP, no shim |
 | **Deep SQL** | joins, window functions, set operations, correlated subqueries, CTEs, upserts, `information_schema` |
 
@@ -113,20 +116,32 @@ The complete feature list is in [docs/FEATURES.md](docs/FEATURES.md).
 
 ## Proof, not vibes
 
-Correctness is not asserted, it is tested three independent ways, all under `clippy -D warnings` and `rustfmt` in CI:
+Correctness is not asserted, it is tested several independent ways, all under `clippy -D warnings` and `rustfmt` in CI:
 
 - **Deterministic simulation testing.** Every crash scenario is one `u64` seed against a fault-injecting disk, so any failure replays exactly. **100,000 seeded crash-and-recover runs pass** (4.1M committed rows verified), and the harness found and fixed a real recovery bug.
 - **Differential testing against SQLite.** Random SQL run through both engines, compared as a sorted multiset, with SQLite as the independent oracle.
-- **Vector durability and isolation simulation (`vecsim`).** The same seeded, replayable model applied to the memory layer: a random multi-tenant embedding workload writing through the RLS fence, a crash, then a check that every committed embedding survives intact and that each tenant sees only its own after recovery, on reads and on nearest-neighbor ranking.
+- **Vector durability and isolation simulation (`vecsim`).** The same seeded, replayable model applied to the memory layer: a multi-tenant embedding workload writing through the RLS fence, a crash, then a check that every committed embedding survives intact and each tenant sees only its own after recovery, on reads and on nearest-neighbor ranking.
+- **A metamorphic oracle for approximate search.** Relations that must always hold (self-retrieval, monotonic insertion, deletion consistency, recall monotonicity) test correctness without a ground-truth answer, the accepted answer to the oracle problem for approximate search.
+- **Corruption detection and self-healing.** Every page and every serialized index carries a CRC32 that is verified on read, so a flipped bit is refused rather than served; the index keeps a redundant copy and reconstructs itself from it with no intervention.
 
 ```bash
 cargo run --release --bin dst -- 100000        # 100k reproducible crash scenarios
 cargo run --release --bin difftest -- 100000   # 100k queries checked against SQLite
 cargo run --release --bin vecsim -- 100000     # 100k durability + isolation sims
 cargo run --release --bin vecbench             # HNSW vs brute-force speedup and recall
+cargo run --release --bin vecert               # the regenerable reliability certificate
 ```
 
-A database for hardware you cannot service is only as good as its proof that it survives failure, and that proof is reproducible on demand from a single integer seed.
+A database for hardware you cannot service is only as good as its proof that it survives failure. `vecert` turns that proof into a single regenerable, content-hashed artifact:
+
+```text
+[PASS] recall L2 (clustered): recall@10 = 1.0000 over 3000 clustered vectors (oracle: brute force)
+[PASS] corruption detection: 7271/7271 single-bit faults detected on load
+[PASS] self-healing: 6/6 corrupted copies recovered exactly from redundancy
+[PASS] radiation survivability (LEO): modeled low Earth orbit dose ~1.07 upsets/day for a 261 KB index; all detected
+result: ALL INVARIANTS HELD
+certificate hash: ...  (regenerate from this commit to verify)
+```
 
 ## Architecture
 
