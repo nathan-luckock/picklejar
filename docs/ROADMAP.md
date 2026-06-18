@@ -64,14 +64,33 @@ row-level-security-filtered similarity (a tenant's search can only rank its own
 vectors), an HNSW index (four metrics, insert/search/delete, durable), and the
 `vecsim` simulator that proves durability and isolation together under crash.
 
-The honest gaps, which Horizon 1 closes:
+Much of this roadmap is now built. Shipped so far:
 
-- The HNSW index is **not yet wired into the query path**, so the search being
-  fault-tested is exact brute force, not the approximate index.
-- The fault model is **crash only**. It does not yet model the corruption faults
-  (bit flips, silent data corruption) that dominate in a radiation environment.
-- The test vectors are **uniform random**, not adversarial or embedding-like, so
-  recall testing does not yet stress the hard cases.
+- **Recall oracle on realistic data (1C/1D):** clustered, near-duplicate, and
+  unit-norm distributions, with recall@k held as a CI gate against the exact
+  brute-force oracle. Building it found a real recall bug (0.47 on clustered
+  data), fixed by the HNSW heuristic neighbor selection, which took it to 0.98.
+- **Metamorphic oracle (2D):** self-retrieval, monotonic insertion, deletion
+  consistency, and recall monotonicity, the answer to the oracle problem.
+- **Corruption detection (2B):** every page and every serialized index carries a
+  CRC32 verified on read, so a flipped bit is refused, not served. (The page
+  checksum machinery existed but was unwired; this closed that gap, verified by a
+  3000-seed crash sweep.)
+- **Self-healing (2C):** a redundant index reconstructs itself from its second
+  copy when one is corrupted past its checksum, with no intervention.
+- **Radiation framing (3A)** and the **regenerable reliability certificate (3B):**
+  `vecert` emits a content-hashed report of all of the above, framed in a named
+  orbit's upset rate.
+
+The remaining gaps:
+
+- The HNSW index is **not yet wired into the query path** (1A), so the search a
+  SQL `ORDER BY <-> LIMIT` runs is still exact brute force, not the index.
+- The corruption faults are injected into the serialized artifacts, **not yet
+  into the live crash simulator** (the deeper half of 2A) or surfaced through the
+  certificate at scale.
+- The core recovery and isolation invariants are simulation-tested but **not yet
+  model-checked** (3C).
 
 ## The arc
 
