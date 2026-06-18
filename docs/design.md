@@ -940,11 +940,16 @@ approximate-nearest-neighbor index (HNSW) of its own later, which is fast.
    graph but never returns from a search); and a versioned serialization so the
    index itself survives a restart. Recall is measured against the brute-force
    baseline from step 2 (recall@10 above 0.90 on random data, exact on the single
-   nearest), and `vecbench` reports its speedup over a linear scan. What remains
-   is wiring it into the planner so `ORDER BY embedding <-> :q LIMIT k` uses it.
-   The wiring must apply the RLS policy *before* taking the top k, or it would
-   breach the isolation guarantee that step 3 establishes; `vecsim` is the
-   regression net for exactly that.
+   nearest), and `vecbench` reports its speedup over a linear scan. The index is
+   now wired into SQL: an opt-in path serves `ORDER BY embedding <-> :q LIMIT k`
+   from a cached HNSW index instead of an exact scan. It is keyed by
+   `(role, table, column, metric)` and cleared on any write, and it only engages
+   when row-level security does not apply, because RLS folds a predicate into a
+   WHERE before dispatch and the index shape requires no WHERE. An RLS-fenced query
+   therefore always falls back to the exact, fenced path, so the acceleration can
+   never breach the isolation guarantee that step 3 establishes; `vecsim` and the
+   `vector_index_path` tests are the regression net for exactly that, and
+   `vecsqlbench` measures the warm speedup end to end through the SQL engine.
 
 ## Testing strategy
 
