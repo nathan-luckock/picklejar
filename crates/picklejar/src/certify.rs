@@ -204,6 +204,11 @@ impl Certificate {
         // through the SQL layer, not just the index artifact.
         checks.push(whole_store_corruption());
 
+        // Irradiated multi-tenant memory layer: a committed multi-tenant workload
+        // corrupted at an orbit's upset rate, then reopened, never serves a tenant
+        // a silently wrong embedding and never leaks another tenant's row.
+        checks.push(irradiated_memory_layer());
+
         Self { checks }
     }
 
@@ -238,7 +243,9 @@ impl Certificate {
     pub fn render(&self) -> String {
         let mut s = String::new();
         s.push_str("PICKLEJAR AI MEMORY LAYER RELIABILITY CERTIFICATE\n");
-        s.push_str("fault model: single-bit upsets injected into the serialized index\n");
+        s.push_str("fault model: single-event upsets injected into the serialized index, into\n");
+        s.push_str("      whole-store pages through SQL, and into an irradiated multi-tenant\n");
+        s.push_str("      workload at an orbit's upset rate\n");
         s.push_str("method: deterministic, every check reproducible from a fixed seed\n");
         s.push_str("note: crash durability (100k sims) and tenant isolation are certified\n");
         s.push_str("      separately and at larger scale by the `dst` and `vecsim` binaries\n");
@@ -469,6 +476,44 @@ fn whole_store_corruption() -> Check {
         name: "whole-store corruption survival".into(),
         detail: format!(
             "{trials} page-corruption trials through SQL, {violated} silent-wrong results"
+        ),
+        passed: violated == 0,
+    }
+}
+
+/// Irradiated multi-tenant memory layer, certified through the live simulator:
+/// for several seeds, build and commit a multi-tenant embedding workload, corrupt
+/// its on-disk bytes at the geostationary single-event-upset rate for a fixed
+/// dwell, reopen, and require that no tenant is ever served a silently wrong
+/// embedding and no row leaks across tenants. Every outcome is a deterministic
+/// function of its seed, so the reported counts (and the certificate hash) are
+/// reproducible.
+fn irradiated_memory_layer() -> Check {
+    use crate::radiation::Orbit;
+    let seeds = 8u64;
+    let orbit = Orbit::Geo;
+    let orbit_days = 400.0;
+    let mut flips = 0usize;
+    let mut detected = 0usize;
+    let mut violated = 0usize;
+    for seed in 0..seeds {
+        match crate::vecsim::run_seed_irradiated(seed, orbit, orbit_days) {
+            Ok(outcome) => {
+                flips += outcome.flips;
+                if outcome.detected {
+                    detected += 1;
+                }
+            }
+            Err(_) => violated += 1,
+        }
+    }
+    Check {
+        name: "irradiated memory layer (GEO)".into(),
+        detail: format!(
+            "{seeds} multi-tenant workloads irradiated for {orbit_days:.0} orbit-days at the \
+             {} rate through SQL; {flips} upsets injected, {detected} detected, \
+             {violated} silently wrong",
+            orbit.name()
         ),
         passed: violated == 0,
     }

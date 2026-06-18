@@ -146,6 +146,7 @@ A database for hardware you cannot service is only as good as its proof that it 
 [PASS] corruption detection: 7271/7271 single-bit faults detected on load
 [PASS] self-healing: 6/6 corrupted copies recovered exactly from redundancy
 [PASS] radiation survivability (LEO): modeled low Earth orbit dose ~1.07 upsets/day for a 261 KB index; all detected
+[PASS] irradiated memory layer (GEO): 8 multi-tenant workloads irradiated for 400 orbit-days through SQL; 0 silently wrong
 result: ALL INVARIANTS HELD
 certificate hash: ...  (regenerate from this commit to verify)
 ```
