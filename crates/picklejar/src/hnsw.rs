@@ -120,7 +120,7 @@ impl std::fmt::Debug for Hnsw {
 }
 
 /// The similarity metric the graph navigates by, matching the SQL operators:
-/// `L2` is `<->`, `Cosine` is `<=>`, `InnerProduct` is `<#>`.
+/// `L2` is `<->`, `Cosine` is `<=>`, `InnerProduct` is `<#>`, `L1` is `<+>`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Metric {
     /// Euclidean distance.
@@ -129,6 +129,8 @@ pub enum Metric {
     Cosine,
     /// Negative inner product (so smaller still means nearer).
     InnerProduct,
+    /// L1 (Manhattan / taxicab) distance.
+    L1,
 }
 
 impl Metric {
@@ -138,6 +140,7 @@ impl Metric {
             Self::L2 => 0,
             Self::Cosine => 1,
             Self::InnerProduct => 2,
+            Self::L1 => 3,
         }
     }
 
@@ -147,6 +150,7 @@ impl Metric {
             0 => Some(Self::L2),
             1 => Some(Self::Cosine),
             2 => Some(Self::InnerProduct),
+            3 => Some(Self::L1),
             _ => None,
         }
     }
@@ -194,15 +198,17 @@ fn rank(metric: Metric, a: &[f32], b: &[f32]) -> f32 {
         Metric::L2 => dist_sq(a, b),
         Metric::Cosine => cosine_distance(a, b),
         Metric::InnerProduct => -dot(a, b),
+        Metric::L1 => a.iter().zip(b).map(|(x, y)| (x - y).abs()).sum(),
     }
 }
 
 /// Convert a graph-ranking score back to the user-facing distance: the true L2
-/// distance for `L2` (the rank is squared), the score itself otherwise.
+/// distance for `L2` (the rank is squared), the score itself otherwise (cosine,
+/// negative inner product, and L1 are already in their final units).
 fn present(metric: Metric, score: f32) -> f32 {
     match metric {
         Metric::L2 => score.max(0.0).sqrt(),
-        Metric::Cosine | Metric::InnerProduct => score,
+        Metric::Cosine | Metric::InnerProduct | Metric::L1 => score,
     }
 }
 
@@ -749,6 +755,24 @@ mod tests {
             let got = index.search(query, 1, 80);
             let exact = brute_force_metric(&data, query, 1, Metric::Cosine);
             assert_eq!(got[0].0, exact[0], "cosine nearest should be exact");
+        }
+    }
+
+    #[test]
+    fn l1_metric_recovers_the_nearest() {
+        let dim = 12;
+        let data = gen_vectors(500, dim, 64);
+        let mut index = Hnsw::new_with_metric(dim, 16, 150, 9, Metric::L1);
+        for v in &data {
+            index.insert(v.clone());
+        }
+        // Each query is in the set, so its own L1 distance (0) is the minimum.
+        for q in 0..20 {
+            let query = &data[q * 11 % data.len()];
+            let got = index.search(query, 1, 80);
+            let exact = brute_force_metric(&data, query, 1, Metric::L1);
+            assert_eq!(got[0].0, exact[0], "L1 nearest should be exact");
+            assert!(got[0].1.abs() < 1e-6, "own L1 distance should be 0");
         }
     }
 
