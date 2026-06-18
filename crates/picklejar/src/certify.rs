@@ -196,6 +196,9 @@ impl Certificate {
         // redundancy with no intervention.
         checks.push(self_healing());
 
+        // Radiation survivability: the proof, framed in an orbit's own units.
+        checks.push(radiation_survivability());
+
         Self { checks }
     }
 
@@ -356,6 +359,58 @@ fn self_healing() -> Check {
         name: "self-healing".into(),
         detail: format!("{healed}/{trials} corrupted copies recovered exactly from redundancy"),
         passed: healed == trials,
+    }
+}
+
+fn radiation_survivability() -> Check {
+    use crate::radiation::{expected_upsets_per_day, Orbit};
+    let dim = 8;
+    let data = clustered(2000, dim, 12, 77);
+    let mut index = Hnsw::new(dim, 16, 100, 5);
+    for v in &data {
+        index.insert(v.clone());
+    }
+    let img = index.to_bytes();
+    let orbit = Orbit::Leo;
+    let per_day = expected_upsets_per_day(img.len(), orbit);
+    // Stress well above the expected daily dose: inject single-bit upsets, each
+    // into a fresh copy, and require every one detected (never a wrong answer).
+    let dose = stress_count(per_day);
+    let bits = img.len() * 8;
+    let mut rng = Rng::new(9001);
+    let mut detected = 0usize;
+    for _ in 0..dose {
+        let mut bad = img.clone();
+        let bit = usize::try_from(rng.next_u64() % bits as u64).unwrap_or(0);
+        bad[bit / 8] ^= 1u8 << (bit % 8);
+        if Hnsw::from_bytes(&bad).is_none() {
+            detected += 1;
+        }
+    }
+    let kb = img.len() / 1024;
+    Check {
+        name: "radiation survivability (LEO)".into(),
+        detail: format!(
+            "modeled {} dose ~{per_day:.2} upsets/day for a {kb} KB index; \
+             {detected}/{dose} single-bit upsets at high dose detected",
+            orbit.name()
+        ),
+        passed: detected == dose,
+    }
+}
+
+/// A fault count comfortably above the expected daily dose, clamped to keep the
+/// certificate fast.
+fn stress_count(per_day: f64) -> usize {
+    let target = (per_day * 100.0).ceil();
+    if !target.is_finite() || target < 64.0 {
+        64
+    } else if target > 4096.0 {
+        4096
+    } else {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let n = target as usize; // in 64..=4096, exact
+        n
     }
 }
 
