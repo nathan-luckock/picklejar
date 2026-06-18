@@ -322,4 +322,58 @@ mod tests {
             .collect();
         rt(&values, &schema);
     }
+
+    #[test]
+    fn random_mixed_rows_round_trip_including_vectors() {
+        // A dep-free randomized round-trip: many random schemas mixing INT, TEXT,
+        // BOOL, NULL, and VECTOR columns of varying dimension, to exercise the
+        // null bitmap and the variable-length vector encoding together.
+        let mut state = 0x1234_5678_9abc_def0u64;
+        let mut next = || {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        };
+        for _ in 0..1000 {
+            let ncols = usize::try_from(1 + next() % 6).unwrap();
+            let mut schema = Vec::with_capacity(ncols);
+            let mut values = Vec::with_capacity(ncols);
+            for _ in 0..ncols {
+                match next() % 5 {
+                    0 => {
+                        schema.push(DataType::Int);
+                        values.push(Value::Int(i64::from_ne_bytes(next().to_ne_bytes())));
+                    }
+                    1 => {
+                        schema.push(DataType::Text);
+                        let len = usize::try_from(next() % 7).unwrap();
+                        values.push(Value::Text("ab".repeat(len)));
+                    }
+                    2 => {
+                        schema.push(DataType::Bool);
+                        values.push(Value::Bool(next() & 1 == 0));
+                    }
+                    3 => {
+                        let dim = usize::try_from(1 + next() % 6).unwrap();
+                        schema.push(DataType::Vector(u32::try_from(dim).unwrap()));
+                        let v: Vec<f32> = (0..dim)
+                            .map(|_| {
+                                let raw = i16::try_from(next() % 2001).unwrap() - 1000;
+                                f32::from(raw)
+                            })
+                            .collect();
+                        values.push(Value::Vector(v));
+                    }
+                    // A NULL in an INT column: exercises the null bitmap path.
+                    _ => {
+                        schema.push(DataType::Int);
+                        values.push(Value::Null);
+                    }
+                }
+            }
+            rt(&values, &schema);
+        }
+    }
 }
