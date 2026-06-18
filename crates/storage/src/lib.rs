@@ -36,6 +36,7 @@ pub mod file;
 pub mod header;
 pub mod heap;
 pub mod page;
+pub mod resilient;
 pub mod varbtree;
 
 pub use btree::{
