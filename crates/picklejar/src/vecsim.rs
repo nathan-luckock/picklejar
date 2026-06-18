@@ -26,6 +26,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use crate::hnsw::Metric;
 use crate::{ast, Database, QueryOutcome, Value};
 
 /// `SplitMix64`: a small, fast, fully deterministic PRNG, seeded once per run.
@@ -203,6 +204,19 @@ fn simulate(seed: u64, dir: &Path) -> Result<Outcome, String> {
         if knn.iter().any(|row| row.first() != Some(&mine)) {
             return Err(format!(
                 "seed {seed}: tenant t{t}: a KNN result leaked another tenant's row"
+            ));
+        }
+
+        // The approximate (HNSW index) path is fenced too: a tenant's index
+        // search returns only its own rows. This fault-tests the index path's
+        // isolation after a crash, not just the exact brute-force path.
+        let zero = vec![0.0f32; dim];
+        let approx = db
+            .knn("memories", "e", &zero, 8, Metric::L2)
+            .map_err(|e| format!("seed {seed}: tenant t{t}: knn: {e}"))?;
+        if approx.iter().any(|row| row.get(1) != Some(&mine)) {
+            return Err(format!(
+                "seed {seed}: tenant t{t}: the index path leaked another tenant's row"
             ));
         }
     }
