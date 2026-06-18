@@ -17,6 +17,21 @@
 
 ---
 
+## 🛰️ Where this is headed
+
+`picklejar` started as a relational database built from scratch. It's becoming something sharper: **the memory layer for AI in environments you can't physically reach** — orbital and edge data centers where, when hardware fails, no one is coming to fix it.
+
+The bet is timely. Companies like [Starcloud](https://www.starcloud.com) are already running GPUs in orbit and training models in space, and the category is moving fast (a ~$1.1B valuation and an 88,000-satellite data-center filing as of early 2026). But the *data layer* up there — durable, isolated, queryable AI memory — does not exist yet. Vector search and engine-enforced tenant isolation are table stakes: Postgres with `pgvector` and row-level security already do them. The open ground is **proving** that the memory survives the chaos of an environment no one can service.
+
+That is the one thing this engine already does that the others don't. Its durability isn't asserted, it's **proven by deterministic simulation** — tens of thousands of seeded crash scenarios, every failure replayable byte-for-byte. The roadmap layers the AI memory and the fault simulator on top of that foundation.
+
+- **Today:** a complete, crash-proven, Postgres-compatible SQL engine — storage, WAL + ARIES recovery, MVCC, a cost-based planner, roles, and row-level security — built from scratch in Rust, cross-checked against SQLite and a fault-injecting simulator.
+- **Next:** native vector search (the AI memory), row-level-security-filtered similarity (isolation enforced by the engine, not app code), and a failure simulator that proves **zero data lost, zero data leaked** under simulated data-center chaos.
+
+The novelty claim that survives scrutiny isn't "vector + RLS" (shipped products do that) — it's **a vector / AI-memory database whose durability is proven by deterministic simulation, built for unreachable infrastructure.** Rigorous reliability testing of vector databases is still framed as an open problem in the literature ([*"…a Software Testing Roadmap for 2030"*](https://arxiv.org/pdf/2502.20812)); being first is the point.
+
+---
+
 > [!NOTE]
 > `psql`, JDBC, and `psycopg` connect to this engine over TCP and never notice it isn't Postgres. Behind the socket: a B+ tree on 8 KiB pages, ARIES crash recovery proven by a deterministic simulator, snapshot-isolation MVCC, and a planner that picks hash vs. nested-loop joins from statistics.
 

@@ -16,6 +16,47 @@ every layer is shaped the way it is. For the order in which the pieces were
 built, see [sprints.md](sprints.md); for the full SQL and engine surface, see
 [FEATURES.md](FEATURES.md).
 
+## Mission and direction
+
+The engine began as a from-scratch relational database. Its direction is now
+specific: **the memory layer for AI in environments that cannot be physically
+serviced** - orbital and edge data centers, where a failed disk is not getting
+swapped and a partitioned link is not getting a hands-on fix.
+
+This is a deliberate pivot toward a real, open problem rather than a better copy
+of an existing one. The reasoning:
+
+- **Compute is already moving to those environments.** Orbital data centers are
+  no longer speculative (GPUs and model training in space, multi-billion-dollar
+  valuations, large satellite-constellation filings as of early 2026), but the
+  durable, queryable *data layer* for them does not exist. Space storage products
+  so far are archival, not databases.
+- **The hard requirement there is provable durability, not features.** When no
+  human can intervene, "it usually recovers" is unacceptable. The system must be
+  able to *prove* that committed data survives arbitrary crashes and faults.
+- **That proof is exactly what this engine already has.** Recovery correctness is
+  established by deterministic simulation testing: a fault-injecting in-memory
+  disk, every run a single seed, every failure replayable byte-for-byte (see
+  [Crash model and the torture test](#crash-model-and-the-torture-test)).
+
+### What is and isn't novel (an honest scoping)
+
+Stated plainly so the claim survives scrutiny:
+
+- **Not novel:** vector similarity search; *engine-enforced* row-level isolation
+  on vector queries (Postgres + `pgvector` + RLS, and Oracle 23ai, already ship
+  this); deterministic simulation testing as a technique (FoundationDB,
+  TigerBeetle, Antithesis).
+- **The open ground:** a vector / AI-memory database whose durability is *proven*
+  by deterministic simulation, and which is built for unreachable infrastructure.
+  Rigorous reliability testing of vector databases is still posed as a future
+  problem in the literature, and no system fuses durable + isolated + vector +
+  fault-proven for the orbital/edge target.
+
+So vector search and row-level isolation are treated here as table stakes the
+engine must have; the differentiator, and the thing the roadmap drives toward, is
+the *proof* that the AI memory survives an environment no one can reach.
+
 ## Goals
 
 A relational database engine with:

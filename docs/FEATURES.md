@@ -11,7 +11,14 @@ The complete SQL and engine surface.
 ---
 
 For the reasoning behind each decision, see [design.md](design.md); for a quick
-tour, see the [README](../README.md).
+tour, see the [README](../README.md). For where the project is headed - the
+durable, isolated memory layer for AI in unreachable environments - see
+[Mission and direction](design.md#mission-and-direction).
+
+This page is the *shipped* surface. The roadmap on top of it is native vector
+search (AI memory), row-level-security-filtered similarity (isolation enforced by
+the engine), and a fault simulator that proves zero data lost and zero data
+leaked under simulated data-center chaos.
 
 ## SQL
 
