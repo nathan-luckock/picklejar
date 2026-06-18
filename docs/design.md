@@ -36,7 +36,8 @@ of an existing one. The reasoning:
   able to *prove* that committed data survives arbitrary crashes and faults.
 - **That proof is exactly what this engine already has.** Recovery correctness is
   established by deterministic simulation testing: a fault-injecting in-memory
-  disk, every run a single seed, every failure replayable byte-for-byte (see
+  disk, every run a single seed, every failure replayable byte-for-byte. The
+  current bar is **100,000 seeded crash-and-recover runs, all passing** (see
   [Crash model and the torture test](#crash-model-and-the-torture-test)).
 
 ### What is and isn't novel (an honest scoping)
@@ -56,6 +57,14 @@ Stated plainly so the claim survives scrutiny:
 So vector search and row-level isolation are treated here as table stakes the
 engine must have; the differentiator, and the thing the roadmap drives toward, is
 the *proof* that the AI memory survives an environment no one can reach.
+
+The memory layer is now under construction on top of the proven engine. A native
+`VECTOR(n)` type ships today (durable `f32` embedding storage, width-enforced on
+write; see [The vector memory layer](#the-vector-memory-layer)). The remaining
+steps are distance operators and nearest-neighbor search, then folding row-level
+security into similarity queries so the engine itself guarantees one tenant can
+never read another's memory, then extending the deterministic simulator to prove
+that isolation and durability hold together under fault.
 
 ## Goals
 
@@ -81,8 +90,11 @@ Every layer below the SQL surface is implemented and tested: storage, the
 write-ahead log and ARIES recovery, MVCC, the parser, the cost-based planner,
 the executor, and the PostgreSQL wire protocol. The SQL surface is deep
 (joins, window functions, set operations, CTEs, subqueries, a full everyday
-type system) and still growing. [sprints.md](sprints.md) tracks what shipped in
-what order.
+type system, roles and row-level security) and still growing. Durability is
+proven by 100,000 deterministic crash-and-recover simulations. The AI memory
+layer has begun: a native `VECTOR(n)` embedding type ships, with distance
+operators and isolated similarity search next. [sprints.md](sprints.md) tracks
+what shipped in what order.
 
 ## Architecture
 
@@ -844,6 +856,92 @@ serial, hence correct, just not yet concurrent.
 
 ---
 
+## The vector memory layer
+
+This is the first slice of the AI memory direction (see
+[Mission and direction](#mission-and-direction)). It begins with a native vector
+type and builds toward isolated, fault-proven similarity search.
+
+### The `VECTOR(n)` type
+
+A `VECTOR(n)` column holds an embedding: a fixed-width list of `f32` components.
+The type lives in the same `Value` / `DataType` vocabulary as every other column
+type, so it rides the existing row codec, catalog, persistence, wire, and CLI
+paths rather than a bolted-on side channel.
+
+- **`f32`, not `f64`.** Real-model embeddings are `f32`, and at a million vectors
+  of a few hundred dimensions the halved width is the difference between fitting
+  in memory and not. Storing `f64` would double the cost to represent precision
+  the source data never had.
+- **Equality stays reflexive.** `Value::Vector` compares component *bit patterns*,
+  not float values, so a vector containing a `NaN` still equals itself. That keeps
+  `Eq` lawful, which the engine relies on for grouping, deduplication, and hash
+  keys. Vectors are never the thing being compared for similarity through `=`;
+  that is what the distance operators are for.
+- **Width is declared and enforced.** The optional `(n)` is the embedding
+  dimension. Every write checks the vector's length against it, so a 384-dim model
+  cannot quietly insert a 768-dim row that would corrupt a later distance
+  computation. A bare `VECTOR` (dimension `0`) is width-agnostic, useful before the
+  embedding model is pinned down.
+- **On-disk form.** A `u32` component count followed by the little-endian `f32`s.
+  The count makes a vector self-describing within the row, and the format
+  round-trips a crash and reopen exactly like any other value. The declared
+  dimension is persisted in the catalog sidecar (a `VECTOR(n)` type tag), so a
+  reopened column rebuilds its width and keeps enforcing it.
+- **Literals.** A pgvector-style `VECTOR '[0.1, 0.2, 0.9]'` typed literal, and a
+  bare `'[...]'` string coerced into a vector column on write, so embeddings load
+  through the ordinary `INSERT` and `COPY` paths.
+
+### Why a vector column declines the B+ tree index
+
+The order-preserving key encoding behind the secondary indexes deliberately
+refuses `VECTOR` (alongside `FLOAT` and `DECIMAL`). A vector has no meaningful
+total order: nearest-neighbor search ranks by *distance to a query*, not by a
+fixed `<` over the values, and that ranking changes with every query. Forcing a
+vector into a B+ tree would index something nobody searches by. A vector column
+therefore falls back to a sequential scan today, which is correct, and will get an
+approximate-nearest-neighbor index (HNSW) of its own later, which is fast.
+
+### The build order, and where it stands
+
+1. **The `VECTOR(n)` type.** Shipped (above): durable `f32` embedding storage,
+   width-enforced on write.
+2. **Distance operators and brute-force KNN.** Shipped. `<->` (L2), `<=>`
+   (cosine), `<#>` (negative inner product) evaluate to a scalar, so
+   `ORDER BY embedding <-> :q LIMIT k` is nearest-neighbor search over a
+   sequential scan. Brute force first because it is the *correct* baseline every
+   faster index must be checked against.
+3. **RLS-filtered similarity.** Shipped. Row-level security already folds a
+   `USING` predicate into every read, so similarity search inherits it: the
+   engine itself guarantees a tenant's query can only ever rank that tenant's own
+   vectors. This is the isolation half of the mission, enforced in the engine, not
+   the application. Because the brute-force path filters before it sorts before it
+   limits, a `LIMIT` can never leak a forbidden row.
+4. **A fault simulator for the memory layer.** Shipped: the `vecsim` binary (and
+   `crates/picklejar/src/vecsim.rs`). It runs the real engine through a random
+   multi-tenant embedding workload, crashes by drop-and-reopen (WAL recovery),
+   and checks an oracle that every committed embedding survives intact *and* that
+   each tenant, after recovery, sees exactly its own embeddings and never
+   another's, on both reads and nearest-neighbor ranking. Every run is one seed,
+   so a failure replays exactly. This sits one level above the storage `dst`
+   simulator (row durability against a strict fault disk); together they cover
+   durability at the page level and durability-plus-isolation at the memory-layer
+   level. That proof, for AI memory in an unreachable environment, is the
+   contribution.
+5. **An ANN index (HNSW).** The index structure is in
+   (`crates/picklejar/src/hnsw.rs`): a seeded, deterministic Hierarchical
+   Navigable Small World graph. It is feature-complete as a standalone index:
+   build and top-k search; all three metrics (L2, cosine, inner product) matching
+   the SQL operators; tombstone-based delete (a removed vector keeps routing the
+   graph but never returns from a search); and a versioned serialization so the
+   index itself survives a restart. Recall is measured against the brute-force
+   baseline from step 2 (recall@10 above 0.90 on random data, exact on the single
+   nearest), and `vecbench` reports its speedup over a linear scan. What remains
+   is wiring it into the planner so `ORDER BY embedding <-> :q LIMIT k` uses it.
+   The wiring must apply the RLS policy *before* taking the top k, or it would
+   breach the isolation guarantee that step 3 establishes; `vecsim` is the
+   regression net for exactly that.
+
 ## Testing strategy
 
 - **Unit tests** in each module. Fast (`cargo test --lib` runs in <50ms today).
@@ -857,12 +955,19 @@ serial, hence correct, just not yet concurrent.
 
 ## Future work
 
-The query path is complete; these are the deliberate next steps, each tracked
-as an issue.
+The relational engine is complete and proven. The active direction is the AI
+memory layer (see [The vector memory layer](#the-vector-memory-layer)); the items
+below are the deliberate next steps, each tracked as an issue.
 
-- **Richer indexing.** A secondary index currently requires a unique key,
-  because the B+ tree rejects duplicate keys. A duplicate-aware leaf (or a key
-  suffix) would allow an index on any column.
+- **Distance operators and KNN.** `<->` / `<=>` / `<#>` and brute-force
+  nearest-neighbor search over the shipped `VECTOR` type. The correct baseline
+  before any approximate index.
+- **RLS-filtered similarity.** Fold row-level security into similarity queries so
+  per-tenant isolation on vector search is enforced by the engine.
+- **A fault simulator for the memory layer.** Extend deterministic simulation to
+  prove durability *and* isolation of AI memory under crash and fault.
+- **An ANN index (HNSW).** Speed at scale, verified against the brute-force
+  baseline.
 - **Concurrency depth.** Dead versions are reclaimed by `VACUUM`; epoch-based
   background garbage collection and first-updater-wins write-write conflict
   detection for overlapping explicit transactions are the next steps.
@@ -870,12 +975,9 @@ as an issue.
   carries the active-transaction table; bounding recovery to the last
   checkpoint, and batching `fsync` across committers, are additive performance
   work.
-- **Authentication and TLS** for the wire server, so it is safe to expose.
 - **Replication and point-in-time recovery**, built on the existing WAL.
 
 ## References
-
-- Mohan et al., *ARIES: A Transaction Recovery Method Supporting Fine-Granularity Locking and Partial Rollbacks Using Write-Ahead Logging* (1992).
 
 - Mohan et al., *ARIES: A Transaction Recovery Method Supporting Fine-Granularity Locking and Partial Rollbacks Using Write-Ahead Logging* (1992).
 - CMU 15-445 / 15-721 lectures (Pavlo).

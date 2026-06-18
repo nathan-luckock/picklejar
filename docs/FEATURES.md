@@ -15,10 +15,12 @@ tour, see the [README](../README.md). For where the project is headed - the
 durable, isolated memory layer for AI in unreachable environments - see
 [Mission and direction](design.md#mission-and-direction).
 
-This page is the *shipped* surface. The roadmap on top of it is native vector
-search (AI memory), row-level-security-filtered similarity (isolation enforced by
-the engine), and a fault simulator that proves zero data lost and zero data
-leaked under simulated data-center chaos.
+This page is the *shipped* surface. The AI memory layer is now landing on it: a
+native `VECTOR(n)` type ships today (durable embedding storage). The roadmap on
+top of that is distance operators and nearest-neighbor search (KNN), then
+row-level-security-filtered similarity (isolation enforced by the engine, not app
+code), then a fault simulator that proves zero data lost and zero data leaked
+under simulated data-center chaos.
 
 ## SQL
 
@@ -85,6 +87,18 @@ leaked under simulated data-center chaos.
   `->` (returns JSON) and `->>` (returns text) access operators, navigating by
   a text member name or an integer array index, and chainable
   (`body -> 'a' ->> 0`). The JSON parser is in-tree (no external crate).
+- **Vector** - a `VECTOR(n)` / `EMBEDDING(n)` column for AI embeddings, with
+  pgvector-style literals (`VECTOR '[0.1, 0.2, 0.9]'`, or a bare `'[...]'` string
+  coerced into the column). Stored as native `f32` components (a `u32` count then
+  the little-endian floats), so an embedding round-trips a crash and reopen like
+  any other value. The optional dimension declares the embedding width and is
+  enforced on every write; a bare `VECTOR` is width-agnostic. Distance operators
+  `<->` (L2), `<=>` (cosine), and `<#>` (negative inner product) evaluate to a
+  FLOAT, so `ORDER BY embedding <-> :query LIMIT k` is brute-force
+  nearest-neighbor search and `WHERE embedding <-> :query < r` is a radius
+  filter; the same distances are available as the functions `l2_distance`,
+  `cosine_distance`, and `inner_product`, alongside `vector_dims` and `l2_norm`.
+  This is the storage and query foundation of the AI memory layer.
 - **Decimal** - a `DECIMAL` / `NUMERIC` column with exact base-10 arithmetic
   (`0.1 + 0.2` is `0.3`, not a binary-float approximation), `DECIMAL '12.34'`
   literals, and exact `SUM` / `AVG`. Stored as an `i128` mantissa plus a scale,
@@ -94,8 +108,8 @@ leaked under simulated data-center chaos.
 - **Casts** - `CAST(expr AS type)` and the `expr::type` shorthand, converting
   between `INT` / `FLOAT` / `BOOL` / `TEXT` / `DATE` / `TIMESTAMP` / `JSON`
   (text is parsed, a float rounds to an int, any value renders to text, a
-  timestamp truncates to a date, text validates as JSON). A cast over a
-  constant folds at insert time.
+  timestamp truncates to a date, text validates as JSON, text parses to a
+  `VECTOR`). A cast over a constant folds at insert time.
 - **Expressions** - `INT` / `FLOAT` / `BOOL` / `TEXT` / `DATE` / `TIMESTAMP`,
   arithmetic with int-to-float promotion, `IN` / `BETWEEN` / `LIKE` / `IS NULL`,
   `CASE`, string `||`, and a library of scalar functions: string (`LENGTH`,
@@ -139,8 +153,14 @@ leaked under simulated data-center chaos.
   `col BETWEEN a AND b`) off either index, and the cost model chooses it whenever
   it beats a full scan. Every index hit is a candidate the executor re-checks
   against the predicate, so a stale or out-of-snapshot entry is filtered, never
-  returned. (`FLOAT` / `DECIMAL` are not keyed; such a column falls back to a
-  sequential scan.)
+  returned. (`FLOAT` / `DECIMAL` / `VECTOR` are not keyed by a B+ tree; such a column
+  falls back to a sequential scan. A vector has no meaningful total order and is
+  searched by distance, so it gets an approximate-nearest-neighbor index of its
+  own instead: an in-memory, seeded HNSW graph (`crates/picklejar/src/hnsw.rs`)
+  with build and top-k search, recall measured against the brute-force baseline.
+  The structure is in place; wiring it into the planner so `ORDER BY col <-> q
+  LIMIT k` uses it, with the row-level-security filter applied before the top-k,
+  is the next step.)
 - **Concurrency control** - MVCC with snapshot isolation and version chains.
 - **Interfaces** - an embeddable library, a `psql`-style CLI, and a
   PostgreSQL-wire-protocol server (simple + extended, with `$N` parameters).
@@ -217,6 +237,23 @@ multiset. SQLite is the independent oracle, so any divergence is a picklejar bug
 ```bash
 cargo run --release --bin difftest -- 100000   # 100k queries vs SQLite
 cargo run --bin difftest -- --seed 42           # replay one exactly
+```
+
+For the AI memory layer, a third simulator proves durability and isolation
+together. The **`vecsim`** binary runs the real engine through a random
+multi-tenant embedding workload (some transactions committed, a quarter rolled
+back), crashes by dropping and reopening the engine (WAL recovery), and checks an
+oracle that every committed embedding survives byte-for-byte *and* that each
+tenant, after recovery, sees exactly its own embeddings and never another's, on
+both ordinary reads and nearest-neighbor ranking. It sits one level above the
+storage `dst` simulator: `dst` proves row durability against a strict fault disk,
+`vecsim` proves embedding durability plus engine-enforced tenant isolation through
+the full SQL / RLS / MVCC stack. Every run is one seed, so any failure replays
+exactly.
+
+```bash
+cargo run --release --bin vecsim -- 100000     # 100k durability+isolation sims
+cargo run --bin vecsim -- --seed 42             # replay one exactly
 ```
 
 ## Crates
