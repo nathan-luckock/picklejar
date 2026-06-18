@@ -188,11 +188,18 @@ fn statement() -> impl Strategy<Value = Statement> {
             if_exists: false,
             name,
         }),
-        (ident(), ident(), ident()).prop_map(|(name, table, column)| Statement::CreateIndex {
-            name,
-            table,
-            column
-        }),
+        (
+            ident(),
+            ident(),
+            prop::collection::vec(ident(), 1..3),
+            any::<bool>()
+        )
+            .prop_map(|(name, table, columns, unique)| Statement::CreateIndex {
+                name,
+                table,
+                columns,
+                unique,
+            }),
         select().prop_map(|s| Statement::Select(Box::new(s))),
         (
             ident(),

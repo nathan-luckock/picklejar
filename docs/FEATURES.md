@@ -120,11 +120,14 @@ tour, see the [README](../README.md).
   index, secondary indexes, and CRC32 page checksums.
 - **Indexes** - a unique column of an order-preserving fixed type (`INT`,
   `DATE`, `TIMESTAMP`, `BOOL`) gets a physical secondary B+ tree automatically,
-  and `CREATE INDEX` builds one over any indexable column, including `TEXT` and
-  **non-unique** columns, through a second, variable-length-key B+ tree. The key
-  is the column value encoded order-preservingly plus the row id, so repeated
-  values produce distinct keys and a value lookup is a prefix range scan that
-  returns every matching row. Because the key map is order-preserving, the
+  and `CREATE [UNIQUE] INDEX name ON t (col, ...)` builds one over any indexable
+  column(s), including `TEXT`, **non-unique**, and **composite** (multi-column)
+  keys, through a second, variable-length-key B+ tree. The key is the column
+  values encoded order-preservingly plus the row id, so repeated values produce
+  distinct keys and a value lookup is a prefix range scan that returns every
+  matching row; equality on a leading subset of a composite index works the same
+  way. `UNIQUE` rejects a write (or an index build) that would duplicate the
+  indexed value tuple (`NULL`s never conflict). Because the key map is order-preserving, the
   planner drives both a point get (`col = x`) and a range scan (`col > x`,
   `col BETWEEN a AND b`) off either index, and the cost model chooses it whenever
   it beats a full scan. Every index hit is a candidate the executor re-checks

@@ -508,14 +508,16 @@ pub enum Statement {
         /// Table name.
         name: String,
     },
-    /// `CREATE INDEX name ON table (column)`.
+    /// `CREATE [UNIQUE] INDEX name ON table (col, ...)`.
     CreateIndex {
         /// Index name.
         name: String,
         /// Indexed table.
         table: String,
-        /// Indexed column.
-        column: String,
+        /// Indexed columns, in index order (the first is the leading column).
+        columns: Vec<String>,
+        /// `UNIQUE`: reject a write that would duplicate the indexed value(s).
+        unique: bool,
     },
     /// `CREATE VIEW name AS <query>`: a named, stored query expanded as a
     /// derived table wherever the view name appears in a FROM or JOIN.
@@ -995,8 +997,12 @@ impl fmt::Display for Statement {
             Self::CreateIndex {
                 name,
                 table,
-                column,
-            } => write!(f, "CREATE INDEX {name} ON {table} ({column})"),
+                columns,
+                unique,
+            } => {
+                let kw = if *unique { "UNIQUE INDEX" } else { "INDEX" };
+                write!(f, "CREATE {kw} {name} ON {table} ({})", columns.join(", "))
+            }
             Self::CreateTableAs { name, query } => write!(f, "CREATE TABLE {name} AS {query}"),
             Self::CreateView { name, query } => write!(f, "CREATE VIEW {name} AS {query}"),
             Self::DropView { if_exists, name } => {
@@ -1780,10 +1786,15 @@ impl Parser {
 
     fn parse_create(&mut self) -> Result<Statement> {
         self.expect_keyword(Keyword::Create)?;
+        // `CREATE UNIQUE INDEX ...`: the UNIQUE qualifier precedes INDEX.
+        if self.eat_keyword(Keyword::Unique) {
+            self.expect_keyword(Keyword::Index)?;
+            return self.parse_create_index_tail(true);
+        }
         if self.eat_keyword(Keyword::Table) {
             self.parse_create_table_tail()
         } else if self.eat_keyword(Keyword::Index) {
-            self.parse_create_index_tail()
+            self.parse_create_index_tail(false)
         } else if self.eat_keyword(Keyword::View) {
             self.parse_create_view_tail()
         } else if self.eat_ident_kw("role") {
@@ -2079,17 +2090,21 @@ impl Parser {
         }
     }
 
-    fn parse_create_index_tail(&mut self) -> Result<Statement> {
+    fn parse_create_index_tail(&mut self, unique: bool) -> Result<Statement> {
         let name = self.parse_ident()?;
         self.expect_keyword(Keyword::On)?;
         let table = self.parse_ident()?;
         self.expect(&TokenKind::LParen)?;
-        let column = self.parse_ident()?;
+        let mut columns = vec![self.parse_ident()?];
+        while self.eat(&TokenKind::Comma) {
+            columns.push(self.parse_ident()?);
+        }
         self.expect(&TokenKind::RParen)?;
         Ok(Statement::CreateIndex {
             name,
             table,
-            column,
+            columns,
+            unique,
         })
     }
 
@@ -2741,6 +2756,22 @@ mod tests {
     }
 
     #[test]
+    fn create_index_round_trips_unique_and_composite() {
+        round_trip("CREATE INDEX i ON t (a)");
+        round_trip("CREATE INDEX i ON t (a, b, c)");
+        round_trip("CREATE UNIQUE INDEX i ON t (email)");
+        round_trip("CREATE UNIQUE INDEX i ON t (tenant, slug)");
+        let Statement::CreateIndex {
+            columns, unique, ..
+        } = parse("CREATE UNIQUE INDEX i ON t (a, b)")
+        else {
+            panic!("expected CreateIndex");
+        };
+        assert!(unique);
+        assert_eq!(columns, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
     fn roles_and_grants_round_trip() {
         round_trip("CREATE ROLE analyst");
         round_trip("CREATE ROLE admin SUPERUSER CREATEROLE");
@@ -3187,7 +3218,8 @@ mod tests {
             Statement::CreateIndex {
                 name: "idx_name".into(),
                 table: "parts".into(),
-                column: "name".into(),
+                columns: vec!["name".into()],
+                unique: false,
             }
         );
     }

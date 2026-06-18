@@ -130,8 +130,14 @@ impl Catalog {
             Statement::CreateIndex {
                 name,
                 table,
-                column,
-            } => self.create_index(name, table, column),
+                columns,
+                ..
+            } => {
+                // The planner only needs the leading column to decide an index
+                // scan; the full column list lives in the engine's descriptor.
+                let leading = columns.first().map_or("", String::as_str);
+                self.create_index(name, table, leading)
+            }
             other => Err(PlanError::Unsupported(format!("{other}"))),
         }
     }

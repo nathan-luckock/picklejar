@@ -101,6 +101,8 @@ struct MultiSecondaryIndex {
     /// so the cost model can judge an equality's selectivity after a reopen
     /// (stats are otherwise in-memory only).
     distinct: u64,
+    /// Whether the index enforces uniqueness of the indexed value tuple.
+    unique: bool,
 }
 
 /// The outcome of running one statement.
@@ -329,7 +331,8 @@ impl Database {
                 self.catalog.apply(&Statement::CreateIndex {
                     name: index.clone(),
                     table: r.name.clone(),
-                    column: column.clone(),
+                    columns: vec![column.clone()],
+                    unique: false,
                 })?;
             }
             self.catalog.set_row_count(&r.name, r.next_rowid)?;
@@ -721,8 +724,9 @@ impl Database {
             Statement::CreateIndex {
                 ref name,
                 ref table,
-                ref column,
-            } => self.create_index(name, table, column),
+                ref columns,
+                unique,
+            } => self.create_index(name, table, columns, unique),
             Statement::DropTable {
                 if_exists,
                 ref name,
@@ -1163,6 +1167,7 @@ impl Database {
                     columns,
                     root: PageId(r.root),
                     distinct: r.distinct,
+                    unique: r.unique,
                 });
             }
         }
@@ -1185,6 +1190,7 @@ impl Database {
                     name: m.name.clone(),
                     root: m.root.0,
                     distinct: m.distinct,
+                    unique: m.unique,
                     columns: m
                         .columns
                         .iter()
@@ -1720,7 +1726,8 @@ impl Database {
                 self.catalog.apply(&Statement::CreateIndex {
                     name: format!("{name}_{}_idx", col.name),
                     table: name.clone(),
-                    column: col.name.clone(),
+                    columns: vec![col.name.clone()],
+                    unique: false,
                 })?;
             }
         }
@@ -2042,10 +2049,10 @@ impl Database {
                 .map(|(_k, bytes)| decode_row(&bytes, &schema))
                 .collect::<std::result::Result<_, _>>()?;
             let sec_cols: Vec<usize> = store.secondary.iter().map(|s| s.column).collect();
-            let multi_cols: Vec<(String, Vec<usize>, u64)> = store
+            let multi_cols: Vec<(String, Vec<usize>, u64, bool)> = store
                 .multi_secondary
                 .iter()
-                .map(|m| (m.name.clone(), m.columns.clone(), m.distinct))
+                .map(|m| (m.name.clone(), m.columns.clone(), m.distinct, m.unique))
                 .collect();
             (rows, sec_cols, multi_cols)
         };
@@ -2062,12 +2069,13 @@ impl Database {
             });
         }
         let mut multi: Vec<MultiSecondaryIndex> = Vec::with_capacity(multi_cols.len());
-        for (name, columns, distinct) in multi_cols {
+        for (name, columns, distinct, unique) in multi_cols {
             multi.push(MultiSecondaryIndex {
                 name,
                 columns,
                 root: MultiIndex::create(&self.pool)?.root(),
                 distinct,
+                unique,
             });
         }
 
@@ -2400,41 +2408,57 @@ impl Database {
         Ok(rows)
     }
 
-    /// `CREATE INDEX name ON table (column)`: register the index in the catalog
-    /// and, for an indexable column type that is not already physically indexed,
-    /// build and populate a variable-key [`MultiIndex`] over the live rows.
-    fn create_index(&mut self, name: &str, table: &str, column: &str) -> Result<QueryOutcome> {
+    /// `CREATE [UNIQUE] INDEX name ON table (col, ...)`: register the index in
+    /// the catalog and, when every column has an indexable type and the leading
+    /// column is not already physically indexed, build and populate a
+    /// variable-key [`MultiIndex`] over the live rows.
+    fn create_index(
+        &mut self,
+        name: &str,
+        table: &str,
+        columns: &[String],
+        unique: bool,
+    ) -> Result<QueryOutcome> {
         // Only the table owner (or a superuser) may add an index.
         self.require_owner(table)?;
-        // Validate and register in the catalog (the planner sees it from here).
+        // Validate and register in the catalog (the planner sees the leading
+        // column from here).
         self.catalog.apply(&Statement::CreateIndex {
             name: name.to_string(),
             table: table.to_string(),
-            column: column.to_string(),
+            columns: columns.to_vec(),
+            unique,
         })?;
 
-        let (col_idx, col_ty) = {
+        // Resolve each column to its position and type.
+        let cols: Vec<(usize, DataType)> = {
             let meta = self
                 .catalog
                 .get_table(table)
                 .ok_or_else(|| DbError::UnknownTable(table.to_string()))?;
-            let idx = meta
-                .column_index(column)
-                .ok_or_else(|| DbError::UnknownColumn {
-                    table: table.to_string(),
-                    column: column.to_string(),
-                })?;
-            (idx, meta.columns[idx].ty)
+            columns
+                .iter()
+                .map(|c| {
+                    meta.column_index(c)
+                        .map(|i| (i, meta.columns[i].ty))
+                        .ok_or_else(|| DbError::UnknownColumn {
+                            table: table.to_string(),
+                            column: c.clone(),
+                        })
+                })
+                .collect::<Result<_>>()?
         };
+        let col_idxs: Vec<usize> = cols.iter().map(|(i, _)| *i).collect();
+        let leading = col_idxs[0];
 
-        // Skip a column already covered by a physical index (the auto-built u64
-        // index for a unique fixed-type column, or a prior CREATE INDEX) or whose
-        // type the variable-key index does not handle.
+        // Skip when every column is already covered by the leading u64 index or
+        // an identical variable-key index, or when a column's type is not keyed.
+        let all_indexable = cols.iter().all(|(_, ty)| is_multi_indexable(*ty));
         let already = self.tables.get(table).is_some_and(|s| {
-            s.secondary.iter().any(|x| x.column == col_idx)
-                || s.multi_secondary.iter().any(|m| m.columns == [col_idx])
+            (col_idxs.len() == 1 && s.secondary.iter().any(|x| x.column == leading))
+                || s.multi_secondary.iter().any(|m| m.columns == col_idxs)
         });
-        if is_multi_indexable(col_ty) && !already {
+        if all_indexable && !already {
             let schema: Vec<DataType> = self
                 .catalog
                 .get_table(table)
@@ -2445,14 +2469,20 @@ impl Database {
                 .collect();
             let rows = self.scan_rows_with_rowid(table, &schema)?;
             let mindex = MultiIndex::create(&self.pool)?;
+            // Distinct values of the *leading* column, for the cost model.
             let mut distinct = std::collections::HashSet::new();
             for (rowid, values) in &rows {
-                mindex.put(&[&values[col_idx]], *rowid)?;
-                // Track the column's distinct values (by their encoded bytes) so
-                // the cost model can judge an equality's selectivity and actually
-                // choose this index when it pays off.
+                let key_vals: Vec<&Value> = col_idxs.iter().map(|&c| &values[c]).collect();
+                // A UNIQUE index refuses a build over data that already has a
+                // duplicate tuple (every entry built so far is from a live row).
+                if unique && !mindex.lookup_prefix(&key_vals)?.is_empty() {
+                    return Err(DbError::Constraint(format!(
+                        "could not create unique index \"{name}\": table contains duplicate values"
+                    )));
+                }
+                mindex.put(&key_vals, *rowid)?;
                 let mut enc = Vec::new();
-                if crate::keyenc::encode_field(&values[col_idx], &mut enc) {
+                if crate::keyenc::encode_field(&values[leading], &mut enc) {
                     distinct.insert(enc);
                 }
             }
@@ -2461,14 +2491,15 @@ impl Database {
             if let Some(store) = self.tables.get_mut(table) {
                 store.multi_secondary.push(MultiSecondaryIndex {
                     name: name.to_string(),
-                    columns: vec![col_idx],
+                    columns: col_idxs,
                     root,
                     distinct,
+                    unique,
                 });
             }
             self.catalog.set_column_stats(
                 table,
-                column,
+                &columns[0],
                 ColumnStats {
                     distinct,
                     min: None,
@@ -2478,6 +2509,66 @@ impl Database {
         }
         self.persist()?;
         Ok(QueryOutcome::Ddl)
+    }
+
+    /// Reject a write whose `values` would duplicate the tuple of any `UNIQUE`
+    /// variable-key index on `table`. Checks both the rows already stored (the
+    /// index plus an MVCC visibility check under `txn`, skipping `exclude`'s own
+    /// row on an update) and `peers` (other rows produced earlier in the same
+    /// statement). A tuple with a `NULL` never conflicts (SQL semantics).
+    fn check_unique_multi(
+        &self,
+        txn: &Transaction,
+        table: &str,
+        values: &[Value],
+        exclude: Option<u64>,
+        peers: &[Vec<Value>],
+    ) -> Result<()> {
+        let Some(store) = self.tables.get(table) else {
+            return Ok(());
+        };
+        if !store.multi_secondary.iter().any(|m| m.unique) {
+            return Ok(());
+        }
+        let schema: Vec<DataType> = self
+            .catalog
+            .get_table(table)
+            .map(|m| m.columns.iter().map(|c| c.ty).collect())
+            .unwrap_or_default();
+        let mvcc = MvccTable::open(
+            &self.pool,
+            self.wal.clone(),
+            &self.mgr,
+            store.index_root,
+            store.version_page,
+        );
+        for m in &store.multi_secondary {
+            if !m.unique {
+                continue;
+            }
+            let key_vals: Vec<&Value> = m.columns.iter().map(|&c| &values[c]).collect();
+            if key_vals.iter().any(|v| matches!(v, Value::Null)) {
+                continue;
+            }
+            let same = |row: &[Value]| m.columns.iter().all(|&c| row[c] == values[c]);
+            // Another row earlier in this same statement.
+            if peers.iter().any(|p| same(p)) {
+                return Err(unique_violation(&m.name));
+            }
+            // A row already committed (or written earlier and visible to `txn`).
+            let mindex = MultiIndex::open(&self.pool, m.root);
+            for rowid in mindex.lookup_prefix(&key_vals)? {
+                if Some(rowid) == exclude {
+                    continue;
+                }
+                if let Some(bytes) = mvcc.get(txn, rowid)? {
+                    if same(&decode_row(&bytes, &schema)?) {
+                        return Err(unique_violation(&m.name));
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Rebuild `table`'s physical storage and secondary indexes from `rows`,
@@ -2504,7 +2595,8 @@ impl Database {
                     self.catalog.apply(&Statement::CreateIndex {
                         name: format!("{table}_{}_idx", c.name),
                         table: table.to_string(),
-                        column: c.name.clone(),
+                        columns: vec![c.name.clone()],
+                        unique: false,
                     })?;
                 }
                 secondary.push(SecondaryIndex {
@@ -2640,7 +2732,8 @@ impl Database {
                     self.catalog.apply(&Statement::CreateIndex {
                         name: format!("{table}_{}_idx", c.name),
                         table: table.to_string(),
-                        column: c.name.clone(),
+                        columns: vec![c.name.clone()],
+                        unique: false,
                     })?;
                 }
                 secondary.push(SecondaryIndex {
@@ -3153,6 +3246,9 @@ impl Database {
             self.enforce_checks(table, &column_names, &values)?;
             self.enforce_rls_check(table, PolicyCommand::Insert, &column_names, &values)?;
             self.enforce_fk_child(txn, table, &column_names, &values)?;
+            // A UNIQUE variable-key index rejects a duplicate value tuple, against
+            // both stored rows and earlier rows of this same INSERT.
+            self.check_unique_multi(txn, table, &values, None, &built)?;
             built.push(values);
         }
 
@@ -3954,6 +4050,9 @@ impl Database {
                 self.enforce_checks(table, &columns, &new_row)?;
                 self.enforce_rls_check(table, PolicyCommand::Update, &columns, &new_row)?;
                 self.enforce_fk_child(txn, table, &columns, &new_row)?;
+                // A UNIQUE variable-key index rejects an update that collides with
+                // another row (excluding this row's own current entry).
+                self.check_unique_multi(txn, table, &new_row, Some(key), &[])?;
                 // RESTRICT / NO ACTION on a changed referenced key blocks before
                 // any write; CASCADE / SET NULL run after the parent is updated.
                 self.check_fk_update_restrict(txn, table, &columns, &row, &new_row)?;
@@ -4604,6 +4703,13 @@ fn grantee_name(grantee: &Grantee) -> String {
 fn others(mut set: HashSet<String>, victim: &str) -> HashSet<String> {
     set.remove(victim);
     set
+}
+
+/// A duplicate-key error for a `UNIQUE` index named `index`.
+fn unique_violation(index: &str) -> DbError {
+    DbError::Constraint(format!(
+        "duplicate key value violates unique index \"{index}\""
+    ))
 }
 
 /// The role names a policy applies to. An empty list, or one naming `PUBLIC`,
@@ -6390,6 +6496,96 @@ mod tests {
                 .map(|i| vec![Value::Int(i)])
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn composite_index_serves_leading_and_full_equality() {
+        let (_dir, mut db) = db();
+        db.execute("CREATE TABLE t (tenant INT, status TEXT, id INT)")
+            .unwrap();
+        for tenant in 0..5 {
+            for i in 0..10 {
+                let st = if i % 2 == 0 { "open" } else { "closed" };
+                db.execute(&format!("INSERT INTO t VALUES ({tenant}, '{st}', {i})"))
+                    .unwrap();
+            }
+        }
+        db.execute("CREATE INDEX t_ts ON t (tenant, status)")
+            .unwrap();
+        // Leading-column equality uses the composite index.
+        let plan = explain(&mut db, "SELECT id FROM t WHERE tenant = 2");
+        assert!(plan.contains("IndexScan"), "plan was:\n{plan}");
+        let (_c, rows) = query(&mut db, "SELECT id FROM t WHERE tenant = 2 ORDER BY id");
+        assert_eq!(rows.len(), 10);
+        // Full-tuple equality returns the right rows (residual filter narrows the
+        // leading-prefix candidates by the second column).
+        let (_c, rows) = query(
+            &mut db,
+            "SELECT id FROM t WHERE tenant = 3 AND status = 'open' ORDER BY id",
+        );
+        assert_eq!(rows, [0, 2, 4, 6, 8].map(|i| vec![Value::Int(i)]).to_vec());
+    }
+
+    #[test]
+    fn unique_index_rejects_duplicates_on_insert_and_update() {
+        let (_dir, mut db) = db();
+        db.execute("CREATE TABLE u (id INT, email TEXT)").unwrap();
+        db.execute("INSERT INTO u VALUES (1, 'a@x.com'), (2, 'b@x.com')")
+            .unwrap();
+        db.execute("CREATE UNIQUE INDEX u_email ON u (email)")
+            .unwrap();
+        // A duplicate insert is refused.
+        assert!(matches!(
+            db.execute("INSERT INTO u VALUES (3, 'a@x.com')")
+                .unwrap_err(),
+            DbError::Constraint(_)
+        ));
+        // A distinct value is fine.
+        db.execute("INSERT INTO u VALUES (3, 'c@x.com')").unwrap();
+        // An update into an existing value is refused; updating the row to its own
+        // value is fine.
+        assert!(matches!(
+            db.execute("UPDATE u SET email = 'b@x.com' WHERE id = 1")
+                .unwrap_err(),
+            DbError::Constraint(_)
+        ));
+        db.execute("UPDATE u SET email = 'a@x.com' WHERE id = 1")
+            .unwrap();
+        // Two duplicate rows in one multi-row INSERT are caught.
+        assert!(matches!(
+            db.execute("INSERT INTO u VALUES (4, 'd@x.com'), (5, 'd@x.com')")
+                .unwrap_err(),
+            DbError::Constraint(_)
+        ));
+    }
+
+    #[test]
+    fn unique_index_refuses_to_build_over_duplicate_data() {
+        let (_dir, mut db) = db();
+        db.execute("CREATE TABLE u (id INT, email TEXT)").unwrap();
+        db.execute("INSERT INTO u VALUES (1, 'dup@x.com'), (2, 'dup@x.com')")
+            .unwrap();
+        assert!(matches!(
+            db.execute("CREATE UNIQUE INDEX u_email ON u (email)")
+                .unwrap_err(),
+            DbError::Constraint(_)
+        ));
+    }
+
+    #[test]
+    fn composite_unique_allows_distinct_tuples() {
+        let (_dir, mut db) = db();
+        db.execute("CREATE TABLE m (tenant INT, slug TEXT)")
+            .unwrap();
+        db.execute("CREATE UNIQUE INDEX m_u ON m (tenant, slug)")
+            .unwrap();
+        db.execute("INSERT INTO m VALUES (1, 'a'), (1, 'b'), (2, 'a')")
+            .unwrap();
+        // Same (tenant, slug) tuple is rejected.
+        assert!(matches!(
+            db.execute("INSERT INTO m VALUES (1, 'a')").unwrap_err(),
+            DbError::Constraint(_)
+        ));
     }
 
     // --- transaction durability across reopen ---
