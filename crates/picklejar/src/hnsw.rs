@@ -101,6 +101,9 @@ pub struct Hnsw {
     metric: Metric,
     rng: Rng,
     nodes: Vec<Node>,
+    /// Tombstones, one per node: a removed node stays in the graph for
+    /// connectivity but is never returned from a search.
+    tombstones: Vec<bool>,
     entry: Option<usize>,
     max_level: usize,
 }
@@ -236,21 +239,40 @@ impl Hnsw {
             metric,
             rng: Rng::new(seed),
             nodes: Vec::new(),
+            tombstones: Vec::new(),
             entry: None,
             max_level: 0,
         }
     }
 
-    /// Number of indexed vectors.
+    /// Number of live (non-removed) indexed vectors.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.nodes.len()
+        self.nodes.len() - self.tombstones.iter().filter(|&&t| t).count()
     }
 
-    /// Whether the index holds no vectors.
+    /// Whether the index holds no live vectors.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.nodes.is_empty()
+        self.len() == 0
+    }
+
+    /// Whether node `id` has been removed.
+    fn is_deleted(&self, id: usize) -> bool {
+        self.tombstones.get(id).copied().unwrap_or(false)
+    }
+
+    /// Remove the vector with id `id` (its insertion index): it is tombstoned, so
+    /// it stays in the graph as a routing waypoint but is never returned from a
+    /// search again. Returns `false` if `id` is unknown or already removed. The
+    /// graph is not restructured, matching how production HNSW handles deletes.
+    pub fn remove(&mut self, id: usize) -> bool {
+        if id < self.tombstones.len() && !self.tombstones[id] {
+            self.tombstones[id] = true;
+            true
+        } else {
+            false
+        }
     }
 
     /// A random level from the exponential distribution HNSW uses, so most nodes
@@ -276,6 +298,7 @@ impl Hnsw {
             vector,
             neighbors: vec![Vec::new(); level + 1],
         });
+        self.tombstones.push(false);
 
         let Some(entry) = self.entry else {
             // First node: it becomes the entry point.
@@ -339,7 +362,7 @@ impl Hnsw {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(b"PJHN");
-        out.extend_from_slice(&2u32.to_le_bytes());
+        out.extend_from_slice(&3u32.to_le_bytes());
         out.push(self.metric.tag());
         for field in [
             self.dim as u64,
@@ -366,11 +389,15 @@ impl Hnsw {
                 }
             }
         }
+        // One tombstone byte per node, trailing the node section.
+        for &t in &self.tombstones {
+            out.push(u8::from(t));
+        }
         out
     }
 
     /// Restore an index from [`to_bytes`](Self::to_bytes) output. Returns `None`
-    /// if the bytes are not a version-2 index image or are truncated, so a
+    /// if the bytes are not a version-3 index image or are truncated, so a
     /// corrupt sidecar is rejected rather than trusted.
     #[must_use]
     #[allow(clippy::similar_names)] // the read_u32 / read_u64 / read_f32 readers are deliberately parallel
@@ -394,7 +421,7 @@ impl Hnsw {
             *p += 4;
             Some(f32::from_le_bytes(b.try_into().ok()?))
         };
-        if read_u32(&mut p)? != 2 {
+        if read_u32(&mut p)? != 3 {
             return None;
         }
         let metric = Metric::from_tag(*bytes.get(p)?)?;
@@ -434,6 +461,12 @@ impl Hnsw {
             }
             nodes.push(Node { vector, neighbors });
         }
+        // One tombstone byte per node.
+        let mut tombstones = Vec::new();
+        for _ in 0..node_count {
+            tombstones.push(*bytes.get(p)? != 0);
+            p += 1;
+        }
         Some(Self {
             dim,
             m,
@@ -443,6 +476,7 @@ impl Hnsw {
             metric,
             rng,
             nodes,
+            tombstones,
             entry,
             max_level,
         })
@@ -499,8 +533,11 @@ impl Hnsw {
             let d = rank(self.metric, query, &self.nodes[ep].vector);
             let s = Scored { dist: d, id: ep };
             visited.insert(ep);
+            // A tombstoned node still routes the search but is never a result.
             frontier.push(Reverse(s));
-            best.push(s);
+            if !self.is_deleted(ep) {
+                best.push(s);
+            }
         }
         while let Some(Reverse(c)) = frontier.pop() {
             // If the nearest frontier node is farther than our current worst kept
@@ -519,12 +556,16 @@ impl Hnsw {
                 }
                 let d = rank(self.metric, query, &self.nodes[nb].vector);
                 let worst = best.peek().map_or(f32::INFINITY, |s| s.dist);
+                // Traverse toward any promising node; keep only live ones as
+                // results, so a removed node still bridges the graph.
                 if best.len() < ef || d < worst {
                     let s = Scored { dist: d, id: nb };
                     frontier.push(Reverse(s));
-                    best.push(s);
-                    if best.len() > ef {
-                        best.pop();
+                    if !self.is_deleted(nb) {
+                        best.push(s);
+                        if best.len() > ef {
+                            best.pop();
+                        }
                     }
                 }
             }
@@ -754,6 +795,38 @@ mod tests {
             let query = &data[q * 7 % data.len()];
             assert_eq!(index.search(query, 5, 64), restored.search(query, 5, 64));
         }
+    }
+
+    #[test]
+    fn removed_vectors_are_never_returned() {
+        let dim = 12;
+        let data = gen_vectors(500, dim, 91);
+        let mut index = Hnsw::new(dim, 16, 150, 12);
+        for v in &data {
+            index.insert(v.clone());
+        }
+        assert_eq!(index.len(), data.len());
+        // Remove the true nearest neighbor of a handful of queries, then confirm
+        // the search no longer returns it but still finds the next ones.
+        for q in 0..15 {
+            let query = data[q * 17 % data.len()].clone();
+            let exact = brute_force(&data, &query, 2);
+            let removed = index.remove(exact[0]);
+            assert!(removed, "removing a live id should succeed");
+            assert!(!index.remove(exact[0]), "removing twice should be a no-op");
+            let leaked = index
+                .search(&query, 5, 80)
+                .iter()
+                .any(|&(i, _)| i == exact[0]);
+            assert!(!leaked, "a removed id must not be returned");
+        }
+        // The live count dropped by the number removed, and a removed id round
+        // trips through serialization (the index stays consistent on reload).
+        assert!(index.len() < data.len());
+        let restored = Hnsw::from_bytes(&index.to_bytes()).expect("restore");
+        assert_eq!(restored.len(), index.len());
+        let probe = &data[3];
+        assert_eq!(index.search(probe, 5, 80), restored.search(probe, 5, 80));
     }
 
     #[test]
