@@ -790,6 +790,124 @@ mod tests {
         );
     }
 
+    // --- metamorphic oracle ---
+    //
+    // You cannot know the exact correct approximate result in general, but you
+    // know relations that must always hold between inputs and outputs. Checking
+    // those relations is the accepted research answer to the oracle problem for
+    // systems whose exact output you cannot predict. These are those relations
+    // for nearest-neighbor search.
+
+    #[test]
+    fn metamorphic_self_retrieval() {
+        // Every stored vector is its own nearest neighbor.
+        let dim = 24;
+        let data = gen_vectors(800, dim, 41);
+        let mut index = Hnsw::new(dim, 16, 200, 9);
+        for v in &data {
+            index.insert(v.clone());
+        }
+        let mut ok = 0usize;
+        for (i, v) in data.iter().enumerate() {
+            if index.search(v, 1, 64)[0].0 == i {
+                ok += 1;
+            }
+        }
+        let rate = f64::from(u32::try_from(ok).unwrap_or(u32::MAX))
+            / f64::from(u32::try_from(data.len()).unwrap_or(u32::MAX));
+        assert!(rate > 0.99, "self-retrieval rate was {rate:.4}");
+    }
+
+    #[test]
+    fn metamorphic_monotonic_insertion() {
+        // Inserting a point strictly closer to a query than its current k-th
+        // neighbor must make that point appear in the new top-k.
+        let dim = 16;
+        let data = gen_vectors(500, dim, 7);
+        let mut index = Hnsw::new(dim, 16, 200, 3);
+        for v in &data {
+            index.insert(v.clone());
+        }
+        let q = data[10].clone();
+        // A point a tiny step from q is far closer than any other random vector.
+        let mut closer = q.clone();
+        closer[0] += 0.5;
+        let id = index.insert(closer);
+        let after = index.search(&q, 5, 64);
+        assert!(
+            after.iter().any(|&(i, _)| i == id),
+            "a strictly closer inserted point must enter the top-k"
+        );
+    }
+
+    #[test]
+    fn metamorphic_duplicate_insertion() {
+        // A duplicate of a stored vector means the two nearest to it are the
+        // original and the duplicate, both at distance zero.
+        let dim = 16;
+        let data = gen_vectors(400, dim, 21);
+        let mut index = Hnsw::new(dim, 16, 200, 4);
+        for v in &data {
+            index.insert(v.clone());
+        }
+        let v = data[5].clone();
+        let dup = index.insert(v.clone());
+        let got = index.search(&v, 2, 64);
+        let ids: Vec<usize> = got.iter().map(|&(i, _)| i).collect();
+        assert!(
+            ids.contains(&5) && ids.contains(&dup),
+            "the original and its duplicate must be the two nearest, got {ids:?}"
+        );
+        assert!(
+            got[0].1.abs() < 1e-6 && got[1].1.abs() < 1e-6,
+            "both nearest distances must be zero"
+        );
+    }
+
+    #[test]
+    fn metamorphic_deletion_consistency() {
+        // A removed vector never appears in any result, while its neighbors
+        // remain findable.
+        let dim = 16;
+        let data = gen_vectors(400, dim, 88);
+        let mut index = Hnsw::new(dim, 16, 200, 2);
+        for v in &data {
+            index.insert(v.clone());
+        }
+        for victim in [3usize, 50, 199, 372] {
+            index.remove(victim);
+        }
+        for (i, v) in data.iter().enumerate() {
+            let ids: Vec<usize> = index
+                .search(v, 10, 80)
+                .into_iter()
+                .map(|(j, _)| j)
+                .collect();
+            assert!(
+                !ids.contains(&3)
+                    && !ids.contains(&50)
+                    && !ids.contains(&199)
+                    && !ids.contains(&372),
+                "a removed vector appeared in the results for query {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn metamorphic_recall_monotone_in_ef() {
+        // Recall is monotone non-decreasing in the query beam width ef: searching
+        // harder never finds fewer true neighbors.
+        let dim = 24;
+        let data = clustered_vectors(1500, dim, 15, 17);
+        let queries = clustered_vectors(40, dim, 15, 88);
+        let r_low = measure_recall(&data, &queries, 10, 12, Metric::L2, 6);
+        let r_high = measure_recall(&data, &queries, 10, 200, Metric::L2, 6);
+        assert!(
+            r_high + 0.02 >= r_low,
+            "recall must not fall as ef grows: {r_low:.3} at ef=12 then {r_high:.3} at ef=200"
+        );
+    }
+
     #[test]
     fn empty_index_returns_nothing() {
         let index = Hnsw::new(4, 16, 100, 1);
