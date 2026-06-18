@@ -653,12 +653,14 @@ pub struct MultiIndexRecord {
     pub root: u64,
     /// Distinct values in the leading column at build time (for the cost model).
     pub distinct: u64,
+    /// Whether the index enforces uniqueness of the indexed value tuple.
+    pub unique: bool,
     /// The indexed column names, in index order.
     pub columns: Vec<String>,
 }
 
 /// Persist the variable-key secondary indexes, one per line, atomically:
-/// `table name root distinct col1 col2 ...`.
+/// `table name root distinct unique col1 col2 ...`.
 ///
 /// # Errors
 ///
@@ -666,7 +668,15 @@ pub struct MultiIndexRecord {
 pub fn save_multi_indexes(path: &Path, records: &[MultiIndexRecord]) -> io::Result<()> {
     let mut out = String::new();
     for r in records {
-        let _ = write!(out, "{} {} {} {}", r.table, r.name, r.root, r.distinct);
+        let _ = write!(
+            out,
+            "{} {} {} {} {}",
+            r.table,
+            r.name,
+            r.root,
+            r.distinct,
+            u8::from(r.unique),
+        );
         for col in &r.columns {
             let _ = write!(out, " {col}");
         }
@@ -695,7 +705,7 @@ pub fn load_multi_indexes(path: &Path) -> io::Result<Vec<MultiIndexRecord>> {
         if toks.is_empty() {
             continue;
         }
-        if toks.len() < 5 {
+        if toks.len() < 6 {
             return Err(invalid());
         }
         out.push(MultiIndexRecord {
@@ -703,7 +713,8 @@ pub fn load_multi_indexes(path: &Path) -> io::Result<Vec<MultiIndexRecord>> {
             name: toks[1].to_string(),
             root: parse_u64(toks[2])?,
             distinct: parse_u64(toks[3])?,
-            columns: toks[4..].iter().map(|s| (*s).to_string()).collect(),
+            unique: toks[4] == "1",
+            columns: toks[5..].iter().map(|s| (*s).to_string()).collect(),
         });
     }
     Ok(out)
