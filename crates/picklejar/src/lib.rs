@@ -13,6 +13,7 @@ pub mod hnsw;
 pub mod index;
 pub mod keyenc;
 pub mod persist;
+pub mod radiation;
 pub mod security;
 pub mod vecsim;
 
