@@ -144,6 +144,14 @@ the core invariants are model-checked, and `vecert` regenerates the whole proof.
   radius filter; the same distances are available as the functions `l2_distance`,
   `l1_distance`, `cosine_distance`, and `inner_product`, alongside `vector_dims`
   and `l2_norm`. This is the storage and query foundation of the AI memory layer.
+- **Drift-adaptive quantization** - a scalar-quantized index (`quantize` module)
+  stores each embedding at one byte per dimension, a 4x smaller index, and holds
+  recall flat as the embedding distribution drifts: it watches the live
+  distribution and recalibrates only when it outgrows the calibrated range,
+  re-quantizing from the durable full-precision rows so the index never grows. The
+  `quantsim` benchmark (certified in `vecert`) shows the adaptive index near the
+  full-precision recall ceiling where a calibrate-once quantizer collapses under
+  the same drift, recalibrating on under 2% of inserts instead of reindexing.
 - **Decimal** - a `DECIMAL` / `NUMERIC` column with exact base-10 arithmetic
   (`0.1 + 0.2` is `0.3`, not a binary-float approximation), `DECIMAL '12.34'`
   literals, and exact `SUM` / `AVG`. Stored as an `i128` mantissa plus a scale,

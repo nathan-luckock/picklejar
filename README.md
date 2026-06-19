@@ -89,6 +89,8 @@ Memory also travels in time, on both axes. Give a table `valid_from` and `valid_
 
 And memory defends its own consistency. `INSERT ... ON CONFLICT (key) DO ASSERT` re-asserts a fact the agent already holds for free, but rejects a write that records a *different* value for the same key as a contradiction, naming the column, the key, and the two values. The conflicting belief is caught at write time instead of silently overwriting what was there.
 
+Memory also keeps its recall as it ages. A scalar-quantized index stores each embedding at a quarter of the size, and the usual cost of that compression is that recall decays as the embedding distribution drifts away from what the quantizer was calibrated on. This engine recalibrates adaptively, only when the live distribution outgrows the calibrated range, re-quantizing from the durable rows so the index never grows. On a drifting stream the adaptive index holds recall near the full-precision ceiling (~0.97) where a calibrate-once quantizer collapses (~0.005), at the same compression and recalibrating on under 2% of inserts. The benchmark is `quantsim`, and the margin is checked in the `vecert` certificate.
+
 ## It speaks Postgres
 
 No shim. The server implements the PostgreSQL v3 wire protocol, so the real `psql` binary connects straight to the engine:

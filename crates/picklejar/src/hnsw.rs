@@ -193,7 +193,7 @@ fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
 
 /// The graph-ranking score for `metric`: smaller always means nearer, whichever
 /// metric is in use, so the search machinery is metric-agnostic.
-fn rank(metric: Metric, a: &[f32], b: &[f32]) -> f32 {
+pub(crate) fn rank(metric: Metric, a: &[f32], b: &[f32]) -> f32 {
     match metric {
         Metric::L2 => dist_sq(a, b),
         Metric::Cosine => cosine_distance(a, b),

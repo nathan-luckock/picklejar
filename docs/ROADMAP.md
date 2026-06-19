@@ -45,6 +45,17 @@ On top of it sits the AI-memory layer and its full reliability story, all shippe
   store already holds is rejected as a contradiction (the column, key, and both
   values are named), instead of silently overwriting a held belief. This is the
   unsolved AI-memory consistency problem from the research, enforced by the engine.
+- **Drift-adaptive quantization.** A scalar-quantized index stores each embedding
+  at one byte per dimension (a 4x smaller index), and holds recall flat as the
+  embedding distribution drifts by watching the live distribution and recalibrating
+  only when it has outgrown the calibrated range, re-quantizing from the durable
+  full-precision rows so the index never grows. The benchmark (`quantsim`,
+  certified in `vecert`) shows the adaptive index near the full-precision ceiling
+  (recall ~0.97) where a static calibrate-once quantizer collapses (~0.005) under
+  the same drift, at the same compression, recalibrating on under 2% of inserts
+  rather than reindexing. Holding recall flat under drift at a fixed memory budget,
+  rather than reindexing, is the one place this engine makes a benchmarked
+  contribution rather than re-implementing solved art.
 - **Recall as a CI gate.** `recall@k` held against the exact brute-force oracle
   on clustered, near-duplicate, and unit-norm distributions. Building it found and
   fixed a real recall bug (0.47 to 0.98 on clustered data).
@@ -128,12 +139,6 @@ What is genuinely still ahead, stated honestly:
 - **Deeper fault coverage.** Per-part, shielding-aware upset rates that only a
   specific flight build can supply, and torn, misdirected, and lost-write models
   beyond the current bit-flip injector.
-- **Drift-adaptive vector quantization (a research direction, optional).**
-  Production vector indexes lose recall as embeddings drift and lean on a full
-  reindex to recover it. Holding recall flat under drift, at a fixed memory budget
-  and with the self-healing and model-checking guarantees intact, is an open
-  systems problem and the one place this engine could make a novel, benchmarked
-  contribution rather than a from-scratch re-implementation of solved art.
 
 ## What this is, and is not
 

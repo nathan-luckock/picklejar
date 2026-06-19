@@ -243,6 +243,11 @@ impl Certificate {
         // is restored from the WAL, so a crash can never silently drop a fence.
         checks.push(rls_wal_recovery());
 
+        // Drift-adaptive quantization holds recall flat under distribution drift,
+        // at a fixed 4x-compressed memory budget, where a static quantizer
+        // collapses: the memory layer keeps recall as embeddings drift.
+        checks.push(drift_adaptive_recall());
+
         Self { checks }
     }
 
@@ -964,6 +969,24 @@ fn valid_time_travel_model() -> Check {
              (domain {domain}); a closed upper bound that serves a superseded row is caught"
         ),
         passed: held && teeth,
+    }
+}
+
+/// Drift-adaptive vector quantization holds recall under distribution drift. Over
+/// a drifting stream, the adaptive index stays near the full-precision ceiling
+/// while a static (calibrate-once) quantizer collapses, at the same 4x
+/// compression. This is the memory layer's recall guarantee under covariate shift.
+fn drift_adaptive_recall() -> Check {
+    let b = crate::quantize::run_drift_benchmark(0x00CE_27A1);
+    let held = b.adaptive_recall > 0.85 && b.static_recall < 0.20;
+    Check {
+        name: "drift-adaptive recall".into(),
+        detail: format!(
+            "adaptive recall {:.3} vs static {:.3} over a drifting {}-vector stream \
+             ({} recalibrations, {:.0}x compression)",
+            b.adaptive_recall, b.static_recall, b.vectors, b.recalibrations, b.compression
+        ),
+        passed: held,
     }
 }
 

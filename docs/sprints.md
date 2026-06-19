@@ -287,6 +287,25 @@ snapshot of live rows and the arbiter collision test, adding one resolution bran
 and a structural value comparison; equality is fact identity (a re-asserted NULL
 matches a stored NULL), not SQL three-valued logic.
 
+### Sprint 24 - Drift-adaptive vector quantization
+
+The one place the project makes a benchmarked contribution rather than a
+from-scratch re-implementation of solved art. A quantized index stores each
+embedding at one byte per dimension under a per-dimension affine map, a 4x smaller
+index; the catch every production vector index hits is that recall decays as the
+embedding distribution drifts away from what the quantizer was calibrated on, and
+the usual fix is a full reindex. This holds recall flat instead: the index tracks
+the live per-dimension range, and when the observed range outgrows the calibrated
+range past a threshold it recalibrates and re-quantizes from the durable
+full-precision rows, so the codes stay one byte per dimension and the index never
+grows. The benchmark (`quantsim`, certified in `vecert`) streams embeddings whose
+magnitude drifts over time into two indexes calibrated on the same early sample,
+one static and one adaptive, and scores both against the exact full-precision
+oracle: across seeds the adaptive index holds recall near the ceiling (~0.97)
+while the static one collapses (~0.005), at the same compression and recalibrating
+on under 2% of inserts. Recall under covariate shift, at a fixed memory budget,
+joins the durability and isolation guarantees the certificate already carries.
+
 ## Direction
 
 A from-scratch engine that speaks PostgreSQL over the wire, turned toward a

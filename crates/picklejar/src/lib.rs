@@ -15,6 +15,7 @@ pub mod index;
 pub mod isolation_model;
 pub mod keyenc;
 pub mod persist;
+pub mod quantize;
 pub mod radiation;
 pub mod security;
 pub mod valid_time_model;
