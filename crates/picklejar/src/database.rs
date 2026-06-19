@@ -45,7 +45,7 @@ use picklejar_sql::statement::{
 use picklejar_sql::{BinOp, Expr, Parser, SetOp, Statement, UnOp, Value};
 use picklejar_storage::page::Page;
 use picklejar_storage::{BufferPool, FileManager, PageId};
-use picklejar_txn::{MvccTable, Transaction, TransactionManager};
+use picklejar_txn::{MvccTable, Snapshot, Transaction, TransactionManager};
 use picklejar_wal::{LogRecord, Lsn, TxnId, WalSyncHandle, WalWriter};
 
 use crate::error::{DbError, Result};
@@ -275,6 +275,13 @@ pub struct Database {
     /// (the default, and after `SET valid_time = off` / `RESET valid_time`) reads
     /// the latest state. Set by `SET valid_time = <timestamp>`.
     valid_time_as_of: Option<Value>,
+    /// The session's transaction-time as-of point: a transaction-id watermark. While
+    /// `Some`, a read-only auto-commit statement runs against the historical MVCC
+    /// snapshot as of that point (only transactions before it are visible), so the
+    /// read sees the database as it was then, bounded by retained version history.
+    /// `None` (the default, and after `SET transaction_time = off` / `RESET`) reads
+    /// the latest committed state. Set by `SET transaction_time = <n>`.
+    transaction_time_as_of: Option<u64>,
 }
 
 /// One entry in the durable fault log: a heap page the self-healing layer found
@@ -483,6 +490,7 @@ impl Database {
             vector_index_cache: HashMap::new(),
             last_rls_body: std::cell::RefCell::new(None),
             valid_time_as_of: None,
+            transaction_time_as_of: None,
         };
         // The catalog and the isolation state each have two redundant copies:
         // the WAL snapshot and the sidecar. Prefer the WAL (it is authoritative
@@ -1078,6 +1086,10 @@ impl Database {
         // Publish the active role names so `current_user` / `session_user`
         // expressions (and, later, RLS policies) resolve to the right role.
         picklejar_executor::set_session_identity(&self.current_role, &self.session_user);
+        // Publish the current transaction-id watermark so `txid_current()` reports
+        // the present transaction point, the handle a session captures to travel
+        // reads back to with `SET transaction_time`.
+        picklejar_executor::set_session_txid(self.mgr.next_xid());
         // Authorize the statement against the current role before running it.
         // A superuser session (the default) passes every check, so an
         // unconfigured database is unaffected.
@@ -1129,6 +1141,10 @@ impl Database {
             }
             Statement::SetValidTime { ref at } => {
                 self.set_valid_time(at.as_ref())?;
+                Ok(QueryOutcome::Message("SET"))
+            }
+            Statement::SetTransactionTime { ref at } => {
+                self.set_transaction_time(at.as_ref())?;
                 Ok(QueryOutcome::Message("SET"))
             }
             Statement::CreatePolicy {
@@ -1183,9 +1199,12 @@ impl Database {
             // when that path is enabled. Anything the index path declines (the
             // common case, and every RLS-fenced query, which now carries a folded
             // WHERE) falls through to the exact, transactional path below.
-            Statement::Select(ref s) if self.vector_index_on => self
-                .run_vector_index_select(s)?
-                .map_or_else(|| self.run_in_txn(&stmt), Ok),
+            Statement::Select(ref s)
+                if self.vector_index_on && self.transaction_time_as_of.is_none() =>
+            {
+                self.run_vector_index_select(s)?
+                    .map_or_else(|| self.run_in_txn(&stmt), Ok)
+            }
             // DML and SELECT run inside the open transaction, or a fresh
             // auto-commit one. `expand_ctes` inlined any non-recursive WITH;
             // only a recursive WITH reaches here, evaluated against a snapshot.
@@ -1343,6 +1362,45 @@ impl Database {
     #[must_use]
     pub const fn valid_time_as_of(&self) -> Option<&Value> {
         self.valid_time_as_of.as_ref()
+    }
+
+    /// Set or clear the session's transaction-time as-of point. `at` is the
+    /// transaction-point expression from `SET transaction_time = <n>` (folded to a
+    /// constant integer here), or `None` for `off` / `RESET transaction_time`. A
+    /// `NULL` point also clears it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `at` is not a constant non-negative integer.
+    pub fn set_transaction_time(&mut self, at: Option<&Expr>) -> Result<()> {
+        self.transaction_time_as_of = match at {
+            None => None,
+            Some(expr) => match const_eval(expr).map_err(|_| {
+                DbError::Unsupported("SET transaction_time expects a constant integer".into())
+            })? {
+                Value::Null => None,
+                Value::Int(n) if n >= 0 => Some(n.unsigned_abs()),
+                _ => {
+                    return Err(DbError::Unsupported(
+                        "SET transaction_time expects a non-negative integer".into(),
+                    ))
+                }
+            },
+        };
+        Ok(())
+    }
+
+    /// The current transaction-id watermark: the next xid the engine will assign,
+    /// which is the present transaction point a session can travel back to.
+    #[must_use]
+    pub fn current_txid(&self) -> u64 {
+        self.mgr.next_xid()
+    }
+
+    /// The session's transaction-time as-of point, if one is set.
+    #[must_use]
+    pub const fn transaction_time_as_of(&self) -> Option<u64> {
+        self.transaction_time_as_of
     }
 
     /// If `s` is a pure nearest-neighbor query this engine can serve from an HNSW
@@ -2174,6 +2232,17 @@ impl Database {
     fn run_in_txn(&mut self, stmt: &Statement) -> Result<QueryOutcome> {
         let explicit = self.current_txn.is_some();
         let txn = self.current_txn.take().unwrap_or_else(|| self.mgr.begin());
+        // Transaction-time travel: for a read-only auto-commit statement, override
+        // the read snapshot with the historical one as of the session's as-of point,
+        // so the scan walks each version chain to the version live then. Writes and
+        // statements inside an explicit transaction are never travelled: a write
+        // always acts on the latest state, and travelling an open transaction would
+        // break its snapshot stability.
+        if !explicit && statement_is_read_only(stmt) {
+            if let Some(point) = self.transaction_time_as_of {
+                txn.set_snapshot(historical_snapshot(point));
+            }
+        }
         let result = self.dispatch(stmt, &txn);
         if explicit {
             // Keep the transaction open; COMMIT/ROLLBACK decide its fate.
@@ -5573,6 +5642,23 @@ fn qualify_expr(expr: &Expr, qualifier: &str) -> Expr {
                 .map(|e| Box::new(qualify_expr(e, qualifier))),
         },
         other => other.clone(),
+    }
+}
+
+/// The MVCC snapshot as of transaction point `point`: every transaction with an
+/// xid below `point` is visible (if it committed), and nothing from `point` on.
+///
+/// `xmax = point` makes any version created at or after `point` invisible, and an
+/// empty active set means no transaction below `point` is treated as still in
+/// flight, so the historical view is exactly "the database after every
+/// transaction before `point` had settled". The standard visibility rule then
+/// walks each version chain to the version live then. This reuses the locked
+/// snapshot-isolation logic unchanged; it only hands it a synthetic past snapshot.
+const fn historical_snapshot(point: u64) -> Snapshot {
+    Snapshot {
+        xmin: point,
+        xmax: point,
+        active: std::collections::BTreeSet::new(),
     }
 }
 

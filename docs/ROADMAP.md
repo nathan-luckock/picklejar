@@ -57,11 +57,17 @@ On top of it sits the AI-memory layer and its full reliability story, all shippe
 - **Operability of self-healing.** A `PROTECT` statement, a durable fault log
   (`pg_fault_log`), and the `pjscrub` scrubber that heals and refreshes parity on
   a cadence.
-- **Valid-time travel.** A session as-of instant (`SET valid_time = TIMESTAMP
-  '...'`) rewinds reads on temporal tables (those with `valid_from` / `valid_to`
-  columns) to the rows valid at that instant, over the half-open interval, so an
-  agent can recall what it knew at a past moment. It rides the same parser-safe
-  session mechanism as the index toggle, sidestepping the `AS OF` syntax collision.
+- **Bitemporal time travel.** Two independent as-of axes. Valid-time
+  (`SET valid_time = TIMESTAMP '...'`) rewinds reads on temporal tables (those with
+  `valid_from` / `valid_to` columns) to the rows valid at that instant over the
+  half-open interval: what was true in the world then. Transaction-time
+  (`SET transaction_time = <point>`, a transaction-id watermark from
+  `txid_current()`) travels a read to the MVCC snapshot as of a past transaction,
+  walking each retained version chain to the version live then: what the database
+  knew then. With both set a query is a full bitemporal as-of. Both ride the same
+  parser-safe session mechanism as the index toggle, sidestepping the `AS OF`
+  syntax collision, and both are read-only (writes act on the latest state);
+  transaction-time is bounded by retained version history (pre-`VACUUM`).
 - **Backup, point-in-time recovery, and a physical standby replica.**
 - **Exhaustive model-checking.** From-scratch bounded model checkers prove the
   write-ahead-logging ordering invariant (no page change is ever durable ahead of
