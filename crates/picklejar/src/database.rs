@@ -263,6 +263,12 @@ pub struct Database {
     /// reuse an index it was itself permitted to build, never one another role
     /// built; keying by metric means an L2 index is never reused for a cosine query.
     vector_index_cache: HashMap<(String, String, String, Metric), CachedVectorIndex>,
+    /// The row-level-security body last written to the WAL, so a policy snapshot
+    /// is logged only when isolation actually changed. `persist` runs after every
+    /// data statement too, and the isolation body does not depend on the data, so
+    /// without this an `INSERT` would append an (often empty) policy snapshot to
+    /// the log every time and bloat it. `None` until the first log.
+    last_rls_body: std::cell::RefCell<Option<String>>,
 }
 
 /// One entry in the durable fault log: a heap page the self-healing layer found
@@ -469,6 +475,7 @@ impl Database {
             fault_log: Vec::new(),
             vector_index_on: false,
             vector_index_cache: HashMap::new(),
+            last_rls_body: std::cell::RefCell::new(None),
         };
         // The catalog and the isolation state each have two redundant copies:
         // the WAL snapshot and the sidecar. Prefer the WAL (it is authoritative
@@ -1005,15 +1012,19 @@ impl Database {
                 })
             })
             .collect();
-        persist::save(&self.meta_path, &records)?;
-        // Log the same catalog snapshot to the WAL so forward replay can
-        // reconstruct the schema as of any LSN, not just the base state. The
-        // record carries a sentinel txn and sits outside the transaction
-        // redo/undo chain (analysis skips it), so it cannot be mistaken for an
-        // uncommitted loser. Fsync it so the schema change is durable in the log
-        // even if the sidecar rename that follows is lost in a crash.
+        let catalog_body = persist::serialize(&records);
+        persist::save_serialized(&self.meta_path, &catalog_body)?;
+        // Log the catalog snapshot to the WAL so forward replay can reconstruct
+        // the schema as of any LSN, not just the base state. The record carries a
+        // sentinel txn and sits outside the transaction redo/undo chain (analysis
+        // skips it), so it cannot be mistaken for an uncommitted loser. Fsync it
+        // so the schema change is durable in the log even if the sidecar rename
+        // that follows is lost in a crash. This is logged on every persist
+        // (including after a data write) because the snapshot carries per-table
+        // anchor state (`next_rowid`, `version_page`) that changes with the data
+        // and is load-bearing for recovering a lost sidecar write.
         {
-            let snapshot = persist::serialize(&records).into_bytes();
+            let snapshot = catalog_body.into_bytes();
             let mut writer = self.wal.writer();
             let lsn = writer.append(
                 &LogRecord::Catalog { snapshot },
@@ -1852,14 +1863,17 @@ impl Database {
             }
         }
         let rls = persist::RlsData { flags, policies };
-        persist::save_rls(&self.pol_path, &rls)?;
+        let rls_body = persist::serialize_rls(&rls);
+        persist::save_rls_serialized(&self.pol_path, &rls_body)?;
         // Log the isolation snapshot to the WAL so the log is authoritative for
         // tenant isolation: a policy change that reached the log is recovered
         // even if its `.pol` sidecar write was lost in a crash, which would
         // otherwise drop a fence and risk a cross-tenant read. The record sits
         // outside the transaction redo/undo chain, like the catalog snapshot.
-        {
-            let snapshot = persist::serialize_rls(&rls).into_bytes();
+        // Only log when isolation actually changed, so a plain data write does
+        // not append a policy snapshot every time.
+        if self.last_rls_body.borrow().as_deref() != Some(rls_body.as_str()) {
+            let snapshot = rls_body.clone().into_bytes();
             let mut writer = self.wal.writer();
             let lsn = writer.append(
                 &LogRecord::RlsPolicies { snapshot },
@@ -1867,6 +1881,8 @@ impl Database {
                 Lsn::INVALID,
             )?;
             writer.fsync_through(lsn)?;
+            drop(writer);
+            *self.last_rls_body.borrow_mut() = Some(rls_body);
         }
         Ok(())
     }
@@ -9322,6 +9338,43 @@ mod tests {
         let (cols, rows) = query(&mut db, "SELECT id, name FROM t2");
         assert_eq!(names(&cols), ["id", "name"]);
         assert_eq!(rows, vec![vec![Value::Int(1), Value::Text("a".into())]]);
+    }
+
+    #[test]
+    fn data_writes_do_not_relog_unchanged_isolation_state() {
+        // The isolation snapshot is logged only when policies change, not on
+        // every data write (its body does not depend on the data), so a busy
+        // table does not bloat the WAL with identical policy records.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("rlsbloat.db");
+        let wal_path = path.with_extension("wal");
+        {
+            let mut db = Database::open(&path).expect("open");
+            db.execute("CREATE TABLE t (id INT, tenant TEXT)").unwrap();
+            db.execute("CREATE POLICY p ON t USING ((tenant = current_user()))")
+                .unwrap();
+            db.execute("ALTER TABLE t ENABLE ROW LEVEL SECURITY")
+                .unwrap();
+            for i in 0..50 {
+                db.execute(&format!("INSERT INTO t VALUES ({i}, 'acme')"))
+                    .unwrap();
+            }
+        }
+        let mut rls_records = 0usize;
+        for (h, _) in picklejar_wal::WalReader::open(&wal_path)
+            .expect("open wal")
+            .flatten()
+        {
+            if h.kind == picklejar_wal::RecordKind::RlsPolicies {
+                rls_records += 1;
+            }
+        }
+        // Logged only for the distinct isolation states (empty, policy added,
+        // RLS enabled), a small constant, never one per insert.
+        assert!(
+            rls_records < 10,
+            "isolation logged {rls_records} times; expected only on policy change, not per insert"
+        );
     }
 
     #[test]
