@@ -15,6 +15,41 @@ Proven by 100,000 deterministic crash simulations. A from-scratch, Postgres-wire
 
 ---
 
+## See it prove itself
+
+One command runs the whole proof: live throughput on the real engine, recall held under embedding drift, and every reliability invariant, content-hashed so the same commit always produces the same result.
+
+```text
+$ cargo run --release --bin scorecard
+
+================ PICKLEJAR SCORECARD ================
+a from-scratch, Postgres-wire AI-memory engine, proven
+
+THROUGHPUT (measured live on this machine)
+  inserts                   454 rows/sec      durable, one fsync per row
+  point lookups           90215 queries/sec   by primary key
+  vector KNN (HNSW)        6005 queries/sec    k=10 over 3000 embeddings
+
+RECALL UNDER DRIFT (4x-compressed index)
+  drift-adaptive          0.969  vs static 0.005  (28 recalibrations)
+
+PROVEN INVARIANTS (deterministic, content-hashed)
+  [PASS] recall L2 (clustered)            [PASS] WAL ordering model-check
+  [PASS] metamorphic: self-retrieval      [PASS] snapshot isolation model-check
+  [PASS] corruption detection             [PASS] RLS retrieval isolation model-check
+  [PASS] self-healing                     [PASS] cache freshness model-check
+  [PASS] radiation survivability (LEO)    [PASS] valid-time travel model-check
+  [PASS] irradiated memory layer (GEO)    [PASS] drift-adaptive recall
+  ... 20 invariants total ...             [PASS] storage-fault detection coverage
+
+  certificate hash f83b61ee
+
+VERDICT: 20 invariants proven, recall held under drift, throughput measured live.
+====================================================
+```
+
+The verification numbers are deterministic (only the throughput line varies by machine), and `vecert` emits the same set as a notarized, content-hashed certificate. Five of those invariants are proved by *exhaustive* from-scratch model checking, not sampling: WAL ordering, snapshot isolation, RLS-filtered retrieval, cache freshness, and valid-time travel.
+
 ## What this is
 
 picklejar is a relational database engine written from scratch in Rust, evolving into a specific thing: **the memory layer for AI in environments that cannot be physically serviced**, such as orbital and edge data centers, where a failed disk is never swapped and a partitioned link is never fixed by hand.
