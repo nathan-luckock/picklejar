@@ -228,6 +228,10 @@ impl Certificate {
         // (WAL and sidecar) are redundant and the schema self-heals.
         checks.push(catalog_wal_recovery());
 
+        // The same for tenant isolation: a policy whose sidecar write was lost
+        // is restored from the WAL, so a crash can never silently drop a fence.
+        checks.push(rls_wal_recovery());
+
         Self { checks }
     }
 
@@ -778,6 +782,84 @@ fn catalog_wal_recovery() -> Check {
         detail: "a schema change whose sidecar write was lost is recovered from the WAL on open"
             .into(),
         passed: recovered,
+    }
+}
+
+/// Tenant isolation survives a lost sidecar write: a policy that reached the WAL
+/// is restored on open even when its `.pol` sidecar write was lost, so a crash
+/// can never silently drop a fence and leak one tenant's rows to another.
+fn rls_wal_recovery() -> Check {
+    let name = "RLS WAL recovery".to_string();
+    let base = std::env::temp_dir().join(format!("pj-cert-rlswal-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let _ = std::fs::create_dir_all(&base);
+    let path = base.join("m.db");
+    let pol_path = path.with_extension("pol");
+    let fail = |detail: String| Check {
+        name: name.clone(),
+        detail,
+        passed: false,
+    };
+
+    // Build a two-tenant table and grant, then snapshot `.pol` before the fence.
+    let stale_pol = {
+        let mut db = match Database::open(&path) {
+            Ok(db) => db,
+            Err(e) => return fail(format!("open: {e}")),
+        };
+        for sql in [
+            "CREATE TABLE m (id INT, tenant TEXT)",
+            "INSERT INTO m VALUES (1, 'acme'), (2, 'globex')",
+            "CREATE ROLE acme LOGIN",
+            "GRANT SELECT ON m TO PUBLIC",
+        ] {
+            if let Err(e) = db.execute(sql) {
+                return fail(format!("{sql}: {e}"));
+            }
+        }
+        let snap = match std::fs::read(&pol_path) {
+            Ok(b) => b,
+            Err(e) => return fail(format!("read pol: {e}")),
+        };
+        for sql in [
+            "CREATE POLICY tenant ON m USING ((tenant = current_user()))",
+            "ALTER TABLE m ENABLE ROW LEVEL SECURITY",
+        ] {
+            if let Err(e) = db.execute(sql) {
+                return fail(format!("{sql}: {e}"));
+            }
+        }
+        snap
+    };
+
+    // Roll `.pol` back to before the fence, leaving the WAL intact.
+    if let Err(e) = std::fs::write(&pol_path, &stale_pol) {
+        return fail(format!("clobber pol: {e}"));
+    }
+
+    // Reopen: the WAL restores the fence, so acme sees only its own row.
+    let fenced = {
+        let mut db = match Database::open(&path) {
+            Ok(db) => db,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&base);
+                return fail(format!("reopen: {e}"));
+            }
+        };
+        db.set_session_user("acme");
+        matches!(
+            db.execute("SELECT id FROM m"),
+            Ok(QueryOutcome::Rows { rows, .. }) if rows == vec![vec![Value::Int(1)]]
+        )
+    };
+    let _ = std::fs::remove_dir_all(&base);
+
+    Check {
+        name,
+        detail:
+            "a tenant fence whose policy sidecar write was lost is restored from the WAL on open"
+                .into(),
+        passed: fenced,
     }
 }
 
