@@ -68,11 +68,13 @@ On top of it sits the AI-memory layer and its full reliability story, all shippe
   its log record), the MVCC snapshot read-stability invariant, and, through the
   approximate index, both tenant isolation (a tenant's query never returns another
   tenant's row) and cache freshness (a query never returns a deleted row, so a
-  forgotten memory cannot resurface) over every reachable interleaving, each with
-  a deliberately buggy variant that yields a concrete counterexample so the proof
-  is not vacuous. No vector or AI-memory database is known to model-check its
-  filtered retrieval this way, which is the sharpest piece of open ground the
-  project sits on.
+  forgotten memory cannot resurface), and valid-time travel (a read at a session
+  as-of instant returns a row exactly when it is valid then, so the half-open
+  boundary never serves a superseded row nor drops a current one). Each is proved
+  over its whole bounded model, with a deliberately buggy variant that yields a
+  concrete counterexample so the proof is not vacuous. No vector or AI-memory
+  database is known to model-check its filtered retrieval this way, which is the
+  sharpest piece of open ground the project sits on.
 - **The reliability certificate.** `vecert` runs every invariant above and emits
   a content-hashed, regenerable report, framed in a named orbit's upset rate.
 - **A WAL-logged catalog and isolation state.** Schema changes and row-level-

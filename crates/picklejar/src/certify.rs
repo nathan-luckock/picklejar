@@ -229,6 +229,10 @@ impl Certificate {
         // was deleted, so a forgotten memory can never resurface through a stale
         // cache.
         checks.push(cache_freshness_model());
+        // And valid-time travel: a read at a session as-of instant returns a row
+        // exactly when it is valid then, so the half-open boundary never serves a
+        // superseded row nor drops a current one.
+        checks.push(valid_time_travel_model());
 
         // The catalog is WAL-logged: a schema change whose sidecar write was
         // lost in a crash is recovered from the log on open, so the two copies
@@ -939,6 +943,25 @@ fn cache_freshness_model() -> Check {
         detail: format!(
             "no query returns a deleted row over all {states} reachable states ({bound} rows); \
              a delete that leaves the cache stale is caught"
+        ),
+        passed: held && teeth,
+    }
+}
+
+/// The valid-time travel invariant, model-checked: over every interval and every
+/// instant in a bounded time domain, the binder's validity predicate returns a
+/// row exactly when the half-open rule says it is valid, and a closed upper bound
+/// that serves a superseded row is caught.
+fn valid_time_travel_model() -> Check {
+    let domain = 6u8;
+    let states = crate::valid_time_model::reachable_states(domain, true);
+    let held = crate::valid_time_model::check(domain, true).is_none();
+    let teeth = crate::valid_time_model::check(3, false).is_some();
+    Check {
+        name: "valid-time travel model-check".into(),
+        detail: format!(
+            "a read returns a row exactly when it is valid then, over all {states} checked cases \
+             (domain {domain}); a closed upper bound that serves a superseded row is caught"
         ),
         passed: held && teeth,
     }

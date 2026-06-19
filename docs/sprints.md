@@ -221,6 +221,16 @@ the fold applies only to temporal tables, leaving ordinary tables read in full.
 It composes with row-level security: the validity predicate is `AND`-ed after the
 tenant fence, so time travel can never widen what a tenant sees.
 
+The filter is then model-checked, a fifth proved invariant alongside the WAL,
+snapshot, isolation, and freshness ones. Valid-time travel is a pure, row-local
+predicate, so `valid_time_model` exhaustively sweeps every interval and every
+instant over a bounded time domain and proves the binder's predicate returns a
+row exactly when the half-open rule says it is valid. A deliberately buggy closed
+upper bound (`t <= valid_to`), which would serve a row at the very instant it is
+superseded, is caught with a concrete counterexample, so the boundary the rule
+exists to get right is the boundary the proof pins. Certified in `vecert` and
+swept by `rlsmodel`.
+
 ## Direction
 
 A from-scratch engine that speaks PostgreSQL over the wire, turned toward a

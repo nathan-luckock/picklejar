@@ -17,6 +17,7 @@ pub mod keyenc;
 pub mod persist;
 pub mod radiation;
 pub mod security;
+pub mod valid_time_model;
 pub mod vecsim;
 
 pub use database::{BackupReport, Database, ProtectReport, QueryOutcome};

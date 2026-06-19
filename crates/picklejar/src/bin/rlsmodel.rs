@@ -10,7 +10,7 @@
 
 use std::process::ExitCode;
 
-use picklejar::{freshness_model, isolation_model};
+use picklejar::{freshness_model, isolation_model, valid_time_model};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
@@ -54,6 +54,26 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    println!("result: index-cache isolation and freshness proved over every interleaving up to bound {max}");
+    println!("valid-time travel (a read returns a row exactly when it is valid then):");
+    for domain in 1..=max {
+        if let Some(cx) = valid_time_model::check(domain, true) {
+            eprintln!("VIOLATION over domain {domain}: {cx:?}");
+            return ExitCode::FAILURE;
+        }
+        println!(
+            "  domain {domain}: holds over {} checked cases",
+            valid_time_model::reachable_states(domain, true)
+        );
+    }
+    if let Some(cx) = valid_time_model::check(3, false) {
+        println!("  teeth: a closed upper bound that serves a superseded row is caught ({cx:?})");
+    } else {
+        eprintln!("teeth check failed: a closed upper bound was not caught");
+        return ExitCode::FAILURE;
+    }
+
+    println!(
+        "result: index-cache isolation and freshness, and valid-time travel, proved exhaustively up to bound {max}"
+    );
     ExitCode::SUCCESS
 }
