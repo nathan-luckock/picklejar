@@ -9,6 +9,7 @@ pub mod certify;
 pub mod correlated;
 pub mod database;
 pub mod error;
+pub mod faults;
 pub mod freshness_model;
 pub mod hnsw;
 pub mod index;

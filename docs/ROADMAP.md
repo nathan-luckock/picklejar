@@ -102,6 +102,13 @@ On top of it sits the AI-memory layer and its full reliability story, all shippe
   concrete counterexample so the proof is not vacuous. No vector or AI-memory
   database is known to model-check its filtered retrieval this way, which is the
   sharpest piece of open ground the project sits on.
+- **A storage-fault taxonomy and coverage simulator.** Beyond the radiation
+  bit-flip model, `faultsim` injects all four storage-write fault classes (bit
+  flip, torn write, lost write, misdirected write) and measures the engine's
+  detection rate per class under its layered page check. The payload checksum
+  catches every bit flip and torn write, and the LSN-versus-log guard catches
+  every lost write; a misdirected write that lands newer content is the honest
+  residual, reported and recorded, that a self-identifying page id would close.
 - **The reliability certificate.** `vecert` runs every invariant above and emits
   a content-hashed, regenerable report, framed in a named orbit's upset rate.
 - **A WAL-logged catalog and isolation state.** Schema changes and row-level-
@@ -136,9 +143,15 @@ What is genuinely still ahead, stated honestly:
   diverge from, so it is folded into the replication path rather than built ahead
   of it: the link is down for a bounded interval, the node serves locally, and it
   reconciles on reconnect with bounded staleness.
+- **A self-identifying page id (the misdirected-write residual).** The fault-
+  coverage simulator catches every bit flip, torn write, and lost write, but a
+  misdirected write that lands *newer* content slips, because the page format
+  stores no page id to check its location against. Closing it means adding a page-
+  id guard to the header (a page-format change), after which misdirected writes
+  are caught completely.
 - **Deeper fault coverage.** Per-part, shielding-aware upset rates that only a
-  specific flight build can supply, and torn, misdirected, and lost-write models
-  beyond the current bit-flip injector.
+  specific flight build can supply, beyond the modeled-orbit rates and the
+  bit-flip, torn, lost, and misdirected fault classes the simulator now sweeps.
 
 ## What this is, and is not
 

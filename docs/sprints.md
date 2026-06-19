@@ -306,6 +306,23 @@ while the static one collapses (~0.005), at the same compression and recalibrati
 on under 2% of inserts. Recall under covariate shift, at a fixed memory budget,
 joins the durability and isolation guarantees the certificate already carries.
 
+### Sprint 25 - Storage-fault taxonomy and coverage simulator
+
+The radiation model injects single-event upsets (bit flips), but real storage
+fails three other ways, and each defeats a different defense: a torn write lands
+only a prefix of a page, a lost write is acknowledged but never reaches the
+platter, and a misdirected write lands a page at the wrong location. `faultsim`
+injects all four and measures the engine's detection rate per class under its
+layered page check. The finding is honest and specific: the payload checksum
+catches every bit flip and torn write (both leave payload bytes that disagree with
+the stored CRC), and the LSN-versus-log guard catches every lost write (a page
+lagging the log is stale), but a misdirected write that lands newer content slips,
+because the page format carries no self-identifying page id to check its location
+against. The three covered classes are certified in `vecert`; the misdirected
+residual is reported, not papered over, and closing it (a page-id guard in the
+header) is recorded on the roadmap. Naming the fault you do not yet catch is worth
+more than a green check that never exercised it.
+
 ## Direction
 
 A from-scratch engine that speaks PostgreSQL over the wire, turned toward a
