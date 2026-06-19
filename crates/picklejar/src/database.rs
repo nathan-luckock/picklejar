@@ -480,6 +480,15 @@ impl Database {
                 persist::save_serialized(&db.meta_path, body)?;
             }
         }
+        // Same for tenant isolation: rebuild the `.pol` sidecar from the latest
+        // logged row-level-security snapshot, so a policy change that reached
+        // the log survives a lost sidecar write rather than silently dropping a
+        // fence.
+        if let Some(snapshot) = picklejar_wal::latest_rls_snapshot(&wal_path, None)? {
+            if let Ok(body) = std::str::from_utf8(&snapshot) {
+                persist::save_rls_serialized(&db.pol_path, body)?;
+            }
+        }
         db.load_catalog()?;
         db.load_views()?;
         db.load_constraints()?;
@@ -1844,7 +1853,23 @@ impl Database {
                 policies.push(policy_to_sql(table, p));
             }
         }
-        persist::save_rls(&self.pol_path, &persist::RlsData { flags, policies })?;
+        let rls = persist::RlsData { flags, policies };
+        persist::save_rls(&self.pol_path, &rls)?;
+        // Log the isolation snapshot to the WAL so the log is authoritative for
+        // tenant isolation: a policy change that reached the log is recovered
+        // even if its `.pol` sidecar write was lost in a crash, which would
+        // otherwise drop a fence and risk a cross-tenant read. The record sits
+        // outside the transaction redo/undo chain, like the catalog snapshot.
+        {
+            let snapshot = persist::serialize_rls(&rls).into_bytes();
+            let mut writer = self.wal.writer();
+            let lsn = writer.append(
+                &LogRecord::RlsPolicies { snapshot },
+                TxnId::new(0),
+                Lsn::INVALID,
+            )?;
+            writer.fsync_through(lsn)?;
+        }
         Ok(())
     }
 
@@ -9299,6 +9324,47 @@ mod tests {
         let (cols, rows) = query(&mut db, "SELECT id, name FROM t2");
         assert_eq!(names(&cols), ["id", "name"]);
         assert_eq!(rows, vec![vec![Value::Int(1), Value::Text("a".into())]]);
+    }
+
+    #[test]
+    fn rls_policy_recovers_from_wal_when_sidecar_write_is_lost() {
+        // The WAL is authoritative for tenant isolation too: a policy change
+        // that reached the log is recovered on open even if its `.pol` sidecar
+        // write was lost, so a crash can never silently drop a fence and leak
+        // one tenant's rows to another.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("rls.db");
+        let pol_path = path.with_extension("pol");
+        let stale_pol;
+        {
+            let mut db = Database::open(&path).expect("open");
+            db.execute("CREATE TABLE memories (id INT, tenant TEXT)")
+                .unwrap();
+            db.execute("INSERT INTO memories VALUES (1, 'acme'), (2, 'globex')")
+                .unwrap();
+            db.execute("CREATE ROLE acme LOGIN").unwrap();
+            db.execute("GRANT SELECT ON memories TO PUBLIC").unwrap();
+            // The isolation sidecar before the policy is added: the state a
+            // crash would leave if the policy's `.pol` write never landed.
+            stale_pol = std::fs::read(&pol_path).expect("read pol");
+            db.execute("CREATE POLICY tenant ON memories USING ((tenant = current_user()))")
+                .unwrap();
+            db.execute("ALTER TABLE memories ENABLE ROW LEVEL SECURITY")
+                .unwrap();
+        }
+        // Roll the isolation sidecar back to before the fence, leaving the WAL
+        // (which logged the policy) intact.
+        std::fs::write(&pol_path, &stale_pol).expect("clobber pol");
+
+        // Reopen: the WAL restores the fence, so acme sees only its own row.
+        let mut db = Database::open(&path).expect("reopen");
+        db.set_session_user("acme");
+        let (_c, rows) = query(&mut db, "SELECT id FROM memories");
+        assert_eq!(
+            rows,
+            vec![vec![Value::Int(1)]],
+            "acme is fenced to its own row after the policy is recovered from the WAL"
+        );
     }
 
     #[test]

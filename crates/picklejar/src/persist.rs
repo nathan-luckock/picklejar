@@ -658,6 +658,15 @@ pub struct RlsData {
 ///
 /// Returns an I/O error if the file cannot be written or renamed.
 pub fn save_rls(path: &Path, rls: &RlsData) -> io::Result<()> {
+    write_checked(path, &serialize_rls(rls))
+}
+
+/// Serialize the row-level-security state to its body string.
+///
+/// These are the same bytes [`save_rls`] writes under its integrity header,
+/// exposed so the engine can log an identical isolation snapshot to the WAL.
+#[must_use]
+pub fn serialize_rls(rls: &RlsData) -> String {
     let mut out = String::new();
     for (table, enabled, forced) in &rls.flags {
         let _ = writeln!(
@@ -670,8 +679,20 @@ pub fn save_rls(path: &Path, rls: &RlsData) -> io::Result<()> {
     for policy in &rls.policies {
         let _ = writeln!(out, "policy {policy}");
     }
-    write_checked(path, &out)?;
-    Ok(())
+    out
+}
+
+/// Write an already-serialized row-level-security `body` to `path` under the
+/// integrity header.
+///
+/// Lets the engine reconstruct the `.pol` sidecar from a WAL snapshot on open,
+/// making the log authoritative for tenant isolation.
+///
+/// # Errors
+///
+/// Returns an I/O error if the file cannot be written or renamed.
+pub fn save_rls_serialized(path: &Path, body: &str) -> io::Result<()> {
+    write_checked(path, body)
 }
 
 /// Read the row-level-security state. An absent file yields an empty set.

@@ -61,6 +61,10 @@ pub enum RecordKind {
     /// replay can reconstruct the catalog as of any LSN. Carries the same
     /// serialized body the `.meta` sidecar holds, as an opaque payload.
     Catalog = 7,
+    /// Full row-level-security snapshot, written after a policy change so the
+    /// log is authoritative for tenant isolation the same way `Catalog` is for
+    /// schema. Carries the serialized `.pol` body as an opaque payload.
+    RlsPolicies = 8,
 }
 
 impl RecordKind {
@@ -74,6 +78,7 @@ impl RecordKind {
             5 => Ok(Self::Checkpoint),
             6 => Ok(Self::Clr),
             7 => Ok(Self::Catalog),
+            8 => Ok(Self::RlsPolicies),
             other => Err(WalError::UnknownRecordType(other)),
         }
     }
@@ -134,6 +139,13 @@ pub enum LogRecord {
         /// Serialized catalog body.
         snapshot: Vec<u8>,
     },
+    /// Full row-level-security snapshot written after a policy change. The
+    /// payload is the serialized `.pol` body, stored opaquely, so forward
+    /// replay can reconstruct tenant isolation as of any LSN.
+    RlsPolicies {
+        /// Serialized row-level-security body.
+        snapshot: Vec<u8>,
+    },
 }
 
 impl LogRecord {
@@ -148,6 +160,7 @@ impl LogRecord {
             Self::Checkpoint { .. } => RecordKind::Checkpoint,
             Self::Clr { .. } => RecordKind::Clr,
             Self::Catalog { .. } => RecordKind::Catalog,
+            Self::RlsPolicies { .. } => RecordKind::RlsPolicies,
         }
     }
 
@@ -204,7 +217,7 @@ impl LogRecord {
                 out.extend_from_slice(&img_len.to_le_bytes());
                 out.extend_from_slice(undo_image);
             }
-            Self::Catalog { snapshot } => {
+            Self::Catalog { snapshot } | Self::RlsPolicies { snapshot } => {
                 // The whole payload is the snapshot; its length is implied by
                 // the record's length field, so no inner length prefix is
                 // needed (and the snapshot can exceed the 64 KiB a u16 prefix
@@ -314,6 +327,9 @@ impl LogRecord {
             RecordKind::Checkpoint => Self::decode_checkpoint(payload)?,
             RecordKind::Clr => Self::decode_clr(payload)?,
             RecordKind::Catalog => Self::Catalog {
+                snapshot: payload.to_vec(),
+            },
+            RecordKind::RlsPolicies => Self::RlsPolicies {
                 snapshot: payload.to_vec(),
             },
         };
@@ -533,6 +549,17 @@ mod tests {
         let (hdr, rec) = round_trip(&r, 1, 0, 0);
         assert_eq!(hdr.kind, RecordKind::Catalog);
         assert_eq!(rec, LogRecord::Catalog { snapshot });
+    }
+
+    #[test]
+    fn rls_policies_round_trips() {
+        let snapshot = b"flags memories 1 0\npolicy CREATE POLICY tenant ON memories ...".to_vec();
+        let r = LogRecord::RlsPolicies {
+            snapshot: snapshot.clone(),
+        };
+        let (hdr, rec) = round_trip(&r, 7, 0, 0);
+        assert_eq!(hdr.kind, RecordKind::RlsPolicies);
+        assert_eq!(rec, LogRecord::RlsPolicies { snapshot });
     }
 
     #[test]

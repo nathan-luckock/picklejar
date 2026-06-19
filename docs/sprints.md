@@ -178,16 +178,18 @@ From-scratch bounded model checkers for the write-ahead-logging ordering invaria
 and each ships a deliberately buggy variant that yields a concrete counterexample,
 so the proofs are not vacuous. Both are certified in `vecert`.
 
-### Sprint 18 - WAL-logged catalog for log-streamed recovery
+### Sprint 18 - WAL-logged catalog and isolation for log-streamed recovery
 
-The catalog is now written to the WAL as a snapshot record after every schema
-change, and replayed on open, so the log is authoritative for the schema: a
-schema change that reached the log is recovered even if its sidecar write was lost
-in a crash, and forward replay reconstructs later schema changes rather than only
-the base state. The record carries a sentinel transaction and sits outside the
-redo/undo chain (analysis skips it), so it can never be mistaken for an
-uncommitted loser. Bounding the replay to a chosen LSN reconstructs the schema as
-of that point, the basis for point-in-time recovery across schema changes.
+The catalog and the row-level-security state are now each written to the WAL as a
+snapshot record after every schema or policy change, and replayed on open, so the
+log is authoritative for both: a change that reached the log is recovered even if
+its sidecar write was lost in a crash, and forward replay reconstructs later
+schema and policy state rather than only the base state. For isolation this is a
+security property, not just durability: a crash can never silently drop a tenant
+fence and leak one tenant's rows to another. The records carry a sentinel
+transaction and sit outside the redo/undo chain (analysis skips them), so they can
+never be mistaken for an uncommitted loser. Bounding the replay to a chosen LSN
+reconstructs the schema and policy state as of that point.
 
 ## Direction
 

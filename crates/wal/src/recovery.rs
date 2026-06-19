@@ -112,13 +112,15 @@ pub fn analyze<P: AsRef<Path>>(wal_path: P) -> Result<Analysis> {
         if hdr.lsn.get() > analysis.max_lsn.get() || analysis.max_lsn.is_invalid() {
             analysis.max_lsn = hdr.lsn;
         }
-        // Checkpoint and Catalog records are metadata, not part of any
-        // transaction, so they never create a transaction-table entry (a
-        // catalog record carries a sentinel txn and must not be mistaken for an
+        // Checkpoint, Catalog, and RlsPolicies records are metadata, not part
+        // of any transaction, so they never create a transaction-table entry (a
+        // metadata record carries a sentinel txn and must not be mistaken for an
         // uncommitted loser and rolled back).
         if matches!(
             rec,
-            LogRecord::Checkpoint { .. } | LogRecord::Catalog { .. }
+            LogRecord::Checkpoint { .. }
+                | LogRecord::Catalog { .. }
+                | LogRecord::RlsPolicies { .. }
         ) {
             continue;
         }

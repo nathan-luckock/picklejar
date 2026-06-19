@@ -65,11 +65,12 @@ On top of it sits the AI-memory layer and its full reliability story, all shippe
   concrete counterexample so the proof is not vacuous.
 - **The reliability certificate.** `vecert` runs every invariant above and emits
   a content-hashed, regenerable report, framed in a named orbit's upset rate.
-- **A WAL-logged catalog.** Schema changes are written to the WAL as snapshot
-  records and replayed on open, so the log is authoritative for the schema: a
-  schema change that reached the log is recovered even if its sidecar write was
-  lost, and forward replay reconstructs later schema changes rather than only the
-  base state.
+- **A WAL-logged catalog and isolation state.** Schema changes and row-level-
+  security policy changes are written to the WAL as snapshot records and replayed
+  on open, so the log is authoritative for both: a change that reached the log is
+  recovered even if its sidecar write was lost, which for isolation means a crash
+  can never silently drop a tenant fence, and forward replay reconstructs later
+  schema and policy state rather than only the base state.
 
 So the engine detects every corruption it is built to catch, repairs from
 redundancy with no human in the loop, never serves a silently wrong or
@@ -81,10 +82,13 @@ model-checking of the core invariants.
 
 What is genuinely still ahead, stated honestly:
 
-- **Point-in-time recovery bounded to an arbitrary LSN.** The catalog is now
-  WAL-logged and replayed on open; bounding that replay to a chosen LSN (the scan
-  already accepts the bound) wires restore-to-a-timestamp across schema changes
-  into the backup path.
+- **Forward-replay point-in-time recovery.** Today the engine restores from a
+  consistent snapshot, not by replaying the log forward over a base image. Rolling
+  a base forward to an arbitrary LSN additionally needs the MVCC watermark and the
+  version pages to advance in step with the replayed heap, which the snapshot model
+  sidesteps and which is the real work here. The catalog and isolation snapshots
+  are already LSN-reconstructable (the scan accepts a bound), so schema and policy
+  as-of-a-point come for free once that forward-replay path exists.
 - **Partition tolerance.** Meaningful only once there is a multi-node replica to
   diverge from, so it is folded into the replication path rather than built ahead
   of it: the link is down for a bounded interval, the node serves locally, and it

@@ -149,6 +149,41 @@ pub fn latest_catalog_snapshot<P: AsRef<Path>>(
     path: P,
     up_to: Option<Lsn>,
 ) -> Result<Option<Vec<u8>>> {
+    latest_snapshot(path, up_to, |rec| match rec {
+        LogRecord::Catalog { snapshot } => Some(snapshot),
+        _ => None,
+    })
+}
+
+/// Most recent [`LogRecord::RlsPolicies`] snapshot at or before `up_to`.
+///
+/// The row-level-security analogue of [`latest_catalog_snapshot`] (or the most
+/// recent overall when `up_to` is `None`).
+/// Makes the WAL authoritative for tenant isolation: a policy change that
+/// reached the log is recovered on open even if its `.pol` sidecar write was
+/// lost in a crash, which closes a security-relevant durability gap (a missing
+/// isolation policy after a crash).
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be read, or if a record before the
+/// stopping point fails to decode.
+pub fn latest_rls_snapshot<P: AsRef<Path>>(path: P, up_to: Option<Lsn>) -> Result<Option<Vec<u8>>> {
+    latest_snapshot(path, up_to, |rec| match rec {
+        LogRecord::RlsPolicies { snapshot } => Some(snapshot),
+        _ => None,
+    })
+}
+
+/// Shared scan behind [`latest_catalog_snapshot`] and [`latest_rls_snapshot`]:
+/// return the payload of the last record at or before `up_to` for which
+/// `extract` yields `Some`. An absent WAL yields `Ok(None)`; a torn tail stops
+/// the scan cleanly.
+fn latest_snapshot<P: AsRef<Path>>(
+    path: P,
+    up_to: Option<Lsn>,
+    extract: impl Fn(LogRecord) -> Option<Vec<u8>>,
+) -> Result<Option<Vec<u8>>> {
     let reader = match WalReader::open(path) {
         Ok(r) => r,
         Err(WalError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -160,7 +195,7 @@ pub fn latest_catalog_snapshot<P: AsRef<Path>>(
         if up_to.is_some_and(|limit| hdr.lsn.get() > limit.get()) {
             break;
         }
-        if let LogRecord::Catalog { snapshot } = rec {
+        if let Some(snapshot) = extract(rec) {
             latest = Some(snapshot);
         }
     }
