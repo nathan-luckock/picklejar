@@ -11,6 +11,7 @@ pub mod database;
 pub mod error;
 pub mod hnsw;
 pub mod index;
+pub mod isolation_model;
 pub mod keyenc;
 pub mod persist;
 pub mod radiation;

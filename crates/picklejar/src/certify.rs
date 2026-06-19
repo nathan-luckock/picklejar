@@ -222,6 +222,9 @@ impl Certificate {
         // over every reachable interleaving of a bounded model, not just sampled.
         checks.push(wal_ordering_model());
         checks.push(snapshot_isolation_model());
+        // The memory layer's central promise, model-checked: a tenant's query,
+        // accelerated by the index or not, never returns another tenant's row.
+        checks.push(rls_isolation_model());
 
         // The catalog is WAL-logged: a schema change whose sidecar write was
         // lost in a crash is recovered from the log on open, so the two copies
@@ -894,6 +897,25 @@ fn snapshot_isolation_model() -> Check {
         detail: format!(
             "reads are stable within a snapshot over all {states} reachable states (bound {bound}); \
              a snapshot-ignoring read is caught"
+        ),
+        passed: held && teeth,
+    }
+}
+
+/// The row-level-security retrieval invariant, model-checked: over every
+/// reachable interleaving of inserts, cache invalidations, role switches, policy
+/// changes, index builds, and queries, a tenant's query (accelerated or not)
+/// never returns another tenant's row, and a policy-ignoring index path is caught.
+fn rls_isolation_model() -> Check {
+    let bound = 4u8;
+    let states = crate::isolation_model::reachable_states(bound, true);
+    let held = crate::isolation_model::check(bound, true).is_none();
+    let teeth = crate::isolation_model::check(2, false).is_some();
+    Check {
+        name: "RLS retrieval isolation model-check".into(),
+        detail: format!(
+            "no tenant query returns another tenant's row over all {states} reachable states \
+             (bound {bound}); serving the index under a policy is caught"
         ),
         passed: held && teeth,
     }

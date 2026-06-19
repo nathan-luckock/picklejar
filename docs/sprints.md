@@ -36,7 +36,8 @@ every task to a pull request that is squash-merged once the checks
 | 15 | Mass-efficient self-healing: from-scratch Reed-Solomon erasure coding; a self-healing block store; whole-footprint radiation (heap, WAL, sidecars); the live heap reconstructing corrupt pages from parity on `open_resilient` | Shipped |
 | 16 | Operability of self-healing (PROTECT statement, pjscrub, pg_fault_log); snapshot backup and replication (Database::backup, pjbackup) | Shipped |
 | 17 | Model-checking the WAL-ordering and snapshot-isolation invariants from scratch (`walmodel`, the `txn` model, both certified in `vecert`) | Shipped |
-| 18 | WAL-logging the catalog metadata to unlock log-streaming point-in-time recovery and multi-node replica divergence | Planned |
+| 18 | WAL-logging the catalog and row-level-security state so the log is authoritative for schema and isolation, with resilient fallback to the sidecar, all certified in `vecert` | Shipped |
+| 19 | Model-checking the row-level-security retrieval invariant from scratch (`rlsmodel`): a tenant's query, accelerated by the index or not, never returns another tenant's row | Shipped |
 
 ## What shipped, by sprint
 
@@ -190,6 +191,19 @@ fence and leak one tenant's rows to another. The records carry a sentinel
 transaction and sit outside the redo/undo chain (analysis skips them), so they can
 never be mistaken for an uncommitted loser. Bounding the replay to a chosen LSN
 reconstructs the schema and policy state as of that point.
+
+### Sprint 19 - Model-checking RLS-filtered retrieval
+
+The memory layer's central promise, proved exhaustively: a tenant's query,
+accelerated by the cached approximate index or served exactly, can never return
+another tenant's row. A from-scratch bounded model checker (`rlsmodel`, the
+`isolation_model`) enumerates every reachable interleaving of inserts, cache
+invalidations, role switches, policy changes, index builds, and queries, and
+proves no query returns a row the caller's policy forbids; a deliberately buggy
+dispatch that serves the index under an active policy is caught with a concrete
+cross-tenant counterexample, so the proof is not vacuous. This is the sharpest
+piece of open ground in the research: no vector or AI-memory database is known to
+model-check its filtered-retrieval isolation. Certified in `vecert`.
 
 ## Direction
 

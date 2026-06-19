@@ -60,9 +60,13 @@ On top of it sits the AI-memory layer and its full reliability story, all shippe
 - **Backup, point-in-time recovery, and a physical standby replica.**
 - **Exhaustive model-checking.** From-scratch bounded model checkers prove the
   write-ahead-logging ordering invariant (no page change is ever durable ahead of
-  its log record) and the MVCC snapshot read-stability invariant over every
-  reachable interleaving, each with a deliberately buggy variant that yields a
-  concrete counterexample so the proof is not vacuous.
+  its log record), the MVCC snapshot read-stability invariant, and the
+  row-level-security retrieval invariant (a tenant's query, accelerated by the
+  index or not, never returns another tenant's row) over every reachable
+  interleaving, each with a deliberately buggy variant that yields a concrete
+  counterexample so the proof is not vacuous. No vector or AI-memory database is
+  known to model-check its filtered-retrieval isolation this way, which is the
+  sharpest piece of open ground the project sits on.
 - **The reliability certificate.** `vecert` runs every invariant above and emits
   a content-hashed, regenerable report, framed in a named orbit's upset rate.
 - **A WAL-logged catalog and isolation state.** Schema changes and row-level-
