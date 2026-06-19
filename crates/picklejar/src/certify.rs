@@ -223,6 +223,11 @@ impl Certificate {
         checks.push(wal_ordering_model());
         checks.push(snapshot_isolation_model());
 
+        // The catalog is WAL-logged: a schema change whose sidecar write was
+        // lost in a crash is recovered from the log on open, so the two copies
+        // (WAL and sidecar) are redundant and the schema self-heals.
+        checks.push(catalog_wal_recovery());
+
         Self { checks }
     }
 
@@ -704,6 +709,75 @@ fn live_heap_self_heal() -> Check {
              all reconstructed on open and {rows_n} rows served exactly"
         ),
         passed: healed,
+    }
+}
+
+/// The catalog survives a lost sidecar write: a schema change that reached the
+/// WAL is recovered on open even when its `.meta` sidecar write was lost, so the
+/// WAL and the sidecar are redundant copies and the schema self-heals.
+fn catalog_wal_recovery() -> Check {
+    let name = "catalog WAL recovery".to_string();
+    let base = std::env::temp_dir().join(format!("pj-cert-catwal-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let _ = std::fs::create_dir_all(&base);
+    let path = base.join("m.db");
+    let meta_path = path.with_extension("meta");
+    let fail = |detail: String| Check {
+        name: name.clone(),
+        detail,
+        passed: false,
+    };
+
+    // Build: one table, snapshot the sidecar, then add a second table and a row.
+    let stale_meta = {
+        let mut db = match Database::open(&path) {
+            Ok(db) => db,
+            Err(e) => return fail(format!("open: {e}")),
+        };
+        if let Err(e) = db.execute("CREATE TABLE t1 (id INT)") {
+            return fail(format!("create t1: {e}"));
+        }
+        let snap = match std::fs::read(&meta_path) {
+            Ok(b) => b,
+            Err(e) => return fail(format!("read meta: {e}")),
+        };
+        if let Err(e) = db.execute("CREATE TABLE t2 (id INT, name TEXT)") {
+            return fail(format!("create t2: {e}"));
+        }
+        if let Err(e) = db.execute("INSERT INTO t2 VALUES (1, 'a')") {
+            return fail(format!("insert: {e}"));
+        }
+        snap
+    };
+
+    // Simulate the lost sidecar write: roll `.meta` back to the t1-only state,
+    // leaving the WAL (which logged t2's catalog snapshot) intact.
+    if let Err(e) = std::fs::write(&meta_path, &stale_meta) {
+        return fail(format!("clobber meta: {e}"));
+    }
+
+    // Reopen: the WAL reconstructs t2's schema and the row it pointed at.
+    let recovered = {
+        let mut db = match Database::open(&path) {
+            Ok(db) => db,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&base);
+                return fail(format!("reopen: {e}"));
+            }
+        };
+        matches!(
+            db.execute("SELECT id, name FROM t2"),
+            Ok(QueryOutcome::Rows { rows, .. })
+                if rows == vec![vec![Value::Int(1), Value::Text("a".into())]]
+        )
+    };
+    let _ = std::fs::remove_dir_all(&base);
+
+    Check {
+        name,
+        detail: "a schema change whose sidecar write was lost is recovered from the WAL on open"
+            .into(),
+        passed: recovered,
     }
 }
 
