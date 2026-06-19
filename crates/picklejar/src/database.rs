@@ -470,21 +470,19 @@ impl Database {
             vector_index_on: false,
             vector_index_cache: HashMap::new(),
         };
-        // Make the WAL authoritative for the catalog: if the log carries a
-        // catalog snapshot (it does once any schema change has been logged),
-        // rebuild the sidecar from it before loading. This recovers a schema
-        // change whose sidecar write was lost in a crash, and lets a forward
-        // replay reconstruct the schema rather than only the base state.
-        if let Some(snapshot) = picklejar_wal::latest_catalog_snapshot(&wal_path, None)? {
+        // The catalog and the isolation state each have two redundant copies:
+        // the WAL snapshot and the sidecar. Prefer the WAL (it is authoritative
+        // and catches a lost sidecar write), but if the WAL scan fails on a
+        // corrupt record, fall back to the independently-checksummed sidecar
+        // rather than refusing to open. For a node no one can service, healing
+        // from the surviving copy beats a dead node; a sidecar that is itself
+        // corrupt is still caught by its own checksum in the load below.
+        if let Ok(Some(snapshot)) = picklejar_wal::latest_catalog_snapshot(&wal_path, None) {
             if let Ok(body) = std::str::from_utf8(&snapshot) {
                 persist::save_serialized(&db.meta_path, body)?;
             }
         }
-        // Same for tenant isolation: rebuild the `.pol` sidecar from the latest
-        // logged row-level-security snapshot, so a policy change that reached
-        // the log survives a lost sidecar write rather than silently dropping a
-        // fence.
-        if let Some(snapshot) = picklejar_wal::latest_rls_snapshot(&wal_path, None)? {
+        if let Ok(Some(snapshot)) = picklejar_wal::latest_rls_snapshot(&wal_path, None) {
             if let Ok(body) = std::str::from_utf8(&snapshot) {
                 persist::save_rls_serialized(&db.pol_path, body)?;
             }
@@ -9324,6 +9322,41 @@ mod tests {
         let (cols, rows) = query(&mut db, "SELECT id, name FROM t2");
         assert_eq!(names(&cols), ["id", "name"]);
         assert_eq!(rows, vec![vec![Value::Int(1), Value::Text("a".into())]]);
+    }
+
+    #[test]
+    fn corrupt_wal_falls_back_to_the_catalog_sidecar() {
+        // The WAL catalog snapshot and the `.meta` sidecar are redundant copies.
+        // A corrupt WAL record must not block open when the sidecar is intact:
+        // the node heals from the surviving copy instead of dying.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("resil.db");
+        let wal_path = path.with_extension("wal");
+        {
+            let mut db = Database::open(&path).expect("open");
+            db.execute("CREATE TABLE t (id INT, name TEXT)").unwrap();
+            db.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b')")
+                .unwrap();
+        }
+        // Garble a byte in the middle of the WAL so the scan hits a corrupt
+        // record (a checksum mismatch or a bogus length) rather than a clean
+        // tail.
+        let mut wal = std::fs::read(&wal_path).expect("read wal");
+        assert!(wal.len() > 40, "wal has records");
+        let mid = wal.len() / 2;
+        wal[mid] ^= 0xFF;
+        std::fs::write(&wal_path, &wal).expect("write wal");
+
+        // Open still succeeds via the sidecar, and the data is intact.
+        let mut db = Database::open(&path).expect("open survives corrupt WAL");
+        let (_c, rows) = query(&mut db, "SELECT id, name FROM t ORDER BY id");
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Int(1), Value::Text("a".into())],
+                vec![Value::Int(2), Value::Text("b".into())],
+            ]
+        );
     }
 
     #[test]
