@@ -96,6 +96,18 @@ the core invariants are model-checked, and `vecert` regenerates the whole proof.
   syntax collision, and `SET valid_time = off` / `RESET valid_time` returns to the
   latest state. Writes are unaffected (they always act on the latest state); the
   travel applies only to temporal tables, so an ordinary table is read in full.
+- **Transaction-time travel** - the other axis of bitemporality.
+  `SET transaction_time = <n>` travels a read to the MVCC snapshot as of a past
+  transaction point, the database's own logical clock: a transaction-id watermark
+  read from `txid_current()`. The read walks each version chain to the version
+  that was live then, so it sees the database as it actually recorded it (a row
+  updated since shows its old value, a deleted row reappears, a row inserted since
+  is absent), bounded by retained version history (before `VACUUM` reclaims it).
+  Where valid-time travel asks "what was true in the world then", this asks "what
+  did the database know then"; with both set, a query is a full bitemporal as-of.
+  It rides the same session mechanism as `SET valid_time`; writes are unaffected
+  (they act on the latest state), and `SET transaction_time = off` /
+  `RESET transaction_time` returns to the present.
 - **JSON** - a `JSON` column (validated on write, stored as text) with the
   `->` (returns JSON) and `->>` (returns text) access operators, navigating by
   a text member name or an integer array index, and chainable
@@ -130,7 +142,9 @@ the core invariants are model-checked, and `vecert` regenerates the whole proof.
   `INITCAP`, `TRIM` / `LTRIM` / `RTRIM`, `SUBSTR`, `RIGHT`, `REPEAT`, `REVERSE`,
   `REPLACE`, `STRPOS` / `POSITION`, `CONCAT`), numeric (`ABS`, `SIGN`, `MOD`,
   `ROUND`, `TRUNC`, `FLOOR`, `CEIL`, `POWER`, `SQRT`, `EXP`, `LN`, `LOG`), and
-  conditional (`COALESCE`, `NULLIF`, `GREATEST`, `LEAST`).
+  conditional (`COALESCE`, `NULLIF`, `GREATEST`, `LEAST`), and session
+  (`txid_current()`, the current transaction-id watermark, for transaction-time
+  travel).
 - **Transactions** - `BEGIN` / `COMMIT` / `ROLLBACK` over MVCC snapshots;
   auto-commit otherwise.
 - **`EXPLAIN`** - the cost-annotated physical plan, showing the planner's scan

@@ -231,6 +231,25 @@ superseded, is caught with a concrete counterexample, so the boundary the rule
 exists to get right is the boundary the proof pins. Certified in `vecert` and
 swept by `rlsmodel`.
 
+### Sprint 21 - Transaction-time travel
+
+The second axis of bitemporality, where valid-time asks what was true in the
+world, transaction-time asks what the database knew. `SET transaction_time = <n>`
+travels a read to the MVCC snapshot as of a past transaction point, the database's
+own logical clock: a transaction-id watermark read from the new `txid_current()`
+function. The implementation reuses the locked machinery whole. The MVCC layer
+already retains every version, chained newest-to-oldest, and the visibility rule
+already decides which version a snapshot sees. So travel is just handing a
+read-only statement a synthetic past snapshot (`xmax = point`, empty active set);
+the existing chain walk then resolves each row to the version live then, with no
+write-path change. A row updated since shows its old value, a deleted row
+reappears, a row inserted since is absent, all bounded by retained history
+(pre-`VACUUM`). Writes are never travelled (they act on the latest state), and
+because the two axes are independent (a snapshot override and a binder fold), a
+query with both set is a full bitemporal as-of. The snapshot construction is the
+same one the forward-replay point-in-time recovery on the frontier will need, so
+this also de-risks that path.
+
 ## Direction
 
 A from-scratch engine that speaks PostgreSQL over the wire, turned toward a

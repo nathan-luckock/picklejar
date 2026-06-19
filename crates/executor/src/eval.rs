@@ -18,6 +18,11 @@ thread_local! {
     /// The engine sets this before running a statement; it defaults to empty.
     static SESSION_IDENTITY: std::cell::RefCell<(String, String)> =
         const { std::cell::RefCell::new((String::new(), String::new())) };
+
+    /// The current transaction-id watermark `txid_current()` reports: the next
+    /// xid the engine will assign, which is the database's own logical clock.
+    /// The engine sets this before running a statement; it defaults to zero.
+    static SESSION_TXID: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Set the role names the niladic session functions report on this thread.
@@ -39,6 +44,20 @@ fn current_user() -> String {
 /// The session user (what `session_user` evaluates to).
 fn session_user() -> String {
     SESSION_IDENTITY.with(|id| id.borrow().1.clone())
+}
+
+/// Set the transaction-id watermark `txid_current()` reports on this thread.
+///
+/// The engine calls this before each statement with its current xid watermark,
+/// so a session can capture the present transaction point and travel reads back
+/// to it later with `SET transaction_time`.
+pub fn set_session_txid(txid: u64) {
+    SESSION_TXID.with(|t| t.set(txid));
+}
+
+/// The current transaction-id watermark (what `txid_current()` evaluates to).
+fn session_txid() -> u64 {
+    SESSION_TXID.with(std::cell::Cell::get)
 }
 
 /// Evaluates a subquery expression (`Expr::Subquery`, `Expr::InSubquery`, or
@@ -187,6 +206,12 @@ fn eval_scalar_func(
         // Niladic session functions report the active role names.
         "CURRENT_USER" | "CURRENT_ROLE" => Ok(Some(Value::Text(current_user()))),
         "SESSION_USER" => Ok(Some(Value::Text(session_user()))),
+        // The database's logical clock: the current transaction-id watermark,
+        // for capturing a point to travel reads back to with SET transaction_time.
+        "TXID_CURRENT" => {
+            let txid = i64::try_from(session_txid()).unwrap_or(i64::MAX);
+            Ok(Some(Value::Int(txid)))
+        }
         // COALESCE returns the first non-NULL argument; it evaluates lazily.
         "COALESCE" => {
             for a in args {

@@ -743,6 +743,16 @@ pub enum Statement {
         /// for `off` / `RESET` (read the latest state).
         at: Option<Expr>,
     },
+    /// `SET transaction_time = <n>` / `SET transaction_time = off`: set the
+    /// session's transaction-time as-of point. While set, a read travels to the
+    /// MVCC snapshot as of that transaction point (the database's own logical
+    /// clock, a transaction-id watermark from `txid_current()`); `off` (or
+    /// `RESET transaction_time`) reads the latest committed state.
+    SetTransactionTime {
+        /// The as-of transaction point (an integer expression), or `None` for
+        /// `off` / `RESET` (read the latest committed state).
+        at: Option<Expr>,
+    },
     /// `CREATE POLICY name ON table [FOR cmd] [TO roles] [USING (expr)]
     /// [WITH CHECK (expr)]`: a row-level security policy.
     CreatePolicy {
@@ -1260,6 +1270,10 @@ impl fmt::Display for Statement {
                 Some(expr) => write!(f, "SET valid_time = {expr}"),
                 None => f.write_str("SET valid_time = off"),
             },
+            Self::SetTransactionTime { at } => match at {
+                Some(expr) => write!(f, "SET transaction_time = {expr}"),
+                None => f.write_str("SET transaction_time = off"),
+            },
             Self::CreatePolicy {
                 name,
                 table,
@@ -1399,9 +1413,11 @@ impl Parser {
                     self.parse_set_vector_index_tail()?
                 } else if self.eat_ident_kw("valid_time") {
                     self.parse_set_valid_time_tail()?
+                } else if self.eat_ident_kw("transaction_time") {
+                    self.parse_set_transaction_time_tail()?
                 } else {
                     return Err(SqlError::parse(
-                        "expected ROLE, vector_index, or valid_time after SET",
+                        "expected ROLE, vector_index, valid_time, or transaction_time after SET",
                         self.span(),
                     ));
                 }
@@ -1412,9 +1428,11 @@ impl Parser {
                     Statement::SetRole { name: None }
                 } else if self.eat_ident_kw("valid_time") {
                     Statement::SetValidTime { at: None }
+                } else if self.eat_ident_kw("transaction_time") {
+                    Statement::SetTransactionTime { at: None }
                 } else {
                     return Err(SqlError::parse(
-                        "expected ROLE or valid_time after RESET",
+                        "expected ROLE, valid_time, or transaction_time after RESET",
                         self.span(),
                     ));
                 }
@@ -2370,6 +2388,23 @@ impl Parser {
         })
     }
 
+    /// `SET transaction_time = <n>` / `SET transaction_time = off` (the
+    /// `SET transaction_time` is already consumed). Both `=` and `TO` are
+    /// accepted. `off` clears the session as-of point; any other value is parsed
+    /// as the transaction-point expression (typically an integer literal or
+    /// `txid_current()`).
+    fn parse_set_transaction_time_tail(&mut self) -> Result<Statement> {
+        if !self.eat_ident_kw("to") {
+            self.expect(&TokenKind::Eq)?;
+        }
+        if self.eat_ident_kw("off") {
+            return Ok(Statement::SetTransactionTime { at: None });
+        }
+        Ok(Statement::SetTransactionTime {
+            at: Some(self.parse_expr()?),
+        })
+    }
+
     /// `PROTECT [WITH (k = N, m = N)]` (the `PROTECT` is already consumed).
     fn parse_protect_tail(&mut self) -> Result<Statement> {
         if !self.eat_keyword(Keyword::With) {
@@ -2941,6 +2976,23 @@ mod tests {
         );
         // `valid_time` stays usable as an ordinary identifier (non-reserved).
         round_trip("SELECT valid_time FROM t");
+    }
+
+    #[test]
+    fn set_transaction_time_round_trips() {
+        round_trip("SET transaction_time = 42");
+        round_trip("SET transaction_time = off");
+        round_trip("SET transaction_time = txid_current()");
+        assert_eq!(
+            parse("RESET transaction_time"),
+            parse("SET transaction_time = off"),
+        );
+        assert_eq!(
+            parse("SET transaction_time TO 7"),
+            parse("SET transaction_time = 7"),
+        );
+        // `transaction_time` stays usable as an ordinary identifier.
+        round_trip("SELECT transaction_time FROM t");
     }
 
     #[test]
