@@ -205,6 +205,22 @@ cross-tenant counterexample, so the proof is not vacuous. This is the sharpest
 piece of open ground in the research: no vector or AI-memory database is known to
 model-check its filtered-retrieval isolation. Certified in `vecert`.
 
+### Sprint 20 - Valid-time travel
+
+A memory of record should answer not only what an agent knows now but what it
+knew at a past instant. A session as-of instant, `SET valid_time = TIMESTAMP
+'...'`, rewinds every read in the session: a table that carries `valid_from` and
+`valid_to` columns is treated as temporal, and the binder folds the half-open
+validity predicate `valid_from <= t AND (valid_to IS NULL OR t < valid_to)` into
+its reads, so a query returns exactly the rows valid then, a `NULL` upper bound
+being the still-current row. The instant rides the same parser-safe `SET`
+mechanism as the index toggle, which is what sidesteps the `AS OF` collision with
+table-alias parsing; `SET valid_time = off` / `RESET valid_time` returns to the
+present. Travel is a read concept, so writes still act on the latest state, and
+the fold applies only to temporal tables, leaving ordinary tables read in full.
+It composes with row-level security: the validity predicate is `AND`-ed after the
+tenant fence, so time travel can never widen what a tenant sees.
+
 ## Direction
 
 A from-scratch engine that speaks PostgreSQL over the wire, turned toward a

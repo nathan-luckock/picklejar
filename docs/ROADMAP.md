@@ -57,6 +57,11 @@ On top of it sits the AI-memory layer and its full reliability story, all shippe
 - **Operability of self-healing.** A `PROTECT` statement, a durable fault log
   (`pg_fault_log`), and the `pjscrub` scrubber that heals and refreshes parity on
   a cadence.
+- **Valid-time travel.** A session as-of instant (`SET valid_time = TIMESTAMP
+  '...'`) rewinds reads on temporal tables (those with `valid_from` / `valid_to`
+  columns) to the rows valid at that instant, over the half-open interval, so an
+  agent can recall what it knew at a past moment. It rides the same parser-safe
+  session mechanism as the index toggle, sidestepping the `AS OF` syntax collision.
 - **Backup, point-in-time recovery, and a physical standby replica.**
 - **Exhaustive model-checking.** From-scratch bounded model checkers prove the
   write-ahead-logging ordering invariant (no page change is ever durable ahead of

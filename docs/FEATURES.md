@@ -86,6 +86,16 @@ the core invariants are model-checked, and `vecert` regenerates the whole proof.
   type words are not reserved. `EXTRACT(field FROM ts)` / `DATE_PART('field',
   ts)` pull out a component (year, month, day, hour, minute, second, dow, doy)
   and `DATE_TRUNC('field', ts)` floors to the start of one.
+- **Valid-time travel** - `SET valid_time = TIMESTAMP '...'` travels every read
+  in the session to an as-of instant: a table that carries `valid_from` and
+  `valid_to` columns is treated as temporal, and its reads are folded with the
+  half-open validity predicate `valid_from <= t AND (valid_to IS NULL OR t <
+  valid_to)`, so a query returns exactly the rows that were valid then (a `NULL`
+  `valid_to` is the still-current row). The instant is set through the same
+  parser-safe session mechanism as `SET vector_index`, sidestepping an `AS OF`
+  syntax collision, and `SET valid_time = off` / `RESET valid_time` returns to the
+  latest state. Writes are unaffected (they always act on the latest state); the
+  travel applies only to temporal tables, so an ordinary table is read in full.
 - **JSON** - a `JSON` column (validated on write, stored as text) with the
   `->` (returns JSON) and `->>` (returns text) access operators, navigating by
   a text member name or an integer array index, and chainable

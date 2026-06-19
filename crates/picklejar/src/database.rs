@@ -269,6 +269,12 @@ pub struct Database {
     /// without this an `INSERT` would append an (often empty) policy snapshot to
     /// the log every time and bloat it. `None` until the first log.
     last_rls_body: std::cell::RefCell<Option<String>>,
+    /// The session's valid-time as-of instant. While `Some`, a read on a temporal
+    /// table (one with `valid_from` and `valid_to` columns) is folded with a
+    /// validity predicate so it returns only the rows valid at that instant. `None`
+    /// (the default, and after `SET valid_time = off` / `RESET valid_time`) reads
+    /// the latest state. Set by `SET valid_time = <timestamp>`.
+    valid_time_as_of: Option<Value>,
 }
 
 /// One entry in the durable fault log: a heap page the self-healing layer found
@@ -476,6 +482,7 @@ impl Database {
             vector_index_on: false,
             vector_index_cache: HashMap::new(),
             last_rls_body: std::cell::RefCell::new(None),
+            valid_time_as_of: None,
         };
         // The catalog and the isolation state each have two redundant copies:
         // the WAL snapshot and the sidecar. Prefer the WAL (it is authoritative
@@ -1053,6 +1060,9 @@ impl Database {
     /// Returns an error if the statement does not parse, names something the
     /// catalog does not have, has a type or arity mismatch, or is a form not
     /// yet supported.
+    // A flat dispatch over every statement keyword after the rewrite passes;
+    // splitting it would only scatter the one-line arms across helpers.
+    #[allow(clippy::too_many_lines)]
     pub fn execute(&mut self, sql: &str) -> Result<QueryOutcome> {
         let stmt = Parser::from_sql(sql)?.parse_statement()?;
         // Inline any WITH common table expressions into the body before routing,
@@ -1075,6 +1085,10 @@ impl Database {
         // Enforce row-level security by folding policy predicates into the
         // statement's reads. A role that bypasses RLS gets it unchanged.
         let stmt = self.apply_rls(stmt);
+        // Travel reads on temporal tables to the session's valid-time as-of
+        // instant, if one is set. Like RLS, this folds a predicate into the
+        // statement's reads; with no instant set the statement is unchanged.
+        let stmt = self.apply_valid_time(stmt);
         match stmt {
             // Transaction control.
             Statement::Begin => self.begin_txn(),
@@ -1111,6 +1125,10 @@ impl Database {
             Statement::SetRole { ref name } => self.set_role(name.as_deref()),
             Statement::SetVectorIndex { on } => {
                 self.set_vector_index(on);
+                Ok(QueryOutcome::Message("SET"))
+            }
+            Statement::SetValidTime { ref at } => {
+                self.set_valid_time(at.as_ref())?;
                 Ok(QueryOutcome::Message("SET"))
             }
             Statement::CreatePolicy {
@@ -1299,6 +1317,32 @@ impl Database {
     #[must_use]
     pub const fn vector_index_enabled(&self) -> bool {
         self.vector_index_on
+    }
+
+    /// Set or clear the session's valid-time as-of instant. `at` is the instant
+    /// expression from `SET valid_time = <expr>` (folded to a constant here), or
+    /// `None` for `off` / `RESET valid_time`. A `NULL` instant also clears it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `at` is not a constant expression.
+    pub fn set_valid_time(&mut self, at: Option<&Expr>) -> Result<()> {
+        self.valid_time_as_of = match at {
+            None => None,
+            Some(expr) => match const_eval(expr).map_err(|_| {
+                DbError::Unsupported("SET valid_time expects a constant timestamp".into())
+            })? {
+                Value::Null => None,
+                instant => Some(instant),
+            },
+        };
+        Ok(())
+    }
+
+    /// The session's valid-time as-of instant, if one is set.
+    #[must_use]
+    pub const fn valid_time_as_of(&self) -> Option<&Value> {
+        self.valid_time_as_of.as_ref()
     }
 
     /// If `s` is a pure nearest-neighbor query this engine can serve from an HNSW
@@ -2000,6 +2044,92 @@ impl Database {
             select.where_clause = Some(and_two(select.where_clause.take(), combined));
         }
         select
+    }
+
+    /// Rewrite a statement to travel its reads to the session's valid-time as-of
+    /// instant. With no instant set the statement is returned unchanged. Only
+    /// reads (`SELECT` and the two halves of a set operation) are folded; writes
+    /// always act on the latest state, matching the bitemporal convention that
+    /// valid-time travel is a read concept.
+    fn apply_valid_time(&self, stmt: Statement) -> Statement {
+        let Some(instant) = self.valid_time_as_of.clone() else {
+            return stmt;
+        };
+        self.valid_time_rewrite(stmt, &instant)
+    }
+
+    /// Fold the validity predicate for `instant` into the reads of `stmt`,
+    /// recursing through set operations and `EXPLAIN`.
+    fn valid_time_rewrite(&self, stmt: Statement, instant: &Value) -> Statement {
+        match stmt {
+            Statement::Select(s) => {
+                Statement::Select(Box::new(self.valid_time_select(*s, instant)))
+            }
+            Statement::Union {
+                op,
+                all,
+                left,
+                right,
+                order_by,
+                limit,
+                offset,
+            } => Statement::Union {
+                op,
+                all,
+                left: Box::new(self.valid_time_rewrite(*left, instant)),
+                right: Box::new(self.valid_time_rewrite(*right, instant)),
+                order_by,
+                limit,
+                offset,
+            },
+            Statement::Explain { analyze, statement } => Statement::Explain {
+                analyze,
+                statement: Box::new(self.valid_time_rewrite(*statement, instant)),
+            },
+            other => other,
+        }
+    }
+
+    /// Travel one `SELECT` to `instant`: guard each temporal `FROM` / `JOIN` table
+    /// with its validity predicate, and recurse into derived-table subqueries.
+    fn valid_time_select(&self, mut select: Select, instant: &Value) -> Select {
+        let mut guards: Vec<Expr> = Vec::new();
+        self.valid_time_guard_table_ref(&mut select.from, instant, &mut guards);
+        for join in &mut select.joins {
+            self.valid_time_guard_table_ref(&mut join.table, instant, &mut guards);
+        }
+        if !guards.is_empty() {
+            let combined = and_all(guards);
+            select.where_clause = Some(and_two(select.where_clause.take(), combined));
+        }
+        select
+    }
+
+    /// Add a validity guard for one table reference: recurse into a derived-table
+    /// subquery, or, for a base temporal table, push the predicate that keeps only
+    /// the rows valid at `instant` (qualified by the table's alias or name).
+    fn valid_time_guard_table_ref(
+        &self,
+        table: &mut TableRef,
+        instant: &Value,
+        guards: &mut Vec<Expr>,
+    ) {
+        if let Some(sub) = table.subquery.take() {
+            table.subquery = Some(Box::new(self.valid_time_rewrite(*sub, instant)));
+            return;
+        }
+        if self.is_temporal(&table.name) {
+            let qualifier = table.alias.clone().unwrap_or_else(|| table.name.clone());
+            guards.push(valid_time_predicate(&qualifier, instant));
+        }
+    }
+
+    /// Whether `table` is a temporal table: a base table carrying both a
+    /// `valid_from` and a `valid_to` column, the pair valid-time travel filters on.
+    fn is_temporal(&self, table: &str) -> bool {
+        self.catalog.get_table(table).is_some_and(|meta| {
+            meta.column_index("valid_from").is_some() && meta.column_index("valid_to").is_some()
+        })
     }
 
     /// Reject `row` if it fails the row-level-security `WITH CHECK` for `command`
@@ -5444,6 +5574,27 @@ fn qualify_expr(expr: &Expr, qualifier: &str) -> Expr {
         },
         other => other.clone(),
     }
+}
+
+/// The validity predicate for a temporal table qualified by `q`, at `instant`:
+/// `q.valid_from <= instant AND (q.valid_to IS NULL OR instant < q.valid_to)`.
+///
+/// The half-open interval `[valid_from, valid_to)` is the standard bitemporal
+/// convention: a row is valid from its `valid_from` up to but not including its
+/// `valid_to`, and a `NULL` `valid_to` means still valid (the open end). So the
+/// instant a row is superseded becomes the `valid_from` of its successor with no
+/// gap or overlap.
+fn valid_time_predicate(q: &str, instant: &Value) -> Expr {
+    let from_col = Expr::QualifiedColumn(q.to_string(), "valid_from".to_string());
+    let to_col = Expr::QualifiedColumn(q.to_string(), "valid_to".to_string());
+    let lit = || Expr::Literal(instant.clone());
+    // valid_from <= instant
+    let lower = Expr::binary(BinOp::Le, from_col, lit());
+    // valid_to IS NULL OR instant < valid_to
+    let to_is_null = Expr::unary(UnOp::IsNull, to_col.clone());
+    let below_upper = Expr::binary(BinOp::Lt, lit(), to_col);
+    let upper = Expr::binary(BinOp::Or, to_is_null, below_upper);
+    Expr::binary(BinOp::And, lower, upper)
 }
 
 /// `OR` a list of predicates, or `FALSE` when empty (RLS default deny).

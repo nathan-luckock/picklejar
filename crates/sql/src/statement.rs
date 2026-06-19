@@ -734,6 +734,15 @@ pub enum Statement {
         /// Whether to enable the index path.
         on: bool,
     },
+    /// `SET valid_time = <timestamp>` / `SET valid_time = off`: set the session's
+    /// valid-time as-of instant. While set, reads on temporal tables (those with
+    /// `valid_from` and `valid_to` columns) return only the rows valid at that
+    /// instant; `off` (or `RESET valid_time`) reads the latest state.
+    SetValidTime {
+        /// The as-of instant (typically a `TIMESTAMP` / `DATE` literal), or `None`
+        /// for `off` / `RESET` (read the latest state).
+        at: Option<Expr>,
+    },
     /// `CREATE POLICY name ON table [FOR cmd] [TO roles] [USING (expr)]
     /// [WITH CHECK (expr)]`: a row-level security policy.
     CreatePolicy {
@@ -1247,6 +1256,10 @@ impl fmt::Display for Statement {
             Self::SetVectorIndex { on } => {
                 write!(f, "SET vector_index = {}", if *on { "on" } else { "off" })
             }
+            Self::SetValidTime { at } => match at {
+                Some(expr) => write!(f, "SET valid_time = {expr}"),
+                None => f.write_str("SET valid_time = off"),
+            },
             Self::CreatePolicy {
                 name,
                 table,
@@ -1384,19 +1397,27 @@ impl Parser {
                     self.parse_set_role_tail()?
                 } else if self.eat_ident_kw("vector_index") {
                     self.parse_set_vector_index_tail()?
+                } else if self.eat_ident_kw("valid_time") {
+                    self.parse_set_valid_time_tail()?
                 } else {
                     return Err(SqlError::parse(
-                        "expected ROLE or vector_index after SET",
+                        "expected ROLE, vector_index, or valid_time after SET",
                         self.span(),
                     ));
                 }
             }
             TokenKind::Keyword(Keyword::Reset) => {
                 self.advance();
-                if !self.eat_ident_kw("role") {
-                    return Err(SqlError::parse("expected ROLE after RESET", self.span()));
+                if self.eat_ident_kw("role") {
+                    Statement::SetRole { name: None }
+                } else if self.eat_ident_kw("valid_time") {
+                    Statement::SetValidTime { at: None }
+                } else {
+                    return Err(SqlError::parse(
+                        "expected ROLE or valid_time after RESET",
+                        self.span(),
+                    ));
                 }
-                Statement::SetRole { name: None }
             }
             TokenKind::Keyword(Keyword::Select) => self.parse_query()?,
             TokenKind::Keyword(Keyword::With) => self.parse_with()?,
@@ -2332,6 +2353,23 @@ impl Parser {
         Ok(Statement::SetVectorIndex { on })
     }
 
+    /// `SET valid_time = <timestamp>` / `SET valid_time = off` (the
+    /// `SET valid_time` is already consumed). Both `=` and `TO` are accepted
+    /// between the name and the value. `off` clears the session as-of instant;
+    /// any other value is parsed as the instant expression (typically a
+    /// `TIMESTAMP` or `DATE` literal).
+    fn parse_set_valid_time_tail(&mut self) -> Result<Statement> {
+        if !self.eat_ident_kw("to") {
+            self.expect(&TokenKind::Eq)?;
+        }
+        if self.eat_ident_kw("off") {
+            return Ok(Statement::SetValidTime { at: None });
+        }
+        Ok(Statement::SetValidTime {
+            at: Some(self.parse_expr()?),
+        })
+    }
+
     /// `PROTECT [WITH (k = N, m = N)]` (the `PROTECT` is already consumed).
     fn parse_protect_tail(&mut self) -> Result<Statement> {
         if !self.eat_keyword(Keyword::With) {
@@ -2887,6 +2925,22 @@ mod tests {
         round_trip("SET ROLE NONE");
         // `role`, `user`, `public` stay usable as identifiers (non-reserved).
         round_trip("SELECT role, public FROM t");
+    }
+
+    #[test]
+    fn set_valid_time_round_trips() {
+        round_trip("SET valid_time = TIMESTAMP '2020-06-01 00:00:00'");
+        round_trip("SET valid_time = DATE '2020-06-01'");
+        round_trip("SET valid_time = off");
+        // `RESET valid_time` and `TO` both normalize to `SET valid_time = off`
+        // / `SET valid_time = <expr>`, so they are checked by hand here.
+        assert_eq!(parse("RESET valid_time"), parse("SET valid_time = off"));
+        assert_eq!(
+            parse("SET valid_time TO TIMESTAMP '2020-06-01 00:00:00'"),
+            parse("SET valid_time = TIMESTAMP '2020-06-01 00:00:00'"),
+        );
+        // `valid_time` stays usable as an ordinary identifier (non-reserved).
+        round_trip("SELECT valid_time FROM t");
     }
 
     #[test]

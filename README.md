@@ -85,6 +85,8 @@ A `VECTOR(n)` column stores an embedding as native `f32`, validates its width on
 
 That last query can be served two ways. By default it is an exact scan. Run `SET vector_index = on` (from `psql` or any client) and the same SQL is answered from a cached HNSW index instead, roughly 150x faster on a warm query, and only when row-level security does not apply to the query, so the acceleration can never widen what a tenant can see. An RLS-fenced query always falls back to the exact, fenced path.
 
+Memory also travels in time. Give a table `valid_from` and `valid_to` columns and `SET valid_time = TIMESTAMP '...'` rewinds every read in the session to an as-of instant, returning exactly the rows that were valid then over the half-open interval `[valid_from, valid_to)`. So an agent can ask what it knew at a past moment, not only what it knows now, and `SET valid_time = off` returns to the present. It rides the same parser-safe session mechanism as the index toggle, which is what lets it sidestep the `AS OF` syntax collision.
+
 ## It speaks Postgres
 
 No shim. The server implements the PostgreSQL v3 wire protocol, so the real `psql` binary connects straight to the engine:
