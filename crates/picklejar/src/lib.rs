@@ -16,6 +16,7 @@ pub mod hnsw;
 pub mod index;
 pub mod isolation_model;
 pub mod keyenc;
+pub mod ledger;
 pub mod persist;
 pub mod quantize;
 pub mod radiation;
