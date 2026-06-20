@@ -30,6 +30,7 @@ pub mod ledger;
 pub mod persist;
 pub mod quantize;
 pub mod radiation;
+pub mod reservoir;
 pub mod retrieval;
 pub mod security;
 pub mod shamir;
