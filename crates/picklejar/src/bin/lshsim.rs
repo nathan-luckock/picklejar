@@ -37,7 +37,7 @@ fn main() -> ExitCode {
     let per = 100;
     let mut centers: Vec<Vec<f32>> = Vec::new();
     for _ in 0..clusters {
-        centers.push((0..dims).map(|_| rng.unit() * 2.0 - 1.0).collect());
+        centers.push((0..dims).map(|_| rng.unit().mul_add(2.0, -1.0)).collect());
     }
     let mut id = 0u64;
     for c in &centers {
