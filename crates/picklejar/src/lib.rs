@@ -14,6 +14,7 @@ pub mod certify;
 pub mod correlated;
 pub mod countbloom;
 pub mod crdtmem;
+pub mod cuckoo;
 pub mod database;
 pub mod error;
 pub mod faults;
