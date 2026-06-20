@@ -25,6 +25,7 @@ pub mod quantize;
 pub mod radiation;
 pub mod retrieval;
 pub mod security;
+pub mod shamir;
 pub mod valid_time_model;
 pub mod vecsim;
 
