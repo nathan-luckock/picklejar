@@ -21,6 +21,7 @@ pub mod database;
 pub mod error;
 pub mod faults;
 pub mod forgetmem;
+pub mod forwardlog;
 pub mod freshness_model;
 pub mod hll;
 pub mod hnsw;
