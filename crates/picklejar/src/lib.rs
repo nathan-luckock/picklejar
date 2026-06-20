@@ -31,6 +31,7 @@ pub mod ledger;
 pub mod lsh;
 pub mod persist;
 pub mod pq;
+pub mod quantile;
 pub mod quantize;
 pub mod radiation;
 pub mod ratelimit;
