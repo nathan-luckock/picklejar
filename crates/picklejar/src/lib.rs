@@ -8,6 +8,7 @@
 pub mod antientropy;
 pub mod authmem;
 pub mod blindvec;
+pub mod bloom;
 pub mod captoken;
 pub mod certify;
 pub mod correlated;
