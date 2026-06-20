@@ -11,6 +11,7 @@ pub mod correlated;
 pub mod database;
 pub mod error;
 pub mod faults;
+pub mod forgetmem;
 pub mod freshness_model;
 pub mod hnsw;
 pub mod index;
