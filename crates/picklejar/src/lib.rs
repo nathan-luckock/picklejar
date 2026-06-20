@@ -7,6 +7,7 @@
 
 pub mod authmem;
 pub mod blindvec;
+pub mod captoken;
 pub mod certify;
 pub mod correlated;
 pub mod crdtmem;
