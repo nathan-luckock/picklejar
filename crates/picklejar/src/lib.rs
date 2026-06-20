@@ -12,6 +12,7 @@ pub mod bloom;
 pub mod captoken;
 pub mod certify;
 pub mod cmsketch;
+pub mod consistenthash;
 pub mod correlated;
 pub mod countbloom;
 pub mod crdtmem;
