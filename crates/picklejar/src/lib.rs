@@ -20,6 +20,7 @@ pub mod error;
 pub mod faults;
 pub mod forgetmem;
 pub mod freshness_model;
+pub mod hll;
 pub mod hnsw;
 pub mod index;
 pub mod isolation_model;
