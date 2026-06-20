@@ -19,6 +19,7 @@ pub mod keyenc;
 pub mod persist;
 pub mod quantize;
 pub mod radiation;
+pub mod retrieval;
 pub mod security;
 pub mod valid_time_model;
 pub mod vecsim;
