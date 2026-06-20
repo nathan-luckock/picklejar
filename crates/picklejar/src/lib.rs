@@ -9,6 +9,7 @@ pub mod authmem;
 pub mod blindvec;
 pub mod certify;
 pub mod correlated;
+pub mod crdtmem;
 pub mod database;
 pub mod error;
 pub mod faults;
