@@ -6,6 +6,7 @@
 #![forbid(unsafe_code)]
 
 pub mod authmem;
+pub mod blindvec;
 pub mod certify;
 pub mod correlated;
 pub mod database;
