@@ -39,6 +39,7 @@ pub mod reservoir;
 pub mod retrieval;
 pub mod security;
 pub mod shamir;
+pub mod skiplist;
 pub mod spacesaving;
 pub mod valid_time_model;
 pub mod vclock;
