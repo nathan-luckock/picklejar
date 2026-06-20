@@ -5,6 +5,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod antientropy;
 pub mod authmem;
 pub mod blindvec;
 pub mod captoken;
