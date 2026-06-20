@@ -37,7 +37,7 @@ of an existing one. The reasoning:
 - **That proof is exactly what this engine already has.** Recovery correctness is
   established by deterministic simulation testing: a fault-injecting in-memory
   disk, every run a single seed, every failure replayable byte-for-byte. The
-  current bar is **100,000 seeded crash-and-recover runs, all passing** (see
+  current bar is **1,000,000 seeded crash-and-recover runs, all passing** (see
   [Crash model and the torture test](#crash-model-and-the-torture-test)).
 
 ### What is and isn't novel (an honest scoping)
@@ -93,7 +93,7 @@ write-ahead log and ARIES recovery, MVCC, the parser, the cost-based planner,
 the executor, and the PostgreSQL wire protocol. The SQL surface is deep
 (joins, window functions, set operations, CTEs, subqueries, a full everyday
 type system, roles and row-level security) and still growing. Durability is
-proven by 100,000 deterministic crash-and-recover simulations. The AI memory
+proven by 1,000,000 deterministic crash-and-recover simulations. The AI memory
 layer is built on this foundation: a native `VECTOR(n)` type, four distance
 metrics with brute-force KNN, row-level-security-filtered similarity search, an
 HNSW index, and a fault simulator that proves durability and isolation together.

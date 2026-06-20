@@ -3,10 +3,10 @@
 # picklejar
 
 **Durable, isolated AI memory for hardware you cannot reach.**
-Proven by 100,000 deterministic crash simulations. A from-scratch, Postgres-wire database engine in Rust.
+Proven by 1,000,000 deterministic crash simulations. A from-scratch, Postgres-wire database engine in Rust.
 
 [![CI](https://img.shields.io/github/actions/workflow/status/nathan-luckock/capstone/ci.yml?style=flat-square&label=CI&logo=github)](https://github.com/nathan-luckock/capstone/actions/workflows/ci.yml)
-[![Crash sims](https://img.shields.io/badge/crash%20sims-100%2C000%20passed-3FB950?style=flat-square&logo=checkmarx&logoColor=white)](#proof-not-vibes)
+[![Crash sims](https://img.shields.io/badge/crash%20sims-1%2C000%2C000%20passed-3FB950?style=flat-square&logo=checkmarx&logoColor=white)](#proof-not-vibes)
 [![Rust](https://img.shields.io/badge/Rust-from%20scratch-CE422B?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org)
 [![Postgres wire](https://img.shields.io/badge/wire-PostgreSQL%20v3-336791?style=flat-square&logo=postgresql&logoColor=white)](#it-speaks-postgres)
 [![License](https://img.shields.io/badge/license-MIT%20or%20Apache--2.0-2F81F7?style=flat-square)](#license)
@@ -168,7 +168,7 @@ The complete feature list is in [docs/FEATURES.md](docs/FEATURES.md).
 
 Correctness is not asserted, it is tested several independent ways, all under `clippy -D warnings` and `rustfmt` in CI:
 
-- **Deterministic simulation testing.** Every crash scenario is one `u64` seed against a fault-injecting disk, so any failure replays exactly. **100,000 seeded crash-and-recover runs pass** (4.1M committed rows verified), and the harness found and fixed a real recovery bug.
+- **Deterministic simulation testing.** Every crash scenario is one `u64` seed against a fault-injecting disk, so any failure replays exactly. **1,000,000 seeded crash-and-recover runs pass** (40,947,775 committed rows verified), and the harness found and fixed a real recovery bug.
 - **Exhaustive model checking.** Where the crash sims sample random interleavings, from-scratch bounded model checkers enumerate *every* reachable interleaving of an abstract model and prove an invariant holds in all of them, each with a deliberately buggy variant confirming the check has teeth. Five are proved this way: the write-ahead-logging ordering invariant (`walmodel`, a page change is never durable ahead of its log record), the MVCC snapshot read-stability invariant (the `txn` model), through the approximate index both tenant isolation and cache freshness (`rlsmodel`, below), and valid-time travel (a read at a session as-of instant returns a row exactly when it is valid then, so the half-open boundary never serves a superseded row). Random testing finds bugs; this proves their absence over the bounded model.
 - **Model-checked correctness through the index (`rlsmodel`).** The promise is that a query served from the cached approximate index never returns a row it should not, two ways. Tenant isolation: a tenant's query can never return another tenant's row. Freshness: a query can never return a row that was deleted, so a forgotten memory cannot resurface through a stale cache. A from-scratch model checker enumerates every interleaving of inserts, deletes, cache invalidations, role switches, policy changes, index builds, and queries, proves both hold, and catches each removed guard with a concrete counterexample (a cross-tenant row, or a deleted row served). No vector or AI-memory database is known to model-check its filtered retrieval this way.
 - **Differential testing against SQLite.** Random SQL run through both engines, compared as a sorted multiset, with SQLite as the independent oracle.
@@ -179,7 +179,7 @@ Correctness is not asserted, it is tested several independent ways, all under `c
 - **Self-healing storage with mass-efficient redundancy.** A from-scratch Reed-Solomon erasure code (GF(2^8)) stores data as `k` shards plus `m` parity, so any `m` corrupt shards are reconstructed from the survivors. Surviving `m` failures this way costs `+m/k` storage (for example `+40%`) instead of the `+m*100%` (for example `+400%`) that redundant hardware copies cost, which is why you can launch light commodity storage instead of heavy triple-redundant drives. The standalone store detects a bad shard by its checksum, logs the fault, repairs it from parity, and heals itself (`resilientdemo` runs the corruption drill; `resilientsim` runs years of it). And it is wired into the live engine: `db.protect(k, m)` writes a parity snapshot of the heap, and `Database::open_resilient` reconstructs any radiation-corrupted heap page from that parity before the engine reads it, so the database repairs its own storage on open with no human and no spare node.
 
 ```bash
-cargo run --release --bin dst -- 100000              # 100k reproducible crash scenarios
+cargo run --release --bin dst -- 1000000             # 1,000,000 reproducible crash scenarios
 cargo run --release --bin difftest -- 100000         # 100k queries checked against SQLite
 cargo run --release --bin walmodel                   # exhaustively model-check the WAL ordering invariant
 cargo run --release --bin rlsmodel                   # exhaustively model-check tenant isolation through the index
