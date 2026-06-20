@@ -29,7 +29,7 @@ and most of it is now built.
 
 The relational engine is complete and crash-proven: storage, a write-ahead log
 with ARIES recovery, MVCC snapshot isolation, a cost-based planner, roles,
-row-level security, and the PostgreSQL wire protocol, verified by 100,000
+row-level security, and the PostgreSQL wire protocol, verified by 1,000,000
 deterministic crash simulations and differentially tested against SQLite.
 
 On top of it sits the AI-memory layer and its full reliability story, all shipped:
@@ -102,7 +102,7 @@ On top of it sits the AI-memory layer and its full reliability story, all shippe
   seeded random workloads, the table is recovered to every checkpoint LSN and its
   scan is checked against an independent model of the committed state then. The
   `IndexUpdate` log record is additive and append-only, so it adds no fsync to the
-  write path and leaves the 100,000-seed-validated recovery untouched.
+  write path and leaves the 1,000,000-seed-validated recovery untouched.
 - **Exhaustive model-checking.** From-scratch bounded model checkers prove the
   write-ahead-logging ordering invariant (no page change is ever durable ahead of
   its log record), the MVCC snapshot read-stability invariant, and, through the
@@ -134,7 +134,7 @@ On top of it sits the AI-memory layer and its full reliability story, all shippe
 So the engine detects every corruption it is built to catch, repairs from
 redundancy with no human in the loop, never serves a silently wrong or
 cross-tenant answer, and proves these properties three independent ways: random
-crash sampling at 100,000 seeds, an independent SQLite oracle, and exhaustive
+crash sampling at 1,000,000 seeds, an independent SQLite oracle, and exhaustive
 model-checking of the core invariants.
 
 ## The frontier
