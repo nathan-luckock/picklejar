@@ -17,6 +17,7 @@ pub mod consistenthash;
 pub mod correlated;
 pub mod countbloom;
 pub mod crdtmem;
+pub mod crdtvec;
 pub mod cuckoo;
 pub mod database;
 pub mod error;
