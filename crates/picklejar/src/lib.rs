@@ -32,6 +32,7 @@ pub mod keyenc;
 pub mod ledger;
 pub mod lsh;
 pub mod persist;
+pub mod pir;
 pub mod pq;
 pub mod quantile;
 pub mod quantize;
