@@ -7,6 +7,7 @@
 
 pub mod antientropy;
 pub mod authmem;
+pub mod authsql;
 pub mod blindvec;
 pub mod bloom;
 pub mod captoken;
