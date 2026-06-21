@@ -29,7 +29,37 @@ A from-scratch, Postgres-wire database engine in Rust. Its durability is proven 
 
 ## See it prove itself
 
-One command runs the whole proof: live throughput on the real engine, recall held under embedding drift, and every reliability invariant, content-hashed so the same commit always produces the same result.
+**One command attests the entire stack.** `cargo run --release --bin attest` re-verifies every guarantee live, across three axes, and emits a single content hash over all of them:
+
+```text
+$ cargo run --release --bin attest
+
+================ PICKLEJAR GRAND ATTESTATION ================
+durable, isolated, verifiable, forgetful, private, available
+
+DURABILITY, RECALL, AND EXHAUSTIVELY MODEL-CHECKED INVARIANTS
+  [PASS] WAL ordering model-check        [PASS] snapshot isolation model-check
+  [PASS] RLS retrieval isolation         [PASS] cache freshness model-check
+  [PASS] valid-time travel model-check   [PASS] radiation survivability (LEO/GEO)
+  ... 20 reliability invariants, all PASS ...
+
+CRYPTOGRAPHIC GUARANTEES (VERIFIED LIVE)
+  [PASS] authenticated KNN soundness     [PASS] authenticated SQL soundness
+  [PASS] provable forgetting             [PASS] forward-secure audit log
+  [PASS] private information retrieval   [PASS] private aggregates
+  [PASS] Shamir threshold                [PASS] capability tokens / blind search
+
+DISTRIBUTED GUARANTEES
+  [PASS] CRDT convergence (all merge orders)   [PASS] quorum never stale (r+w>rf)
+  [PASS] anti-entropy / vector clocks / consistent hashing
+
+attestation hash: 3750b4e8...
+VERDICT: 34/34 checks passed -- ALL GUARANTEES HELD
+(durability backed by 1,000,000 deterministic crash simulations)
+============================================================
+```
+
+One regenerable artifact attesting that the engine is durable, isolated, verifiable, forgetful, private, and available, all at once. For the live performance numbers, `cargo run --release --bin scorecard` measures throughput on the real engine:
 
 ```text
 $ cargo run --release --bin scorecard

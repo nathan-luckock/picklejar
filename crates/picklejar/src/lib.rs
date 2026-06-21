@@ -25,6 +25,7 @@ pub mod faults;
 pub mod forgetmem;
 pub mod forwardlog;
 pub mod freshness_model;
+pub mod grandcert;
 pub mod hll;
 pub mod hnsw;
 pub mod homoagg;

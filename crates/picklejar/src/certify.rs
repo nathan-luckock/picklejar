@@ -137,7 +137,7 @@ fn recall(data: &[Vec<f32>], queries: &[Vec<f32>], metric: Metric, seed: u64) ->
 }
 
 /// One certified reliability invariant and its result.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Check {
     /// Short name of the invariant.
     pub name: String,
