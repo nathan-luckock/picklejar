@@ -6191,19 +6191,48 @@ const MOST_COMMON_VALUES: usize = 32;
 /// the retained list so the kept values' frequency estimates are tight.
 const MCV_TRACKING_CAPACITY: usize = 256;
 
+/// Reservoir sample size for building an integer column's range histogram. A
+/// uniform sample of this many values bounds the histogram's memory and sort
+/// cost regardless of table size.
+const HISTOGRAM_SAMPLE: usize = 1024;
+
+/// Number of equi-depth buckets in a range histogram (one fewer than the count
+/// of boundaries stored).
+const HISTOGRAM_BUCKETS: usize = 16;
+
+/// Fixed reservoir seed, so `ANALYZE` is reproducible run to run.
+const HISTOGRAM_SEED: u64 = 0x2545_F491_4F6C_DD1D;
+
+/// An order-preserving map from `i64` into `u64` (flip the sign bit), so a
+/// reservoir of `u64` keeps integer ordering for the sorted histogram.
+#[allow(clippy::cast_sign_loss)]
+const fn order_key(n: i64) -> u64 {
+    (n as u64) ^ (1u64 << 63)
+}
+
+/// Inverse of [`order_key`].
+#[allow(clippy::cast_possible_wrap)]
+const fn from_order_key(u: u64) -> i64 {
+    (u ^ (1u64 << 63)) as i64
+}
+
 /// Compute one column's statistics over `rows`: its distinct count (NULLs
-/// excluded), its min/max for an integer column, and its most common values.
+/// excluded), its min/max and range histogram for an integer column, and its
+/// most common values.
 ///
 /// The distinct count is exact up to [`EXACT_DISTINCT_CAP`] distinct values and
 /// a `HyperLogLog` estimate beyond that, so analyzing a high-cardinality column
 /// costs a fixed ~16 KiB rather than memory proportional to its cardinality.
-/// The most-common-values list comes from a bounded Space-Saving summary, so a
-/// skewed column's equality selectivity uses real frequencies.
+/// The most-common-values list comes from a bounded Space-Saving summary and
+/// the range histogram from a bounded reservoir sample, so a skewed column's
+/// equality and range selectivity both follow the real distribution.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn analyze_column(rows: &[Vec<Value>], col: usize) -> ColumnStats {
     let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
     let mut hll = crate::hll::HyperLogLog::new();
     let mut heavy = crate::spacesaving::SpaceSaving::with_capacity(MCV_TRACKING_CAPACITY);
+    let mut int_sample =
+        crate::reservoir::Reservoir::with_capacity(HISTOGRAM_SAMPLE, HISTOGRAM_SEED);
     let mut overflowed = false;
     let mut min: Option<i64> = None;
     let mut max: Option<i64> = None;
@@ -6227,6 +6256,7 @@ fn analyze_column(rows: &[Vec<Value>], col: usize) -> ColumnStats {
         if let Value::Int(n) = value {
             min = Some(min.map_or(*n, |m| m.min(*n)));
             max = Some(max.map_or(*n, |m| m.max(*n)));
+            int_sample.offer(order_key(*n));
         }
     }
     let distinct = if overflowed {
@@ -6235,12 +6265,31 @@ fn analyze_column(rows: &[Vec<Value>], col: usize) -> ColumnStats {
         u64::try_from(seen.len()).unwrap_or(u64::MAX).max(1)
     };
     let most_common = most_common_values(rows, col, &heavy);
+    let histogram = build_histogram(int_sample.sample());
     ColumnStats {
         distinct,
         min,
         max,
         most_common,
+        histogram,
     }
+}
+
+/// Build an equi-depth histogram from a reservoir sample of order-preserving
+/// integer keys: sort the sample and read off `HISTOGRAM_BUCKETS + 1` evenly
+/// ranked boundaries, so each bucket holds about the same fraction of rows.
+/// Returns empty for a sample too small to bucket.
+fn build_histogram(sample: &[u64]) -> Vec<i64> {
+    if sample.len() < 2 {
+        return Vec::new();
+    }
+    let mut keys = sample.to_vec();
+    keys.sort_unstable();
+    let m = keys.len();
+    let buckets = HISTOGRAM_BUCKETS.min(m - 1);
+    (0..=buckets)
+        .map(|j| from_order_key(keys[j * (m - 1) / buckets]))
+        .collect()
 }
 
 /// Recover the heaviest values and their table-fraction frequencies from a
@@ -6332,6 +6381,28 @@ mod analyze_column_tests {
         assert!(
             (freq - 0.9).abs() < 0.05,
             "heavy hitter frequency {freq} should be near 0.9"
+        );
+    }
+
+    #[test]
+    fn integer_column_builds_a_monotonic_histogram() {
+        // Skewed low: 900 values in [0, 10), then 100 in [1000, 1100).
+        let mut rows: Vec<Vec<Value>> = (0..900).map(|i| vec![Value::Int(i % 10)]).collect();
+        rows.extend((0..100).map(|i| vec![Value::Int(1000 + i)]));
+        let s = analyze_column(&rows, 0);
+        assert!(s.histogram.len() >= 2, "an integer column gets a histogram");
+        assert!(
+            s.histogram.windows(2).all(|w| w[0] <= w[1]),
+            "boundaries are non-decreasing"
+        );
+        assert_eq!(s.histogram.first().copied(), s.min);
+        assert_eq!(s.histogram.last().copied(), s.max);
+        // The bulk of the mass is in the low cluster, so the median boundary
+        // sits well below the midpoint of [min, max].
+        let median_bound = s.histogram[s.histogram.len() / 2];
+        assert!(
+            median_bound < 500,
+            "median boundary {median_bound} should reflect the low cluster"
         );
     }
 }

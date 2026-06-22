@@ -61,6 +61,13 @@ pub struct ColumnStats {
     /// frequency instead of the uniform `1 / distinct` guess. Empty before
     /// `ANALYZE` or for a column with no notable heavy hitters.
     pub most_common: Vec<(Value, f64)>,
+    /// An equi-depth histogram of an integer column: monotonic bucket
+    /// boundaries where each consecutive pair holds about the same fraction of
+    /// rows. `ANALYZE` builds it from a bounded reservoir sample, so range
+    /// selectivity follows the real distribution instead of assuming values
+    /// are spread uniformly across `[min, max]`. Empty for a non-integer
+    /// column or before `ANALYZE`.
+    pub histogram: Vec<i64>,
 }
 
 impl Default for ColumnStats {
@@ -74,6 +81,7 @@ impl Default for ColumnStats {
             min: None,
             max: None,
             most_common: Vec::new(),
+            histogram: Vec::new(),
         }
     }
 }

@@ -99,6 +99,17 @@ fn range_selectivity(op: BinOp, left: &Expr, right: &Expr, table: &TableMeta) ->
     let (Some(k), stats) = (k, table.column_stats(col)) else {
         return RANGE_SELECTIVITY;
     };
+    // An equi-depth histogram follows the real distribution; prefer it over the
+    // uniform-across-[min, max] estimate when ANALYZE has built one.
+    if !stats.histogram.is_empty() {
+        let below = fraction_below(&stats.histogram, k);
+        let frac = match op {
+            BinOp::Lt | BinOp::Le => below,
+            BinOp::Gt | BinOp::Ge => 1.0 - below,
+            _ => return RANGE_SELECTIVITY,
+        };
+        return frac.clamp(MIN_SELECTIVITY, 1.0);
+    }
     let (Some(min), Some(max)) = (stats.min, stats.max) else {
         return RANGE_SELECTIVITY;
     };
@@ -124,6 +135,34 @@ fn range_selectivity(op: BinOp, left: &Expr, right: &Expr, table: &TableMeta) ->
         _ => return RANGE_SELECTIVITY,
     };
     frac.clamp(MIN_SELECTIVITY, 1.0)
+}
+
+/// The fraction of rows below `k`, read off an equi-depth histogram of
+/// monotonic bucket boundaries. Each of the `bounds.len() - 1` buckets holds an
+/// equal share of rows; within the bucket containing `k`, the position is
+/// interpolated linearly. Returns `0.0` below the first boundary and `1.0` at or
+/// above the last.
+#[allow(clippy::cast_precision_loss)]
+fn fraction_below(bounds: &[i64], k: i64) -> f64 {
+    let buckets = bounds.len().saturating_sub(1);
+    if buckets == 0 || k <= bounds[0] {
+        return 0.0;
+    }
+    if k >= bounds[buckets] {
+        return 1.0;
+    }
+    for i in 0..buckets {
+        if k < bounds[i + 1] {
+            let (lo, hi) = (bounds[i], bounds[i + 1]);
+            let within = if hi > lo {
+                (k - lo) as f64 / (hi - lo) as f64
+            } else {
+                0.0
+            };
+            return (i as f64 + within) / buckets as f64;
+        }
+    }
+    1.0
 }
 
 /// Flip a comparison operator's sense (for `const <op> column`).
@@ -369,6 +408,43 @@ mod tests {
         )
         .unwrap();
         c.get_table("t").unwrap().clone()
+    }
+
+    #[test]
+    fn range_selectivity_follows_the_histogram() {
+        let mut c = Catalog::new();
+        c.apply(
+            &Parser::from_sql("CREATE TABLE t (id INT, name TEXT)")
+                .unwrap()
+                .parse_statement()
+                .unwrap(),
+        )
+        .unwrap();
+        c.set_row_count("t", 1000).unwrap();
+        // Equi-depth boundaries clustered low (8 of 9 buckets in [0, 8)), then a
+        // jump to 1000: most rows are small even though the span reaches 1000.
+        c.set_column_stats(
+            "t",
+            "id",
+            ColumnStats {
+                min: Some(0),
+                max: Some(1000),
+                histogram: vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 1000],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let t = c.get_table("t").unwrap().clone();
+        // id < 9 covers 8 of 9 buckets (~0.89); a uniform [0, 1000] guess would
+        // have said (9 - 0) / 1000 = 0.009.
+        let s = selectivity(&pred("id < 9"), &t);
+        assert!(
+            s > 0.8,
+            "histogram-aware range selectivity {s} should be high"
+        );
+        // The complement holds for the other direction.
+        let g = selectivity(&pred("id > 9"), &t);
+        assert!(g < 0.2, "id > 9 should be a small fraction, got {g}");
     }
 
     #[test]
