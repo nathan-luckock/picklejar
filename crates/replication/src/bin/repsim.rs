@@ -26,18 +26,21 @@ fn main() {
 
     let mut writes = 0usize;
     let mut partitions = 0usize;
+    let mut transfers = 0usize;
     let mut diverged: Vec<u64> = Vec::new();
     for seed in 0..seeds {
         let report = run_seed(seed, nodes, ops);
         writes += report.writes;
         partitions += report.partitions;
+        transfers += report.transfers;
         if !report.converged {
             diverged.push(seed);
         }
     }
 
-    println!("writes applied:     {writes}");
-    println!("partitions induced: {partitions}");
+    println!("writes applied:        {writes}");
+    println!("partitions induced:    {partitions}");
+    println!("slot transfers (Merkle): {transfers}");
     if diverged.is_empty() {
         println!("\nVERDICT: all {seeds} seeds converged after partition + heal");
     } else {

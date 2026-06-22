@@ -118,6 +118,19 @@ impl Replica {
         self.clock = self.clock.max(other.clock);
     }
 
+    /// Merge a single foreign slot for `mem_id`, under the same `(ts, origin)`
+    /// dominance rule as a full [`Replica::merge`]. Lets a caller reconcile only
+    /// the memories a Merkle diff flagged, instead of shipping the whole replica.
+    pub fn merge_slot(&mut self, mem_id: u64, incoming: Slot) {
+        if let Some(mine) = self.slots.get(&mem_id) {
+            if mine.dominates(&incoming) {
+                return;
+            }
+        }
+        self.clock = self.clock.max(incoming.ts);
+        self.slots.insert(mem_id, incoming);
+    }
+
     /// Whether two replicas have converged to the same observable state.
     #[must_use]
     pub fn converged_with(&self, other: &Self) -> bool {

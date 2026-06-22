@@ -62,13 +62,21 @@ impl MerkleSet {
         set
     }
 
-    /// Build a set from `(key, value)` memories.
+    /// Build a set from `(key, value)` memories, rebuilding the tree once at the
+    /// end rather than after each insert (O(n + tree) instead of O(n * tree)).
     #[must_use]
     pub fn from_entries(depth: u32, entries: &[(u64, Vec<u8>)]) -> Self {
         let mut set = Self::new(depth);
         for (k, v) in entries {
-            set.insert(*k, v);
+            let b = set.bucket_of(*k);
+            let h = sha256::hash(v);
+            let bucket = &mut set.buckets[b];
+            match bucket.binary_search_by_key(k, |(kk, _)| *kk) {
+                Ok(i) => bucket[i].1 = h,
+                Err(i) => bucket.insert(i, (*k, h)),
+            }
         }
+        set.rebuild();
         set
     }
 
