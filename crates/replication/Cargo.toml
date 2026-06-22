@@ -16,6 +16,10 @@ path = "src/bin/repsim.rs"
 name = "pjnode"
 path = "src/bin/pjnode.rs"
 
+[[bin]]
+name = "repdemo"
+path = "src/bin/repdemo.rs"
+
 [dependencies]
 picklejar.workspace = true
 

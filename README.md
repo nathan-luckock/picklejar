@@ -72,6 +72,7 @@ A toy "build a database" project stops at a key-value store or wraps an existing
 | **Vector memory** | `VECTOR(n)` type, four distance metrics, KNN, and an HNSW index wired into SQL through a cached, RLS-safe path |
 | **Reliability under fault** | page, index, and metadata checksums; a self-healing redundant index; Reed-Solomon erasure coding; a regenerable certificate |
 | **Postgres wire** | real clients and drivers connect over TCP, no shim |
+| **Multi-node (AP)** | Dynamo-style replication: consistent-hash placement, quorum writes, CRDT merge, Merkle anti-entropy, distributed vector KNN, proven to converge under partition |
 
 The complete SQL surface is in [docs/FEATURES.md](docs/FEATURES.md).
 
@@ -84,6 +85,7 @@ Correctness is not asserted, it is tested several independent ways, all under `c
 - **Differential testing against SQLite.** Random SQL run through both engines, compared as a sorted multiset, with SQLite as the independent oracle.
 - **Corruption detection and self-healing.** Page, index, and metadata checksums refuse a flipped bit rather than serve it; Reed-Solomon parity reconstructs a corrupt heap page on open, at `+m/k` storage overhead instead of the `+m*100%` of redundant copies.
 - **A modeled fault environment.** A committed multi-tenant workload is irradiated at a chosen orbit's single-event-upset rate across every persistent file, then reopened: the engine either detects the corruption or it changed no committed answer, and it never leaks a tenant.
+- **Convergence under partition.** A multi-node cluster takes writes on both sides of a network split and reconciles itself on heal with no coordinator; a seeded simulator sweeps thousands of random partition-and-crash schedules and every one converges, the cluster-level counterpart of the crash sims.
 
 ```bash
 cargo run --release --bin dst -- 1000000      # 1,000,000 reproducible crash scenarios
@@ -92,6 +94,8 @@ cargo run --release --bin rlsmodel             # model-check tenant isolation th
 cargo run --release --bin difftest -- 100000   # 100k queries checked against SQLite
 cargo run --release --bin vecsim -- 100000     # 100k durability + isolation sims
 cargo run --release --bin vecert               # the regenerable reliability certificate
+cargo run --release --bin repsim -- 2000        # thousands of partition schedules, all converge
+cargo run --release --bin repdemo              # the partition money-shot, narrated
 ```
 
 ## Quickstart
