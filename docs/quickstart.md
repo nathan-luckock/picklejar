@@ -16,10 +16,11 @@ with `psql`, a driver, or the Python client.
 
 ## 1. Run the server
 
-With Docker:
+With Docker (build locally, or pull the published image once a release is cut):
 
 ```bash
-docker build -t picklejar .
+docker build -t picklejar .                                  # local build
+# docker pull ghcr.io/nathan-luckock/picklejar               # published image
 docker run -p 5433:5433 -v picklejar-data:/data picklejar
 ```
 
