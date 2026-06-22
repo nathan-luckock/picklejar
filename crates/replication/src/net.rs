@@ -14,12 +14,14 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+use picklejar::blindvec::l2_sq;
 use picklejar::consistenthash::HashRing;
 use picklejar::crdtmem::{Replica, Slot};
 
 const REQ_PUT: u8 = 1;
 const REQ_GET: u8 = 2;
 const REQ_PULL: u8 = 3;
+const REQ_KNN: u8 = 4;
 const VNODES: u32 = 64;
 const TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -78,6 +80,54 @@ fn put_slot(b: &mut Vec<u8>, s: &Slot) {
         None => b.push(0),
     }
 }
+fn put_f64(b: &mut Vec<u8>, v: f64) {
+    b.extend_from_slice(&v.to_bits().to_be_bytes());
+}
+fn get_f64(b: &[u8], off: &mut usize) -> f64 {
+    let mut a = [0u8; 8];
+    a.copy_from_slice(&b[*off..*off + 8]);
+    *off += 8;
+    f64::from_bits(u64::from_be_bytes(a))
+}
+fn put_vec_f32(b: &mut Vec<u8>, v: &[f32]) {
+    put_u32(b, u32::try_from(v.len()).unwrap_or(u32::MAX));
+    for x in v {
+        b.extend_from_slice(&x.to_bits().to_be_bytes());
+    }
+}
+fn get_vec_f32(b: &[u8], off: &mut usize) -> Vec<f32> {
+    let n = usize::try_from(get_u32(b, off)).unwrap_or(0);
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        let mut a = [0u8; 4];
+        a.copy_from_slice(&b[*off..*off + 4]);
+        *off += 4;
+        out.push(f32::from_bits(u32::from_be_bytes(a)));
+    }
+    out
+}
+
+/// Encode a memory record (its embedding and payload) as the value bytes the
+/// replicated CRDT map stores.
+fn encode_memory(embedding: &[f32], payload: &[u8]) -> Vec<u8> {
+    let mut b = Vec::new();
+    put_vec_f32(&mut b, embedding);
+    put_bytes(&mut b, payload);
+    b
+}
+
+/// Decode a memory record back into its embedding and payload.
+fn decode_memory(bytes: &[u8]) -> (Vec<f32>, Vec<u8>) {
+    let mut off = 0;
+    let embedding = get_vec_f32(bytes, &mut off);
+    let payload = if off < bytes.len() {
+        get_bytes(bytes, &mut off)
+    } else {
+        Vec::new()
+    };
+    (embedding, payload)
+}
+
 fn get_slot(b: &[u8], off: &mut usize) -> Slot {
     let ts = get_u64(b, off);
     let origin = get_u64(b, off);
@@ -178,6 +228,36 @@ fn handle(req: &[u8], store: &Arc<Mutex<Replica>>) -> Vec<u8> {
             }
             out
         }
+        Some(REQ_KNN) => {
+            let mut off = 1;
+            let query = get_vec_f32(req, &mut off);
+            let k = usize::try_from(get_u32(req, &mut off)).unwrap_or(0);
+            let memories: Vec<(u64, Vec<u8>)> = {
+                let guard = store.lock().expect("store lock");
+                guard
+                    .slots()
+                    .iter()
+                    .filter_map(|(id, s)| s.value.as_ref().map(|v| (*id, v.clone())))
+                    .collect()
+            };
+            let mut hits: Vec<(u64, f64, Vec<u8>)> = memories
+                .iter()
+                .map(|(id, val)| {
+                    let (embedding, payload) = decode_memory(val);
+                    (*id, l2_sq(&query, &embedding), payload)
+                })
+                .collect();
+            hits.sort_by(|a, b| a.1.total_cmp(&b.1));
+            hits.truncate(k);
+            let mut out = vec![REQ_KNN];
+            put_u32(&mut out, u32::try_from(hits.len()).unwrap_or(u32::MAX));
+            for (id, dist, payload) in &hits {
+                put_u64(&mut out, *id);
+                put_f64(&mut out, *dist);
+                put_bytes(&mut out, payload);
+            }
+            out
+        }
         _ => vec![255],
     }
 }
@@ -215,6 +295,17 @@ pub fn pull_into(store: &Arc<Mutex<Replica>>, peer: &str) -> io::Result<usize> {
         }
     }
     Ok(count)
+}
+
+/// One result of a distributed nearest-neighbor recall.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Hit {
+    /// The memory's id.
+    pub id: u64,
+    /// Its squared L2 distance to the query (the engine's `l2_sq`).
+    pub distance: f64,
+    /// The memory's stored payload (its content bytes).
+    pub payload: Vec<u8>,
 }
 
 /// Places keys on a ring of nodes and drives quorum writes and reads over TCP.
@@ -305,6 +396,51 @@ impl Coordinator {
         best.and_then(|s| s.value)
     }
 
+    /// Store a memory (its embedding and payload) under `id` on the key's
+    /// replicas. Returns how many replicas acknowledged.
+    #[must_use]
+    pub fn store_memory(&self, id: u64, embedding: &[f32], payload: &[u8]) -> usize {
+        self.write(id, &encode_memory(embedding, payload))
+    }
+
+    /// Distributed nearest-neighbor recall: scatter the query to every node,
+    /// each returns its local top-`k` by the engine's `l2_sq` distance, and the
+    /// merged global top-`k` is returned. A memory replicated on several nodes is
+    /// de-duplicated by id.
+    #[must_use]
+    pub fn recall(&self, query: &[f32], k: usize) -> Vec<Hit> {
+        let mut req = vec![REQ_KNN];
+        put_vec_f32(&mut req, query);
+        put_u32(&mut req, u32::try_from(k).unwrap_or(u32::MAX));
+        let mut hits: Vec<Hit> = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        for addr in self.addrs.values() {
+            let Ok(resp) = request(addr, &req) else {
+                continue;
+            };
+            if resp.first() != Some(&REQ_KNN) {
+                continue;
+            }
+            let mut off = 1;
+            let count = usize::try_from(get_u32(&resp, &mut off)).unwrap_or(0);
+            for _ in 0..count {
+                let id = get_u64(&resp, &mut off);
+                let distance = get_f64(&resp, &mut off);
+                let payload = get_bytes(&resp, &mut off);
+                if seen.insert(id) {
+                    hits.push(Hit {
+                        id,
+                        distance,
+                        payload,
+                    });
+                }
+            }
+        }
+        hits.sort_by(|a, b| a.distance.total_cmp(&b.distance));
+        hits.truncate(k);
+        hits
+    }
+
     /// The read quorum.
     #[must_use]
     pub const fn read_quorum(&self) -> usize {
@@ -368,6 +504,33 @@ mod tests {
         assert!(acks >= 2, "write reached a quorum, got {acks}");
         assert_eq!(coord.read(42), Some(b"hello".to_vec()));
         assert_eq!(coord.read(999), None, "an unknown key reads as absent");
+    }
+
+    #[test]
+    fn distributed_knn_finds_the_nearest_across_nodes() {
+        let nodes: Vec<(u64, String)> = (0..3)
+            .map(|id| {
+                let (addr, _store) = spawn_node(id);
+                (id, addr)
+            })
+            .collect();
+        let coord = Coordinator::new(&nodes, 2, 1, 1);
+
+        // Memories spread across the cluster by placement.
+        assert!(coord.store_memory(1, &[0.1, 0.2, 0.9], b"sky") >= 1);
+        assert!(coord.store_memory(2, &[0.9, 0.1, 0.1], b"fire") >= 1);
+        assert!(coord.store_memory(3, &[0.1, 0.2, 0.8], b"ocean") >= 1);
+
+        // A query nearest to memory 3, then memory 1; memory 2 is far.
+        let hits = coord.recall(&[0.1, 0.2, 0.82], 2);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].id, 3, "nearest is memory 3");
+        assert_eq!(hits[0].payload, b"ocean");
+        let ids: Vec<u64> = hits.iter().map(|h| h.id).collect();
+        assert!(
+            !ids.contains(&2),
+            "the far memory is not in the top 2: {ids:?}"
+        );
     }
 
     #[test]
