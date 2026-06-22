@@ -13,13 +13,20 @@ use std::net::TcpListener;
 use std::thread;
 use std::time::Duration;
 
-use picklejar_replication::net::{pull_into, Node};
+use picklejar_replication::net::{pull_into, restore, snapshot, Node};
+
+fn save_atomic(path: &str, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = format!("{path}.tmp");
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, path)
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mut id: u64 = 0;
     let mut port: u16 = 7000;
     let mut peers: Vec<String> = Vec::new();
+    let mut data: Option<String> = None;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -38,6 +45,10 @@ fn main() {
                     peers.push(addr.to_string());
                 }
             }
+            "--data" => {
+                i += 1;
+                data = args.get(i).cloned();
+            }
             _ => {}
         }
         i += 1;
@@ -50,9 +61,26 @@ fn main() {
             std::process::exit(1);
         }
     };
+    let node = Node::new(id);
+
+    // Durability: reload a saved snapshot, then snapshot to disk on a cadence.
+    if let Some(path) = &data {
+        if let Ok(bytes) = std::fs::read(path) {
+            let restored = restore(id, &bytes);
+            node.store().lock().expect("lock").merge(&restored);
+            let n = node.store().lock().expect("lock").slots().len();
+            println!("restored {n} memories from {path}");
+        }
+        let store = node.store();
+        let path = path.clone();
+        thread::spawn(move || loop {
+            thread::sleep(Duration::from_secs(2));
+            let _ = save_atomic(&path, &snapshot(&store));
+        });
+    }
+
     println!("pjnode {id} listening on 0.0.0.0:{port}; peers: {peers:?}");
 
-    let node = Node::new(id);
     if !peers.is_empty() {
         let store = node.store();
         thread::spawn(move || loop {

@@ -308,6 +308,42 @@ pub struct Hit {
     pub payload: Vec<u8>,
 }
 
+/// Encode a node's full state (every slot) for a durable on-disk snapshot.
+#[must_use]
+pub fn snapshot(store: &Arc<Mutex<Replica>>) -> Vec<u8> {
+    let entries: Vec<(u64, Slot)> = {
+        let guard = store.lock().expect("store lock");
+        guard.slots().iter().map(|(k, s)| (*k, s.clone())).collect()
+    };
+    let mut out = Vec::new();
+    put_u32(&mut out, u32::try_from(entries.len()).unwrap_or(u32::MAX));
+    for (k, s) in &entries {
+        put_u64(&mut out, *k);
+        put_slot(&mut out, s);
+    }
+    out
+}
+
+/// Rebuild a replica for node `id` from a snapshot made by [`snapshot`].
+///
+/// Slots keep their `(ts, origin)` versions, so a reloaded node merges cleanly
+/// with peers and any writes it missed while down arrive by anti-entropy.
+#[must_use]
+pub fn restore(id: u64, bytes: &[u8]) -> Replica {
+    let mut replica = Replica::new(id);
+    if bytes.is_empty() {
+        return replica;
+    }
+    let mut off = 0;
+    let count = usize::try_from(get_u32(bytes, &mut off)).unwrap_or(0);
+    for _ in 0..count {
+        let key = get_u64(bytes, &mut off);
+        let slot = get_slot(bytes, &mut off);
+        replica.merge_slot(key, slot);
+    }
+    replica
+}
+
 /// Places keys on a ring of nodes and drives quorum writes and reads over TCP.
 #[derive(Debug)]
 pub struct Coordinator {
@@ -531,6 +567,21 @@ mod tests {
             !ids.contains(&2),
             "the far memory is not in the top 2: {ids:?}"
         );
+    }
+
+    #[test]
+    fn snapshot_restore_roundtrips() {
+        let node = Node::new(5);
+        let store = node.store();
+        {
+            let mut s = store.lock().expect("lock");
+            s.set(1, b"a");
+            s.set(2, b"b");
+        }
+        let bytes = snapshot(&store);
+        let restored = restore(5, &bytes);
+        assert_eq!(restored.get(1), Some(b"a".as_slice()));
+        assert_eq!(restored.get(2), Some(b"b".as_slice()));
     }
 
     #[test]
