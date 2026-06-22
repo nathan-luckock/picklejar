@@ -14,7 +14,7 @@ keywords = ["ai", "memory", "vector", "database", "embeddings", "postgres"]
 dependencies = ["psycopg[binary]>=3.1"]
 
 [project.urls]
-Homepage = "https://github.com/nathan-luckock/capstone"
+Homepage = "https://github.com/nathan-luckock/picklejar"
 
 [tool.hatch.build.targets.wheel]
 packages = ["picklejar"]

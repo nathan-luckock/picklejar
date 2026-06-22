@@ -6,7 +6,7 @@
 
 A from-scratch, Postgres-wire database engine in Rust. Its durability is proven by **1,000,000 deterministic crash simulations**, its core invariants by **exhaustive model-checking**, and even its cryptography is written by hand. One command re-runs the entire proof.
 
-[![CI](https://img.shields.io/github/actions/workflow/status/nathan-luckock/capstone/ci.yml?style=flat-square&label=CI&logo=github)](https://github.com/nathan-luckock/capstone/actions/workflows/ci.yml)
+[![CI](https://img.shields.io/github/actions/workflow/status/nathan-luckock/picklejar/ci.yml?style=flat-square&label=CI&logo=github)](https://github.com/nathan-luckock/picklejar/actions/workflows/ci.yml)
 [![Crash sims](https://img.shields.io/badge/crash%20sims-1%2C000%2C000%20passed-3FB950?style=flat-square&logo=checkmarx&logoColor=white)](#proof-not-vibes)
 [![Model-checked](https://img.shields.io/badge/invariants-5%20exhaustively%20proven-8957e5?style=flat-square&logo=ghostery&logoColor=white)](#proof-not-vibes)
 [![No unsafe](https://img.shields.io/badge/unsafe-forbidden-CE422B?style=flat-square&logo=rust&logoColor=white)](#)
