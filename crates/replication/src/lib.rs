@@ -19,6 +19,8 @@
 //! is a single `u64` seed you replay exactly. The same philosophy as the
 //! single-node crash simulator, now across a cluster.
 
+pub mod net;
+
 use picklejar::antientropy::MerkleSet;
 use picklejar::consistenthash::HashRing;
 use picklejar::crdtmem::{Replica, Slot};

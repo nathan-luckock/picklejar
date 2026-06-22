@@ -12,6 +12,10 @@ description = "AP (Dynamo-style) replication for the picklejar memory layer, pro
 name = "repsim"
 path = "src/bin/repsim.rs"
 
+[[bin]]
+name = "pjnode"
+path = "src/bin/pjnode.rs"
+
 [dependencies]
 picklejar.workspace = true
 
