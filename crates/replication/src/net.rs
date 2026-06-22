@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+use picklejar::antientropy::MerkleSet;
 use picklejar::blindvec::l2_sq;
 use picklejar::consistenthash::HashRing;
 use picklejar::crdtmem::{Replica, Slot};
@@ -22,8 +23,29 @@ const REQ_PUT: u8 = 1;
 const REQ_GET: u8 = 2;
 const REQ_PULL: u8 = 3;
 const REQ_KNN: u8 = 4;
+const REQ_ROOT: u8 = 5;
 const VNODES: u32 = 64;
+const MERKLE_DEPTH: u32 = 8;
 const TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The Merkle root over a replica's slots, used to skip anti-entropy between two
+/// nodes that already agree (an identical-replica check costs one 32-byte
+/// exchange instead of shipping any state).
+fn store_root(store: &Arc<Mutex<Replica>>) -> [u8; 32] {
+    let entries: Vec<(u64, Vec<u8>)> = {
+        let guard = store.lock().expect("store lock");
+        guard
+            .slots()
+            .iter()
+            .map(|(k, s)| {
+                let mut b = Vec::new();
+                put_slot(&mut b, s);
+                (*k, b)
+            })
+            .collect()
+    };
+    MerkleSet::from_entries(MERKLE_DEPTH, &entries).root()
+}
 
 fn write_frame<W: Write>(w: &mut W, payload: &[u8]) -> io::Result<()> {
     let len = u32::try_from(payload.len()).unwrap_or(u32::MAX);
@@ -258,6 +280,11 @@ fn handle(req: &[u8], store: &Arc<Mutex<Replica>>) -> Vec<u8> {
             }
             out
         }
+        Some(REQ_ROOT) => {
+            let mut out = vec![REQ_ROOT];
+            out.extend_from_slice(&store_root(store));
+            out
+        }
         _ => vec![255],
     }
 }
@@ -276,6 +303,16 @@ fn request(addr: &str, req: &[u8]) -> io::Result<Vec<u8>> {
 /// # Errors
 /// Returns an error if the peer cannot be reached or the response is malformed.
 pub fn pull_into(store: &Arc<Mutex<Replica>>, peer: &str) -> io::Result<usize> {
+    // Skip the sync entirely when the peer's Merkle root matches ours: two
+    // replicas that already agree exchange 32 bytes and ship nothing.
+    let root_resp = request(peer, &[REQ_ROOT])?;
+    if root_resp.first() == Some(&REQ_ROOT)
+        && root_resp.len() >= 33
+        && root_resp[1..33] == store_root(store)
+    {
+        return Ok(0);
+    }
+
     let resp = request(peer, &[REQ_PULL])?;
     if resp.first() != Some(&REQ_PULL) {
         return Ok(0);
@@ -595,6 +632,12 @@ mod tests {
         }
         let merged = pull_into(&store_b, &addr_a).expect("pull");
         assert_eq!(merged, 2);
+        // Now identical: a second pull sees matching Merkle roots and skips.
+        assert_eq!(
+            pull_into(&store_b, &addr_a).expect("pull"),
+            0,
+            "already in sync, nothing transferred"
+        );
         let (v7, v8) = {
             let b = store_b.lock().expect("lock");
             (b.get(7).map(<[u8]>::to_vec), b.get(8).map(<[u8]>::to_vec))
