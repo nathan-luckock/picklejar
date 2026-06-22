@@ -2,9 +2,9 @@
 
 # picklejar
 
-### Durable, isolated AI memory for hardware you can neither reach nor trust.
+### A database for when no one is coming to fix it.
 
-A from-scratch, Postgres-wire database engine in Rust. Its durability is proven by **1,000,000 deterministic crash simulations**, its core invariants by **exhaustive model checking**, and even its cryptography is written by hand.
+A from-scratch, Postgres-wire database engine in Rust. Its durability is proven by **1,000,000 deterministic crash simulations**, its core invariants by **exhaustive model-checking**, and even its cryptography is written by hand. One command re-runs the entire proof.
 
 [![CI](https://img.shields.io/github/actions/workflow/status/nathan-luckock/capstone/ci.yml?style=flat-square&label=CI&logo=github)](https://github.com/nathan-luckock/capstone/actions/workflows/ci.yml)
 [![Crash sims](https://img.shields.io/badge/crash%20sims-1%2C000%2C000%20passed-3FB950?style=flat-square&logo=checkmarx&logoColor=white)](#proof-not-vibes)
@@ -14,6 +14,8 @@ A from-scratch, Postgres-wire database engine in Rust. Its durability is proven 
 [![License](https://img.shields.io/badge/license-MIT%20or%20Apache--2.0-2F81F7?style=flat-square)](#license)
 
 </div>
+
+> Built for hardware you can't reach: a satellite, a forward-deployed sensor, a seabed node, a robot in the field. When a disk corrupts and there is no technician, picklejar detects it, repairs it from parity, and proves it never served a wrong answer or leaked one tenant's data into another's.
 
 <table align="center">
 <tr>
@@ -29,29 +31,18 @@ A from-scratch, Postgres-wire database engine in Rust. Its durability is proven 
 
 ## See it prove itself
 
-**One command attests the entire stack.** `cargo run --release --bin attest` re-verifies every guarantee live, across three axes, and emits a single content hash over all of them:
+One command re-verifies every guarantee live and emits a single content hash over all of them:
 
 ```text
 $ cargo run --release --bin attest
 
 ================ PICKLEJAR GRAND ATTESTATION ================
-durable, isolated, verifiable, forgetful, private, available
-
-DURABILITY, RECALL, AND EXHAUSTIVELY MODEL-CHECKED INVARIANTS
   [PASS] WAL ordering model-check        [PASS] snapshot isolation model-check
   [PASS] RLS retrieval isolation         [PASS] cache freshness model-check
-  [PASS] valid-time travel model-check   [PASS] radiation survivability (LEO/GEO)
-  ... 20 reliability invariants, all PASS ...
-
-CRYPTOGRAPHIC GUARANTEES (VERIFIED LIVE)
-  [PASS] authenticated KNN soundness     [PASS] authenticated SQL soundness
-  [PASS] provable forgetting             [PASS] forward-secure audit log
-  [PASS] private information retrieval   [PASS] private aggregates
-  [PASS] Shamir threshold                [PASS] capability tokens / blind search
-
-DISTRIBUTED GUARANTEES
-  [PASS] CRDT convergence (all merge orders)   [PASS] quorum never stale (r+w>rf)
-  [PASS] anti-entropy / vector clocks / consistent hashing
+  [PASS] authenticated SQL soundness     [PASS] provable forgetting
+  [PASS] forward-secure audit log        [PASS] private information retrieval
+  [PASS] CRDT convergence                [PASS] quorum never stale (r+w>rf)
+  ... 34 checks across durability, cryptography, and distribution ...
 
 attestation hash: 3750b4e8...
 VERDICT: 34/34 checks passed -- ALL GUARANTEES HELD
@@ -59,92 +50,64 @@ VERDICT: 34/34 checks passed -- ALL GUARANTEES HELD
 ============================================================
 ```
 
-One regenerable artifact attesting that the engine is durable, isolated, verifiable, forgetful, private, and available, all at once. For the live performance numbers, `cargo run --release --bin scorecard` measures throughput on the real engine:
-
-```text
-$ cargo run --release --bin scorecard
-
-================ PICKLEJAR SCORECARD ================
-a from-scratch, Postgres-wire AI-memory engine, proven
-
-THROUGHPUT (measured live on this machine)
-  inserts                   454 rows/sec      durable, one fsync per row
-  point lookups           90215 queries/sec   by primary key
-  vector KNN (HNSW)        6005 queries/sec    k=10 over 3000 embeddings
-
-RECALL UNDER DRIFT (4x-compressed index)
-  drift-adaptive          0.969  vs static 0.005  (28 recalibrations)
-
-PROVEN INVARIANTS (deterministic, content-hashed)
-  [PASS] recall L2 (clustered)            [PASS] WAL ordering model-check
-  [PASS] metamorphic: self-retrieval      [PASS] snapshot isolation model-check
-  [PASS] corruption detection             [PASS] RLS retrieval isolation model-check
-  [PASS] self-healing                     [PASS] cache freshness model-check
-  [PASS] radiation survivability (LEO)    [PASS] valid-time travel model-check
-  [PASS] irradiated memory layer (GEO)    [PASS] drift-adaptive recall
-  ... 20 invariants total ...             [PASS] storage-fault detection coverage
-
-  certificate hash f83b61ee
-
-VERDICT: 20 invariants proven, recall held under drift, throughput measured live.
-====================================================
-```
-
-The verification numbers are deterministic (only the throughput line varies by machine), and `vecert` emits the same set as a notarized, content-hashed certificate. Five of those invariants are proved by *exhaustive* from-scratch model checking, not sampling: WAL ordering, snapshot isolation, RLS-filtered retrieval, cache freshness, and valid-time travel.
+The verification results are deterministic and regenerable: re-run it from this commit and the hash matches. `cargo run --release --bin scorecard` does the same for live throughput and the 20 proven invariants. Nothing here is a static claim.
 
 ## Run something impossible
 
-Every capability below is a **from-scratch primitive with a live demo** — no libraries pulled in, even the SHA-256 and the finite-field math are hand-written. Pick one and watch it run:
+Each row is a from-scratch primitive with a live demo. No libraries are pulled in; even the SHA-256 and the finite-field math are hand-written.
 
 | Watch it happen | One command |
 |---|---|
 | A nearest-neighbor answer you can **verify without trusting the server** | `cargo run --release --bin authknn` |
-| A memory that **proves it forgot** — unrecoverable even after a crash and a parity rebuild | `cargo run --release --bin forgetsim` |
-| Similarity search on a server that **never sees your embeddings** | `cargo run --release --bin blindsim` |
+| A memory that **proves it forgot**, unrecoverable even after a crash and a parity rebuild | `cargo run --release --bin forgetsim` |
 | A history that **catches a forger** who rewrote and re-signed the whole log | `cargo run --release --bin ledgersim` |
-| Force an unreachable node to **prove it still holds your data** | `cargo run --release --bin retrievesim` |
-| Two partitioned nodes that **merge with zero conflicts** | `cargo run --release --bin crdtsim` |
-| A key **split so no single node can read it** | `cargo run --release --bin shamirsim` |
-| The whole proof on one page: throughput, recall, every invariant | `cargo run --release --bin scorecard` |
+| Years of **orbital radiation** survived with zero data loss | `cargo run --release --bin resilientsim` |
 
-...and **~40 runnable demos in all** (`ls crates/picklejar/src/bin`), every one a primitive built by hand: HyperLogLog, Count-Min, cuckoo filters, product quantization, consistent hashing, vector clocks, a forward-secure audit log, and more.
+There are ~45 more, every one a primitive built by hand: HyperLogLog, Count-Min, product quantization, Shamir secret sharing, private information retrieval, CRDTs, consistent hashing, and the rest. The full catalog is in [docs/gallery.md](docs/gallery.md).
 
-## What this is
+## What it is
 
-picklejar is a relational database engine written from scratch in Rust, evolving into a specific thing: **the memory layer for AI in environments that cannot be physically serviced**, such as orbital and edge data centers, where a failed disk is never swapped and a partitioned link is never fixed by hand.
+picklejar is a relational database engine, built from the page layout up, for **infrastructure humans cannot physically service**: orbital and edge nodes, remote sensors, anywhere a failed disk is never swapped and a partitioned link is never fixed by hand. ([Starcloud](https://www.starcloud.com) is already running GPUs in orbit; the edge keeps pushing further out.)
 
-The data layer for those places has one hard requirement: it must keep committed data intact and isolated through faults that nobody is around to repair, and it must be able to *prove* it. That proof, durability and tenant isolation established by deterministic crash simulation rather than asserted, is what this project is built around.
+The data layer for those places has one hard job: keep committed data intact and tenant-isolated through faults that nobody is around to repair, and *prove* it. That proof is the product. Everything else, including the AI-memory layer, the cryptography, and the distributed pieces, is what owning the whole I/O path makes possible.
 
-## Why now
+**Honest scoping.** No single part is novel: vector search with engine-enforced isolation ships in Postgres + pgvector and Oracle 23ai; deterministic simulation testing is FoundationDB and TigerBeetle; erasure coding is in every object store. The uncontested combination is a single from-scratch engine that is reliability infrastructure for AI memory, self-healing under a modeled fault environment, whose durability and isolation are *proven* by deterministic replay and exhaustive model-checking. The full argument is in [docs/why-from-scratch.md](docs/why-from-scratch.md).
 
-Compute is moving to places people cannot reach. [Starcloud](https://www.starcloud.com) is already running GPUs in orbit and training models in space (a $1.1B valuation and an 88,000-satellite data-center filing as of early 2026), and the edge keeps pushing further out. AI workloads in those places need durable, isolated memory: embeddings, retrieval, and per-tenant context that survive failure and never leak across tenants.
+## What's inside
 
-Honest scoping of what is and is not new:
+A toy "build a database" project stops at a key-value store or wraps an existing engine. picklejar implements the parts that make a database a database:
 
-- **Not novel on its own.** Vector search and engine-enforced row-level isolation already ship together (Postgres with `pgvector` and RLS, Oracle 23ai). Deterministic simulation testing is a respected technique (FoundationDB, TigerBeetle, Antithesis).
-- **The uncontested combination.** A single from-scratch engine that is an AI memory layer with engine-enforced isolation, whose durability and isolation are *proven by deterministic crash simulation*, aimed at unreachable infrastructure. Reliability testing of vector databases is still posed as an open problem in the literature ([*Towards Reliable Vector Database Management Systems: A Software Testing Roadmap for 2030*](https://arxiv.org/abs/2502.20812)).
-
-## Where it stands
-
-| Layer | State |
+| | |
 |---|---|
-| Crash-proven SQL engine (storage, WAL + ARIES recovery, MVCC, cost-based planner, roles, RLS, Postgres wire) | **done**, cross-checked against SQLite and a fault-injecting simulator |
-| Native vector type (`VECTOR(n)`, pgvector-style literals, durable storage) | **done** |
-| Distance operators and brute-force KNN (`<->`, `<=>`, `<#>`, `<+>`, plus function forms) | **done** |
-| RLS-filtered similarity search (isolation enforced by the engine, not application code) | **done** |
-| Fault simulator for the memory layer (`vecsim`: durability and isolation under simulated crash) | **done** |
-| HNSW index (4 metrics, insert/search/delete, durable, recall > 0.98 on hard data) | **done** |
-| HNSW wired into SQL: `ORDER BY col <-> :q LIMIT k` served from a write-invalidated, RLS-safe cached index (~150x warm) | **done** |
-| Orbital radiation fault model injected into the live simulator, corrupting every persistent file (`vecsim --irradiate`, dose set by orbit) | **done** |
-| Corruption detection and self-healing (page, index, and metadata-sidecar CRC32 enforced, redundant self-healing index, metamorphic oracle) | **done** |
-| Mass-efficient self-healing heap: Reed-Solomon parity (`protect`) reconstructs corrupt heap pages on `open_resilient`, wired into the live engine | **done** |
-| Regenerable reliability certificate (`vecert`, framed in orbital upset rates) | **done** |
-| Backup, point-in-time recovery, and a physical standby replica (`pjbackup`, WAL archiving, streaming standby) | **done** |
-| Operability of self-healing: the `PROTECT` statement, a durable fault log (`pg_fault_log`), the `pjscrub` cron scrubber | **done** |
-| Exhaustive from-scratch model-checking of the WAL-ordering, snapshot-isolation, RLS-filtered-retrieval, and cache-freshness invariants (`walmodel`, the `txn` model, `rlsmodel`) | **done** |
-| WAL-logged catalog and isolation: schema and row-level-security policy changes are logged and replayed on open, so the log is authoritative for both and a crash can never silently drop a tenant fence | **done** |
+| **Storage** | 8 KiB slotted pages, an LRU-K buffer pool, a B+ tree, CRC32 checksums verified on every read, all behind a `Disk` trait |
+| **Crash safety** | a write-ahead log and full ARIES recovery (analysis, redo, undo with compensation records) |
+| **Transactions** | MVCC snapshot isolation; `BEGIN` / `COMMIT` / `ROLLBACK`; a reader never blocks a writer |
+| **Query engine** | hand-written lexer and Pratt parser, a cost-based planner, and a Volcano executor |
+| **Security** | roles, `GRANT` / `REVOKE`, ownership, and row-level security enforced in the engine |
+| **Vector memory** | `VECTOR(n)` type, four distance metrics, KNN, and an HNSW index wired into SQL through a cached, RLS-safe path |
+| **Reliability under fault** | page, index, and metadata checksums; a self-healing redundant index; Reed-Solomon erasure coding; a regenerable certificate |
+| **Postgres wire** | real clients and drivers connect over TCP, no shim |
 
-**Where it is headed.** The core is in place: the HNSW index is reachable from SQL through a cached, opt-in, row-level-security-safe path that turns a repeated nearest-neighbor query into roughly a 150x speedup over the exact scan while still fencing each tenant to its own rows; the corruption story is enforced end to end (page and index checksums refuse a flipped bit, the index self-heals from a redundant copy, a metamorphic oracle tests approximate search without a ground-truth answer); and the orbital radiation fault model is injected into the live simulator, so a multi-tenant workload can be irradiated at a chosen orbit's upset rate for a chosen dwell time, across every persistent file (heap, WAL, and the now-checksummed metadata sidecars), and proven to never serve a silently corrupted answer. Since then, backup and point-in-time recovery, a physical standby replica, and from-scratch exhaustive model-checking of the core write-ahead-logging and snapshot-isolation invariants have all landed, so the recovery and isolation guarantees are now proven by an exhaustive model checker, not only by random crash sampling. And the catalog itself is now written to the write-ahead log and replayed on open, so the log is authoritative for the schema: a schema change that reached the log is recovered even if its sidecar write was lost, and forward replay reconstructs later schema changes rather than only the base state. The full plan and its honest scoping are in [docs/ROADMAP.md](docs/ROADMAP.md).
+The complete SQL surface is in [docs/FEATURES.md](docs/FEATURES.md).
+
+## Proof, not vibes
+
+Correctness is not asserted, it is tested several independent ways, all under `clippy -D warnings` and `rustfmt` in CI:
+
+- **Deterministic simulation.** Every crash scenario is one `u64` seed against a fault-injecting disk, so any failure replays exactly. 1,000,000 seeded crash-and-recover runs pass (40,947,775 committed rows verified), and the harness found and fixed a real recovery bug.
+- **Exhaustive model-checking.** From-scratch bounded model checkers enumerate *every* reachable interleaving of an abstract model and prove an invariant holds in all of them: WAL ordering, snapshot isolation, RLS-filtered retrieval, cache freshness, and valid-time travel. Each has a deliberately buggy variant that produces a counterexample, so the check has teeth.
+- **Differential testing against SQLite.** Random SQL run through both engines, compared as a sorted multiset, with SQLite as the independent oracle.
+- **Corruption detection and self-healing.** Page, index, and metadata checksums refuse a flipped bit rather than serve it; Reed-Solomon parity reconstructs a corrupt heap page on open, at `+m/k` storage overhead instead of the `+m*100%` of redundant copies.
+- **A modeled fault environment.** A committed multi-tenant workload is irradiated at a chosen orbit's single-event-upset rate across every persistent file, then reopened: the engine either detects the corruption or it changed no committed answer, and it never leaks a tenant.
+
+```bash
+cargo run --release --bin dst -- 1000000      # 1,000,000 reproducible crash scenarios
+cargo run --release --bin walmodel             # exhaustively model-check the WAL ordering invariant
+cargo run --release --bin rlsmodel             # model-check tenant isolation through the index
+cargo run --release --bin difftest -- 100000   # 100k queries checked against SQLite
+cargo run --release --bin vecsim -- 100000     # 100k durability + isolation sims
+cargo run --release --bin vecert               # the regenerable reliability certificate
+```
 
 ## Quickstart
 
@@ -161,8 +124,6 @@ picklejar> EXPLAIN SELECT name FROM customers WHERE id = 1;   -- the cost-annota
 
 Close the file, reopen it, and your schema and rows are still there.
 
-### The memory layer
-
 ```sql
 -- A memory store for AI agents: each tenant is fenced off by the engine.
 CREATE TABLE memories (id SERIAL PRIMARY KEY, tenant TEXT, embedding VECTOR(3));
@@ -175,15 +136,7 @@ INSERT INTO memories (tenant, embedding) VALUES ('acme', '[0.1, 0.2, 0.9]');
 SELECT id FROM memories ORDER BY embedding <-> '[0.1, 0.2, 0.8]' LIMIT 5;
 ```
 
-A `VECTOR(n)` column stores an embedding as native `f32`, validates its width on write, and survives a crash and reopen like any other value. Similarity search runs through the same row-level-security fence as every other read, so a tenant's nearest-neighbor query can only ever rank that tenant's own vectors, enforced by the engine.
-
-That last query can be served two ways. By default it is an exact scan. Run `SET vector_index = on` (from `psql` or any client) and the same SQL is answered from a cached HNSW index instead, roughly 150x faster on a warm query, and only when row-level security does not apply to the query, so the acceleration can never widen what a tenant can see. An RLS-fenced query always falls back to the exact, fenced path.
-
-Memory also travels in time, on both axes. Give a table `valid_from` and `valid_to` columns and `SET valid_time = TIMESTAMP '...'` rewinds every read in the session to an as-of instant, returning exactly the rows that were valid then over the half-open interval `[valid_from, valid_to)`. The other axis is the database's own history: `SET transaction_time = <point>` (a transaction-id watermark from `txid_current()`) travels a read to the MVCC snapshot as of a past transaction, walking each version chain to the version live then, so a row updated since shows its old value and a deleted one reappears. Valid-time asks what was true in the world; transaction-time asks what the database knew; with both set, a query is a full bitemporal as-of. `SET valid_time = off` / `SET transaction_time = off` return to the present. Both ride the same parser-safe session mechanism as the index toggle, which is what lets them sidestep the `AS OF` syntax collision.
-
-And memory defends its own consistency. `INSERT ... ON CONFLICT (key) DO ASSERT` re-asserts a fact the agent already holds for free, but rejects a write that records a *different* value for the same key as a contradiction, naming the column, the key, and the two values. The conflicting belief is caught at write time instead of silently overwriting what was there.
-
-Memory also keeps its recall as it ages. A scalar-quantized index stores each embedding at a quarter of the size, and the usual cost of that compression is that recall decays as the embedding distribution drifts away from what the quantizer was calibrated on. This engine recalibrates adaptively, only when the live distribution outgrows the calibrated range, re-quantizing from the durable rows so the index never grows. On a drifting stream the adaptive index holds recall near the full-precision ceiling (~0.97) where a calibrate-once quantizer collapses (~0.005), at the same compression and recalibrating on under 2% of inserts. The benchmark is `quantsim`, and the margin is checked in the `vecert` certificate.
+`SET vector_index = on` answers that query from a cached HNSW index (~150x faster on a warm query), and only when row-level security does not apply, so the acceleration can never widen what a tenant sees. The memory layer also travels in time (bitemporal `AS OF`), detects contradictions on write, and holds recall flat under drift; the details are in [docs/FEATURES.md](docs/FEATURES.md).
 
 ## It speaks Postgres
 
@@ -194,76 +147,7 @@ cargo run --release --bin picklejar-pg -- --database mydb.db --port 5433
 psql -h 127.0.0.1 -p 5433 -U postgres
 ```
 
-```text
-postgres=> SELECT name FROM engineers AS e
-postgres->  WHERE rust_years > (SELECT AVG(rust_years) FROM engineers WHERE active = e.active);
- name
-------
- Ada
-(1 row)
-```
-
-That correlated subquery, the aggregate, and `EXPLAIN` all run through the engine. Both the simple and the extended query protocol (server-side prepared statements with `$N` parameters) are implemented and verified against `psql` 18.
-
-## What's inside
-
-A toy "build a database" project stops at a key-value store or wraps an existing engine. picklejar implements the parts that make a database a database:
-
-| | |
-|---|---|
-| **Storage** | 8 KiB slotted pages, an LRU-K buffer pool, a B+ tree, CRC32 checksums verified on every read, all behind a `Disk` trait |
-| **Crash safety** | a write-ahead log and full ARIES recovery (analysis, redo, undo with compensation records) |
-| **Transactions** | MVCC snapshot isolation; `BEGIN` / `COMMIT` / `ROLLBACK`; a reader never blocks a writer |
-| **Query engine** | hand-written lexer and Pratt parser, a cost-based planner, and a Volcano executor |
-| **Security** | roles, `GRANT` / `REVOKE`, ownership, and row-level security enforced in the engine |
-| **Vector memory** | `VECTOR(n)` type, four distance metrics, KNN, and an HNSW index (build, search, delete, persist) wired into SQL through a cached, RLS-safe path |
-| **Reliability under fault** | page, index, and metadata-sidecar checksums refuse corrupt data; a self-healing redundant index; Reed-Solomon erasure coding for mass-efficient self-healing storage; a metamorphic oracle; and a regenerable certificate |
-| **Postgres wire** | real clients and drivers connect over TCP, no shim |
-| **Deep SQL** | joins, window functions, set operations, correlated subqueries, CTEs, upserts, `information_schema` |
-
-The complete feature list is in [docs/FEATURES.md](docs/FEATURES.md).
-
-## Proof, not vibes
-
-Correctness is not asserted, it is tested several independent ways, all under `clippy -D warnings` and `rustfmt` in CI:
-
-- **Deterministic simulation testing.** Every crash scenario is one `u64` seed against a fault-injecting disk, so any failure replays exactly. **1,000,000 seeded crash-and-recover runs pass** (40,947,775 committed rows verified), and the harness found and fixed a real recovery bug.
-- **Exhaustive model checking.** Where the crash sims sample random interleavings, from-scratch bounded model checkers enumerate *every* reachable interleaving of an abstract model and prove an invariant holds in all of them, each with a deliberately buggy variant confirming the check has teeth. Five are proved this way: the write-ahead-logging ordering invariant (`walmodel`, a page change is never durable ahead of its log record), the MVCC snapshot read-stability invariant (the `txn` model), through the approximate index both tenant isolation and cache freshness (`rlsmodel`, below), and valid-time travel (a read at a session as-of instant returns a row exactly when it is valid then, so the half-open boundary never serves a superseded row). Random testing finds bugs; this proves their absence over the bounded model.
-- **Model-checked correctness through the index (`rlsmodel`).** The promise is that a query served from the cached approximate index never returns a row it should not, two ways. Tenant isolation: a tenant's query can never return another tenant's row. Freshness: a query can never return a row that was deleted, so a forgotten memory cannot resurface through a stale cache. A from-scratch model checker enumerates every interleaving of inserts, deletes, cache invalidations, role switches, policy changes, index builds, and queries, proves both hold, and catches each removed guard with a concrete counterexample (a cross-tenant row, or a deleted row served). No vector or AI-memory database is known to model-check its filtered retrieval this way.
-- **Differential testing against SQLite.** Random SQL run through both engines, compared as a sorted multiset, with SQLite as the independent oracle.
-- **Vector durability and isolation simulation (`vecsim`).** The same seeded, replayable model applied to the memory layer: a multi-tenant embedding workload writing through the RLS fence, a crash, then a check that every committed embedding survives intact and each tenant sees only its own after recovery, on reads and on nearest-neighbor ranking.
-- **A metamorphic oracle for approximate search.** Relations that must always hold (self-retrieval, monotonic insertion, deletion consistency, recall monotonicity) test correctness without a ground-truth answer, the accepted answer to the oracle problem for approximate search.
-- **Corruption detection and self-healing.** Every page and every serialized index carries a CRC32 that is verified on read, so a flipped bit is refused rather than served; the index keeps a redundant copy and reconstructs itself from it with no intervention.
-- **An orbital radiation fault model in the live simulator.** A committed multi-tenant workload is irradiated across every persistent file (heap, WAL, and metadata sidecars) at a chosen orbit's single-event-upset rate for a chosen dwell time, then reopened: the engine either detects the corruption or it changed no committed answer, but it never serves a tenant a silently wrong embedding and never leaks another tenant's row. The injected dose is the orbit model, not an arbitrary fault count.
-- **Self-healing storage with mass-efficient redundancy.** A from-scratch Reed-Solomon erasure code (GF(2^8)) stores data as `k` shards plus `m` parity, so any `m` corrupt shards are reconstructed from the survivors. Surviving `m` failures this way costs `+m/k` storage (for example `+40%`) instead of the `+m*100%` (for example `+400%`) that redundant hardware copies cost, which is why you can launch light commodity storage instead of heavy triple-redundant drives. The standalone store detects a bad shard by its checksum, logs the fault, repairs it from parity, and heals itself (`resilientdemo` runs the corruption drill; `resilientsim` runs years of it). And it is wired into the live engine: `db.protect(k, m)` writes a parity snapshot of the heap, and `Database::open_resilient` reconstructs any radiation-corrupted heap page from that parity before the engine reads it, so the database repairs its own storage on open with no human and no spare node.
-
-```bash
-cargo run --release --bin dst -- 1000000             # 1,000,000 reproducible crash scenarios
-cargo run --release --bin difftest -- 100000         # 100k queries checked against SQLite
-cargo run --release --bin walmodel                   # exhaustively model-check the WAL ordering invariant
-cargo run --release --bin rlsmodel                   # exhaustively model-check tenant isolation through the index
-cargo run --release --bin vecsim -- 100000           # 100k durability + isolation sims
-cargo run --release --bin vecsim -- --irradiate 10000 365 geo   # irradiate a year in GEO
-cargo run --release --bin vecbench                   # HNSW vs brute-force speedup and recall
-cargo run --release --bin vecsqlbench                # cached SQL index path vs exact scan
-cargo run --release --bin resilientdemo              # erasure-coded self-healing corruption drill
-cargo run --release --bin resilientsim               # years of orbital radiation vs scrub cadence
-cargo run --release --bin pjscrub -- mem.db          # the cron scrubber: heal + refresh parity
-cargo run --release --bin pjbackup -- mem.db out.db  # consistent snapshot backup (heal first)
-cargo run --release --bin vecert                     # the regenerable reliability certificate
-```
-
-A database for hardware you cannot service is only as good as its proof that it survives failure. `vecert` turns that proof into a single regenerable, content-hashed artifact:
-
-```text
-[PASS] recall L2 (clustered): recall@10 = 1.0000 over 3000 clustered vectors (oracle: brute force)
-[PASS] corruption detection: 7271/7271 single-bit faults detected on load
-[PASS] self-healing: 6/6 corrupted copies recovered exactly from redundancy
-[PASS] radiation survivability (LEO): modeled low Earth orbit dose ~1.07 upsets/day for a 261 KB index; all detected
-[PASS] irradiated memory layer (GEO): 8 multi-tenant workloads irradiated for 400 orbit-days through SQL; 0 silently wrong
-result: ALL INVARIANTS HELD
-certificate hash: ...  (regenerate from this commit to verify)
-```
+Both the simple and the extended query protocol (server-side prepared statements with `$N` parameters) are implemented and verified against `psql` 18.
 
 ## Architecture
 
@@ -285,12 +169,12 @@ certificate hash: ...  (regenerate from this commit to verify)
 
 | | |
 |---|---|
-| [docs/why-from-scratch.md](docs/why-from-scratch.md) | why this is not just Postgres + pgvector: the objection answered honestly |
-| [docs/ROADMAP.md](docs/ROADMAP.md) | where this is headed: from a crash-proven vector engine to flight-certifiable AI memory |
+| [docs/why-from-scratch.md](docs/why-from-scratch.md) | why this is not just Postgres + pgvector, the objection answered honestly |
+| [docs/gallery.md](docs/gallery.md) | every runnable demo and hand-built primitive, grouped |
+| [docs/ROADMAP.md](docs/ROADMAP.md) | what is built, and where the frontier is |
 | [docs/design.md](docs/design.md) | every design decision, with the alternatives considered and rejected |
 | [docs/FEATURES.md](docs/FEATURES.md) | the complete SQL surface and engine features |
 | [docs/sprints.md](docs/sprints.md) | how the build was sequenced |
-| [CONTRIBUTING.md](CONTRIBUTING.md) | `fmt` + `clippy -D warnings` + `test` before every PR |
 
 ## License
 

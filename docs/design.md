@@ -19,18 +19,20 @@ built, see [sprints.md](sprints.md); for the full SQL and engine surface, see
 ## Mission and direction
 
 The engine began as a from-scratch relational database. Its direction is now
-specific: **the memory layer for AI in environments that cannot be physically
-serviced** - orbital and edge data centers, where a failed disk is not getting
-swapped and a partitioned link is not getting a hands-on fix.
+specific: **a proof-driven database for infrastructure humans cannot physically
+service** - orbital and edge nodes, remote sensors, anywhere a failed disk is
+never swapped and a partitioned link is never fixed by hand. Its first
+application is reliability infrastructure for AI memory: durable, isolated
+embeddings and per-tenant context for agents running in those places.
 
 This is a deliberate pivot toward a real, open problem rather than a better copy
 of an existing one. The reasoning:
 
 - **Compute is already moving to those environments.** Orbital data centers are
   no longer speculative (GPUs and model training in space, multi-billion-dollar
-  valuations, large satellite-constellation filings as of early 2026), but the
-  durable, queryable *data layer* for them does not exist. Space storage products
-  so far are archival, not databases.
+  valuations, large satellite-constellation filings as of early 2026), and the
+  edge keeps pushing further out, but the durable, queryable *data layer* for them
+  does not exist. Space storage products so far are archival, not databases.
 - **The hard requirement there is provable durability, not features.** When no
   human can intervene, "it usually recovers" is unacceptable. The system must be
   able to *prove* that committed data survives arbitrary crashes and faults.
@@ -48,15 +50,15 @@ Stated plainly so the claim survives scrutiny:
   on vector queries (Postgres + `pgvector` + RLS, and Oracle 23ai, already ship
   this); deterministic simulation testing as a technique (FoundationDB,
   TigerBeetle, Antithesis).
-- **The open ground:** a vector / AI-memory database whose durability is *proven*
-  by deterministic simulation, and which is built for unreachable infrastructure.
-  Rigorous reliability testing of vector databases is still posed as a future
-  problem in the literature, and no system fuses durable + isolated + vector +
-  fault-proven for the orbital/edge target.
+- **The open ground:** reliability infrastructure for AI memory whose durability
+  is *proven* by deterministic simulation and exhaustive model-checking, built for
+  unreachable infrastructure. Rigorous reliability testing of vector databases is
+  still posed as a future problem in the literature, and no system fuses durable +
+  isolated + vector + fault-proven for the unreachable-node target.
 
 So vector search and row-level isolation are treated here as table stakes the
 engine must have; the differentiator, and the thing the roadmap drives toward, is
-the *proof* that the AI memory survives an environment no one can reach.
+the *proof* that the memory survives an environment no one can reach.
 
 The memory layer is built on top of the proven engine and is complete (see
 [The vector memory layer](#the-vector-memory-layer)). A native `VECTOR(n)` type
@@ -96,8 +98,9 @@ type system, roles and row-level security) and still growing. Durability is
 proven by 1,000,000 deterministic crash-and-recover simulations. The AI memory
 layer is built on this foundation: a native `VECTOR(n)` type, four distance
 metrics with brute-force KNN, row-level-security-filtered similarity search, an
-HNSW index, and a fault simulator that proves durability and isolation together.
-The remaining step is wiring the HNSW index into the planner.
+HNSW index wired into SQL through a cached, RLS-safe path, and a fault simulator
+that proves durability and isolation together, now extended with a space
+radiation model, self-healing erasure coding, and model-checked core invariants.
 [sprints.md](sprints.md) tracks what shipped in what order.
 
 ## Architecture

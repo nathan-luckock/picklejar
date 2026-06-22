@@ -75,13 +75,13 @@ the proof requires the control.
 - **Not new on its own:** vector search plus row-level isolation (Postgres,
   Oracle 23ai). Deterministic simulation testing (FoundationDB, TigerBeetle).
   Erasure coding (every object store).
-- **Uncontested in combination:** a single from-scratch engine that is an
-  isolated AI-memory layer, self-healing under a space radiation fault model with
-  mass-efficient software redundancy, whose durability and isolation are proven by
-  deterministic replay, aimed at a single unreachable node rather than a serviced
-  cluster. The reliability testing of vector databases is still posed as an open
-  problem in the literature
-  ([arXiv 2502.20812](https://arxiv.org/abs/2502.20812)).
+- **Uncontested in combination:** a single from-scratch engine that is
+  reliability infrastructure for AI memory, self-healing under a modeled fault
+  environment with mass-efficient software redundancy, whose durability and
+  isolation are proven by deterministic replay *and exhaustive model-checking*,
+  aimed at a single unreachable node rather than a serviced cluster. The
+  reliability testing of vector databases is still posed as an open problem in the
+  literature ([arXiv 2502.20812](https://arxiv.org/abs/2502.20812)).
 
 The honesty that makes the claim survive scrutiny: picklejar is not replacing
 Postgres. It is building the thing Postgres's own assumptions prevent it from
