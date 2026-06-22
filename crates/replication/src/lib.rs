@@ -20,6 +20,7 @@
 //! single-node crash simulator, now across a cluster.
 
 use picklejar::antientropy::MerkleSet;
+use picklejar::consistenthash::HashRing;
 use picklejar::crdtmem::{Replica, Slot};
 
 /// A deterministic xorshift64 PRNG, so a simulation run replays from its seed.
@@ -53,14 +54,6 @@ impl Rng {
     }
 }
 
-/// A strong scramble of a key into a placement position.
-const fn splitmix64(x: u64) -> u64 {
-    let mut z = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^ (z >> 31)
-}
-
 /// What happened to a write under availability-first semantics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WriteOutcome {
@@ -81,14 +74,21 @@ impl WriteOutcome {
     }
 }
 
-/// A cluster of replicated memory nodes with a controllable partition state.
+/// A cluster of replicated memory nodes with controllable partition and
+/// membership state.
 ///
-/// Nodes carry a partition-group id; two nodes can communicate only when they
-/// share a group. A fresh cluster is fully connected (every node in group 0).
+/// Placement is consistent-hashed: each key's replicas are its preference list
+/// on a [`HashRing`] of the live nodes, so a node joining or leaving moves only
+/// its share of keys. Nodes carry a partition-group id (two nodes communicate
+/// only when they share a group and both are up) and a membership status. A
+/// per-observer heartbeat detector tracks who each node has lately heard from.
 #[derive(Debug)]
 pub struct Cluster {
     nodes: Vec<Replica>,
     group: Vec<u32>,
+    up: Vec<bool>,
+    last_heard: Vec<Vec<u64>>,
+    ring: HashRing,
     rf: usize,
     r: usize,
     w: usize,
@@ -105,9 +105,16 @@ impl Cluster {
         assert!(n > 0, "a cluster needs at least one node");
         assert!(rf > 0 && rf <= n, "replication factor must be in 1..=n");
         let nodes = (0..n).map(|i| Replica::new(i as u64)).collect();
+        let mut ring = HashRing::new(64);
+        for i in 0..n {
+            ring.add_node(&i.to_string());
+        }
         Self {
             nodes,
             group: vec![0; n],
+            up: vec![true; n],
+            last_heard: vec![vec![0; n]; n],
+            ring,
             rf,
             r,
             w,
@@ -151,17 +158,19 @@ impl Cluster {
     }
 
     fn reachable(&self, a: usize, b: usize) -> bool {
-        self.group[a] == self.group[b]
+        self.up[a] && self.up[b] && self.group[a] == self.group[b]
     }
 
-    /// The `rf` replica indices responsible for `key`: a preference list of the
-    /// primary (by hash) and its successors around the ring of node indices.
+    /// The replica indices responsible for `key`: its preference list on the
+    /// consistent-hash ring of the live nodes. A membership change moves only
+    /// the keys whose responsible node changed, not all of them.
     #[must_use]
-    #[allow(clippy::cast_possible_truncation)]
     pub fn replicas(&self, key: u64) -> Vec<usize> {
-        let n = self.nodes.len();
-        let primary = (splitmix64(key) % n as u64) as usize;
-        (0..self.rf).map(|i| (primary + i) % n).collect()
+        self.ring
+            .preference(&key.to_be_bytes(), self.rf)
+            .into_iter()
+            .filter_map(|name| name.parse::<usize>().ok())
+            .collect()
     }
 
     /// Write `value` for `key`, coordinated by node `coord`. Availability-first:
@@ -220,6 +229,66 @@ impl Cluster {
         }
     }
 
+    /// Crash a node: it stops serving and leaves the placement ring, so its keys
+    /// shift to their successors. Its stored data persists (a crashed node keeps
+    /// its disk); [`Cluster::restart`] rejoins it.
+    pub fn crash(&mut self, node: usize) {
+        if self.up[node] {
+            self.up[node] = false;
+            self.ring.remove_node(&node.to_string());
+        }
+    }
+
+    /// Restart a crashed node: it rejoins the ring and serves again. Anti-entropy
+    /// catches it up on the writes it missed while down.
+    pub fn restart(&mut self, node: usize) {
+        if !self.up[node] {
+            self.up[node] = true;
+            self.ring.add_node(&node.to_string());
+        }
+    }
+
+    /// Whether a node is currently a live member.
+    #[must_use]
+    pub fn is_up(&self, node: usize) -> bool {
+        self.up[node]
+    }
+
+    /// The number of live nodes.
+    #[must_use]
+    pub fn alive_count(&self) -> usize {
+        self.up.iter().filter(|&&u| u).count()
+    }
+
+    /// One heartbeat round: every live node refreshes, in its own view, the time
+    /// it last heard from each node it can currently reach. A node it cannot
+    /// reach (crashed, or across a partition) goes stale, which is how failure
+    /// detection works.
+    pub fn heartbeat(&mut self, now: u64) {
+        for o in 0..self.nodes.len() {
+            if !self.up[o] {
+                continue;
+            }
+            for t in 0..self.nodes.len() {
+                if self.reachable(o, t) {
+                    self.last_heard[o][t] = now;
+                }
+            }
+        }
+    }
+
+    /// The nodes `observer` suspects have failed: those it has not heard from
+    /// within `timeout`. Catches a crash and, indistinguishably, the far side of
+    /// a partition, which is the honest limit of failure detection.
+    #[must_use]
+    pub fn suspects(&self, observer: usize, now: u64, timeout: u64) -> Vec<usize> {
+        (0..self.nodes.len())
+            .filter(|&t| {
+                t != observer && now.saturating_sub(self.last_heard[observer][t]) > timeout
+            })
+            .collect()
+    }
+
     /// Reconcile the cluster by Merkle-diff anti-entropy, run to a fixed point.
     ///
     /// Every pair of nodes that can currently reach each other builds a Merkle
@@ -260,11 +329,16 @@ impl Cluster {
         transfers
     }
 
-    /// Whether every node has converged to the identical observable state. Use
-    /// after a heal and anti-entropy to assert global convergence.
+    /// Whether every live node has converged to the identical observable state.
+    /// Use after a heal and anti-entropy to assert global convergence. A crashed
+    /// node is frozen and excluded until it restarts.
     #[must_use]
     pub fn fully_converged(&self) -> bool {
-        self.nodes.windows(2).all(|w| w[0].converged_with(&w[1]))
+        let live: Vec<&Replica> = (0..self.nodes.len())
+            .filter(|&i| self.up[i])
+            .map(|i| &self.nodes[i])
+            .collect();
+        live.windows(2).all(|w| w[0].converged_with(w[1]))
     }
 }
 
@@ -336,23 +410,39 @@ pub fn run_seed(seed: u64, nodes: usize, ops: usize) -> SimReport {
 
     for _ in 0..ops {
         match rng.below(100) {
-            0..=69 => {
+            0..=64 => {
                 let coord = (rng.below(nodes as u64)) as usize;
-                let key = rng.below(keyspace);
-                let value = rng.next_u64().to_le_bytes();
-                cluster.write(coord, key, &value);
-                writes += 1;
+                if cluster.is_up(coord) {
+                    let key = rng.below(keyspace);
+                    let value = rng.next_u64().to_le_bytes();
+                    cluster.write(coord, key, &value);
+                    writes += 1;
+                }
             }
-            70..=81 => {
+            65..=74 => {
                 let groups: Vec<u32> = (0..nodes).map(|_| rng.below(2) as u32).collect();
                 cluster.set_partitions(&groups);
                 partitions += 1;
             }
-            82..=90 => cluster.heal(),
+            75..=82 => cluster.heal(),
+            83..=88 => {
+                let node = (rng.below(nodes as u64)) as usize;
+                if cluster.alive_count() > rf {
+                    cluster.crash(node);
+                }
+            }
+            89..=93 => {
+                let node = (rng.below(nodes as u64)) as usize;
+                cluster.restart(node);
+            }
             _ => transfers += cluster.anti_entropy(),
         }
     }
 
+    // Final reconciliation: bring every node back, heal the network, converge.
+    for i in 0..nodes {
+        cluster.restart(i);
+    }
     cluster.heal();
     transfers += cluster.anti_entropy();
     SimReport {
@@ -438,5 +528,64 @@ mod tests {
             let report = run_seed(seed, 5, 200);
             assert!(report.converged, "seed {seed} diverged: {report:?}");
         }
+    }
+
+    #[test]
+    fn survives_a_crash_and_rejoin() {
+        let mut c = Cluster::new(5, 3, 2, 2);
+        for k in 0..30u64 {
+            c.write((k % 5) as usize, k, &k.to_le_bytes());
+        }
+        let _ = c.anti_entropy();
+
+        // Crash a node; the cluster keeps taking writes, routed around it.
+        c.crash(2);
+        assert!(!c.is_up(2));
+        for k in 30..60u64 {
+            c.write(0, k, &k.to_le_bytes());
+        }
+
+        // It rejoins and anti-entropy catches it up on everything it missed.
+        c.restart(2);
+        let _ = c.anti_entropy();
+        assert!(c.fully_converged());
+        assert_eq!(
+            c.node(2).get(45),
+            Some(45u64.to_le_bytes().as_slice()),
+            "the rejoined node caught up on writes from while it was down"
+        );
+    }
+
+    #[test]
+    fn crash_is_detected_by_the_heartbeat() {
+        let mut c = Cluster::new(4, 3, 2, 2);
+        c.heartbeat(10);
+        assert!(c.suspects(0, 10, 5).is_empty(), "all freshly heard");
+        c.crash(2);
+        c.heartbeat(20); // node 2 is silent now; others refresh
+        let suspects = c.suspects(0, 20, 5);
+        assert!(suspects.contains(&2), "the crashed node is suspected");
+        assert!(!suspects.contains(&1), "a live node is not suspected");
+    }
+
+    #[test]
+    fn a_partition_looks_like_failure_then_clears() {
+        let mut c = Cluster::new(4, 3, 2, 2);
+        c.heartbeat(10);
+        c.set_partitions(&[0, 0, 1, 1]); // {0,1} | {2,3}
+        c.heartbeat(20); // node 0 can only hear node 1
+        let suspects = c.suspects(0, 20, 5);
+        assert!(
+            suspects.contains(&2) && suspects.contains(&3),
+            "the far side of a partition is suspected, like a failure"
+        );
+        assert!(!suspects.contains(&1), "the same-side peer is fine");
+
+        c.heal();
+        c.heartbeat(30);
+        assert!(
+            c.suspects(0, 30, 5).is_empty(),
+            "suspicion clears once the link returns"
+        );
     }
 }

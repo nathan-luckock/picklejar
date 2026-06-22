@@ -64,6 +64,29 @@ impl HashRing {
             .map(|(_, n)| n.as_str())
     }
 
+    /// The preference list for `key`: the first `count` distinct physical nodes
+    /// clockwise from the key's point, wrapping around the ring. This is the
+    /// replica set for a key under replication. Returns fewer than `count` only
+    /// when the ring holds fewer than `count` distinct nodes.
+    #[must_use]
+    pub fn preference(&self, key: &[u8], count: usize) -> Vec<&str> {
+        if self.ring.is_empty() || count == 0 {
+            return Vec::new();
+        }
+        let d = sha256::hash(key);
+        let h = u64::from_be_bytes([d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]]);
+        let mut out: Vec<&str> = Vec::with_capacity(count);
+        for name in self.ring.range(h..).chain(self.ring.iter()).map(|(_, n)| n) {
+            if out.len() == count {
+                break;
+            }
+            if !out.contains(&name.as_str()) {
+                out.push(name.as_str());
+            }
+        }
+        out
+    }
+
     /// The number of distinct physical nodes on the ring.
     #[must_use]
     pub fn node_count(&self) -> usize {
@@ -147,5 +170,27 @@ mod tests {
     fn an_empty_ring_routes_nothing() {
         let ring = HashRing::new(10);
         assert!(ring.route(b"key").is_none());
+    }
+
+    #[test]
+    fn preference_returns_distinct_replicas_led_by_the_primary() {
+        let mut ring = HashRing::new(200);
+        for name in ["a", "b", "c", "d"] {
+            ring.add_node(name);
+        }
+        let pref = ring.preference(b"some-key", 3);
+        assert_eq!(pref.len(), 3, "three distinct replicas");
+        assert_eq!(pref[0], ring.route(b"some-key").unwrap(), "primary leads");
+        let mut sorted = pref.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 3, "no duplicate nodes");
+    }
+
+    #[test]
+    fn preference_caps_at_the_number_of_nodes() {
+        let mut ring = HashRing::new(50);
+        ring.add_node("only");
+        assert_eq!(ring.preference(b"k", 3), vec!["only"]);
     }
 }
