@@ -4,9 +4,9 @@
 
 ### A database for when no one is coming to fix it.
 
-picklejar is a from-scratch, Postgres-wire database engine built in Rust for places humans cannot physically reach - satellites, seabed nodes, and remote field robotics.
-When a disk corrupts in orbit, there is no technician to swap it. picklejar expects the fault, repairs it from parity, and mathematically proves it never served a wrong answer. No vibes, no dependencies, just absolute durability.
+**picklejar** is a from-scratch, Postgres-wire database engine built in Rust for infrastructure humans cannot physically service—satellites, seabed nodes, and remote field robotics. 
 
+When a disk corrupts in orbit, there is no technician to swap it. **picklejar** expects the fault, repairs it from parity, and mathematically proves it never served a wrong answer or leaked a tenant's data. No vibes, no dependencies, just absolute durability.
 [![CI](https://img.shields.io/github/actions/workflow/status/nathan-luckock/picklejar/ci.yml?style=flat-square&label=CI&logo=github)](https://github.com/nathan-luckock/picklejar/actions/workflows/ci.yml)
 [![Crash sims](https://img.shields.io/badge/crash%20sims-1%2C000%2C000%20passed-3FB950?style=flat-square&logo=checkmarx&logoColor=white)](#proof-not-vibes)
 [![Model-checked](https://img.shields.io/badge/invariants-5%20exhaustively%20proven-8957e5?style=flat-square&logo=ghostery&logoColor=white)](#proof-not-vibes)
